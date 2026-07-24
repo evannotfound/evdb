@@ -75,28 +75,34 @@ def test_traefik_tls_sni_isolates_two_postgres_and_two_kv_backends():
             wait_exec(name, ["pg_isready", "-U", "default", "-d", "postgres"])
         for name in (names["kv1"], names["kv2"]):
             wait_exec(name, ["redis-cli", "PING"])
-        docker_exec(
-            names["pg1"],
+        _retry(
             [
+                "docker",
+                "exec",
+                names["pg1"],
                 "psql",
                 "-U",
                 "default",
                 "-d",
                 "postgres",
                 "-c",
-                "CREATE TABLE route(value text); INSERT INTO route VALUES ('postgres-one')",
+                "CREATE TABLE IF NOT EXISTS route(value text); "
+                "TRUNCATE route; INSERT INTO route VALUES ('postgres-one')",
             ],
         )
-        docker_exec(
-            names["pg2"],
+        _retry(
             [
+                "docker",
+                "exec",
+                names["pg2"],
                 "psql",
                 "-U",
                 "default",
                 "-d",
                 "postgres",
                 "-c",
-                "CREATE TABLE route(value text); INSERT INTO route VALUES ('postgres-two')",
+                "CREATE TABLE IF NOT EXISTS route(value text); "
+                "TRUNCATE route; INSERT INTO route VALUES ('postgres-two')",
             ],
         )
         docker_exec(names["kv1"], ["redis-cli", "SET", "route", "redis-one"])
@@ -179,6 +185,8 @@ def _redis(domain: str, port: int) -> str:
             "redis-cli",
             "--tls",
             "--insecure",
+            "--sni",
+            domain,
             "-h",
             domain,
             "-p",

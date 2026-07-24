@@ -56,3 +56,10 @@ def test_deployment_keeps_timers_disabled_by_default():
 
     assert "evdb_enable_timers: false" in defaults
     assert 'enabled: "{{ evdb_enable_timers | bool }}"' in role
+
+
+def test_weekly_maintenance_rotates_data_checks():
+    text = (SYSTEMD / "evanovation-db-weekly@.service").read_text()
+
+    assert "maintain check %i\n" in text
+    assert "maintain check %i --rotate" in text

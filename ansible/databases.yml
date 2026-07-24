@@ -4,11 +4,12 @@
   become: "{{ evdb_become | default(true) }}"
   gather_facts: false
   pre_tasks:
-    - name: Require explicit production target
+    - name: Guard production execution
       ansible.builtin.assert:
         that:
-          - not (evdb_prod | default(false) | bool) or target | default('') == 'production'
-        fail_msg: Production must be selected with -e target=production
+          - "'production' not in group_names or target | default('') == 'production'"
+          - "'production' not in group_names or ansible_check_mode or apply | default('no') == 'yes'"
+        fail_msg: Production apply requires -e target=production -e apply=yes
   roles:
     - base
     - app

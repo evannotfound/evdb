@@ -16,6 +16,18 @@ def test_montreal_config_has_every_instance():
     assert sum(item.engine == "dragonfly" for item in config.instances) == 7
     assert sum(item.engine == "redis" for item in config.instances) == 4
     assert sum(bool(item.http and item.http["enabled"]) for item in config.instances) == 11
+    assert config.host.resources == {"traefik": "unlimited"}
+    assert all(item.resources["database"] == "unlimited" for item in config.instances)
+    assert all(
+        item.resources.get("pgbouncer") == "unlimited"
+        for item in config.instances
+        if item.engine == "postgres" and item.settings["pgbouncer"]
+    )
+    assert all(
+        item.resources.get("http") == "unlimited"
+        for item in config.instances
+        if item.http and item.http["enabled"]
+    )
 
 
 def test_same_product_name_can_exist_in_both_groups():
@@ -52,6 +64,16 @@ def test_latest_target_image_fails():
 
     with pytest.raises(ConfigError, match="fixed version and digest"):
         require_valid(Config(config.host, (changed, *config.instances[1:])))
+
+
+def test_changed_resource_contract_fails():
+    config = load(ROOT / "config/montreal-01")
+    data = _instance_data(config.get("kv", "test-dev-01"))
+    data["resources"] = {"database": "512m", "http": "unlimited"}
+    changed = Instance.from_dict(data)
+
+    with pytest.raises(ConfigError, match="current unlimited setting"):
+        require_valid(Config(config.host, (changed,)))
 
 
 def test_secret_value_fails_without_printing_it():

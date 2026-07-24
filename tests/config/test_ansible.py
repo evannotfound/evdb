@@ -20,9 +20,14 @@ def test_production_is_not_the_default_and_requires_apply():
         text = (ANSIBLE / name).read_text()
         assert "target | default('test')" in text
         assert "target | default('') == 'production'" in text
+        assert "'production' not in group_names" in text
+        assert "ansible_check_mode or apply | default('no') == 'yes'" in text
+        assert "evdb_prod" not in text
 
     defaults = (ANSIBLE / "group_vars/all.yml").read_text()
     assert "apply | default('no') == 'yes'" in defaults
+    assert "'production' not in group_names" in defaults
+    assert "evdb_prod" not in defaults
 
     production = yaml.safe_load((ANSIBLE / "hosts.yml").read_text())
     assert "test" not in production["all"]["children"]

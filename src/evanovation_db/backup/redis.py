@@ -17,8 +17,7 @@ def backup(host: Host, instance: Instance, folder: Path, run_id: str) -> dict[st
     del run_id
     password = read_secret(host, instance, "password")
     before = int(kv.command(instance, password, ["LASTSAVE"]))
-    while int(time.time()) <= before:
-        time.sleep(0.1)
+    _wait_for_new_second(before)
     kv.command(instance, password, ["BGSAVE"], timeout=60)
     _wait(instance, password, before)
 
@@ -28,6 +27,14 @@ def backup(host: Host, instance: Instance, folder: Path, run_id: str) -> dict[st
     require_file(target)
     _check(instance, target)
     return {**kv.facts(instance, password), "files": ["dump.rdb"]}
+
+
+def _wait_for_new_second(before: int, timeout: int = 5) -> None:
+    deadline = time.monotonic() + timeout
+    while int(time.time()) <= before:
+        if time.monotonic() >= deadline:
+            raise BackupError("Redis clock did not advance before BGSAVE")
+        time.sleep(0.1)
 
 
 def _wait(instance: Instance, password: str, before: int, timeout: int = 1800) -> None:

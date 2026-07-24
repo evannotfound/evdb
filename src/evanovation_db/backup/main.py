@@ -21,13 +21,16 @@ def backup(config: Config, instance: Instance, *, upload: bool = True) -> Path:
     host = config.host
     group_root = private_dir(host.backup_dir / instance.group / instance.id)
     require_space(group_root, host.min_free_gb)
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     partial = group_root / f"{run_id}.partial"
     started = datetime.now(timezone.utc)
     clock = time.monotonic()
 
     with lock(host.lock_dir / f"{instance.group}-{instance.id}.lock"):
-        private_dir(partial)
+        try:
+            partial.mkdir(mode=0o700)
+        except FileExistsError as exc:
+            raise BackupError(f"partial backup already exists: {partial}") from exc
         step = "engine"
         log(
             "backup_start",
@@ -45,6 +48,7 @@ def backup(config: Config, instance: Instance, *, upload: bool = True) -> Path:
                 "group": instance.group,
                 "instance": instance.id,
                 "engine": instance.engine,
+                "image": instance.target["image"],
                 "started": started.isoformat(),
                 "finished": datetime.now(timezone.utc).isoformat(),
                 "version": facts.get("version", "unknown"),
@@ -57,6 +61,7 @@ def backup(config: Config, instance: Instance, *, upload: bool = True) -> Path:
             }
             manifest.write(partial, data)
             folder = finish(partial)
+            _state(host.state_dir, instance, data)
             if upload:
                 step = "upload"
                 snapshot = restic.upload(host, instance, folder)
@@ -110,20 +115,35 @@ def _state(root: Path, instance: Instance, data: dict) -> None:
     path = root / "state" / instance.group / f"{instance.id}.json"
     previous = read_json(path) if path.is_file() else {}
     previous["backup"] = data
-    previous.pop("error", None)
+    errors = _errors(previous)
+    errors.pop("backup", None)
+    if errors:
+        previous["errors"] = errors
+    else:
+        previous.pop("errors", None)
     write_json(path, previous)
 
 
 def _failure(root: Path, instance: Instance, command: str, step: str, error: Exception) -> None:
     path = root / "state" / instance.group / f"{instance.id}.json"
     previous = read_json(path) if path.is_file() else {}
-    previous["error"] = {
+    errors = _errors(previous)
+    errors[command] = {
         "command": command,
         "step": step,
         "time": datetime.now(timezone.utc).isoformat(),
         "message": str(error),
     }
+    previous["errors"] = errors
     write_json(path, previous)
+
+
+def _errors(data: dict) -> dict:
+    errors = dict(data.get("errors", {}))
+    legacy = data.pop("error", None)
+    if legacy:
+        errors.setdefault(legacy.get("command", "legacy"), legacy)
+    return errors
 
 
 def _clean(root: Path, keep: int) -> None:

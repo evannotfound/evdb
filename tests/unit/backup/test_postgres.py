@@ -1,4 +1,7 @@
+import pytest
+
 from evanovation_db.backup import postgres
+from evanovation_db.errors import BackupError, CommandError
 from evanovation_db.run import Result
 
 
@@ -35,3 +38,38 @@ def test_postgres_backup_discovers_and_checks_databases(config, tmp_path, monkey
     assert result["objects"] == {"postgres": 3, "other db": 3}
     assert result["owners"] == {"postgres": "default", "other db": "reporting"}
     assert any(call[0] == "pg_dumpall" for call in calls)
+
+
+def test_postgres_rejects_empty_archive(config, tmp_path):
+    instance = config.get("postgres", "test-dev-01")
+    archive = tmp_path / "empty.dump"
+    archive.touch()
+
+    with pytest.raises(BackupError, match="empty"):
+        postgres._check_archive(instance, archive)
+
+
+def test_postgres_rejects_damaged_archive(config, tmp_path, monkeypatch):
+    instance = config.get("postgres", "test-dev-01")
+    archive = tmp_path / "damaged.dump"
+    archive.write_bytes(b"damaged")
+    monkeypatch.setattr(
+        postgres,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(CommandError("bad archive")),
+    )
+
+    with pytest.raises(CommandError, match="bad archive"):
+        postgres._check_archive(instance, archive)
+
+
+def test_postgres_propagates_command_failure(config, tmp_path, monkeypatch):
+    instance = config.get("postgres", "test-dev-01")
+    monkeypatch.setattr(
+        postgres.docker,
+        "exec",
+        lambda *args, **kwargs: (_ for _ in ()).throw(CommandError("psql failed")),
+    )
+
+    with pytest.raises(CommandError, match="psql failed"):
+        postgres.backup(config.host, instance, tmp_path, "run")

@@ -22,6 +22,7 @@ class Host:
     repos: dict[str, str]
     retention: dict[str, int]
     images: dict[str, str]
+    resources: dict[str, str]
     secrets: dict[str, str]
     min_free_gb: int = 5
     runtime: bool = False
@@ -38,6 +39,7 @@ class Host:
                 repos=dict(data["repos"]),
                 retention={key: int(value) for key, value in data["retention"].items()},
                 images=dict(data["images"]),
+                resources=dict(data["resources"]),
                 secrets=dict(data["secrets"]),
                 min_free_gb=int(data.get("min_free_gb", 5)),
                 runtime=bool(data.get("runtime", False)),
@@ -59,6 +61,7 @@ class Instance:
     current: dict[str, Any]
     target: dict[str, Any]
     backup: dict[str, Any]
+    resources: dict[str, str]
     secrets: dict[str, str]
     settings: dict[str, Any] = field(default_factory=dict)
     http: dict[str, Any] | None = None
@@ -82,6 +85,7 @@ class Instance:
                 current=dict(data["current"]),
                 target=dict(data["target"]),
                 backup=dict(data["backup"]),
+                resources=dict(data["resources"]),
                 secrets=dict(data["secrets"]),
                 settings=dict(data.get("settings", {})),
                 http=dict(data["http"]) if data.get("http") is not None else None,
@@ -184,6 +188,7 @@ def validate(config: Config) -> list[str]:
 
         if instance.durable and not instance.backup.get("enabled"):
             errors.append(f"{instance.id}: durable instance must have backup enabled")
+        _check_resources(errors, instance)
         _check_refs(errors, instance.id, instance.secrets, config.host)
 
         if instance.engine in KV_ENGINES:
@@ -207,6 +212,8 @@ def validate(config: Config) -> list[str]:
 
     for key, image in config.host.images.items():
         _check_image(errors, f"host image {key}", image)
+    if config.host.resources != {"traefik": "unlimited"}:
+        errors.append("host: Traefik resources must preserve the current unlimited setting")
     _check_refs(errors, "host", config.host.secrets, config.host)
     return errors
 
@@ -221,6 +228,19 @@ def _unique(errors: list[str], seen: dict[Any, str], value: Any, name: str, labe
 def _check_image(errors: list[str], name: str, image: str) -> None:
     if not image or "@sha256:" not in image or ":latest" in image.split("@", 1)[0]:
         errors.append(f"{name}: target image must use a fixed version and digest")
+
+
+def _check_resources(errors: list[str], instance: Instance) -> None:
+    expected = {"database"}
+    if instance.engine == "postgres" and instance.settings.get("pgbouncer"):
+        expected.add("pgbouncer")
+    if instance.http and instance.http.get("enabled"):
+        expected.add("http")
+    if set(instance.resources) != expected:
+        errors.append(f"{instance.id}: resource services must be {sorted(expected)}")
+        return
+    if any(value != "unlimited" for value in instance.resources.values()):
+        errors.append(f"{instance.id}: resources must preserve the current unlimited setting")
 
 
 def _check_refs(errors: list[str], name: str, refs: dict[str, Any], host: Host) -> None:

@@ -16,6 +16,6 @@ evdb_enable_timers: false
 evdb_skip_secrets: false
 evdb_release: ""
 
-# Local hosts are disposable. Production writes additionally require apply=yes.
-evdb_write: "{{ (not (evdb_prod | default(false) | bool)) or (apply | default('no') == 'yes') }}"
+# Inventory membership determines production. Extra variables cannot downgrade that host class.
+evdb_write: "{{ ('production' not in group_names) or (apply | default('no') == 'yes') }}"
 evdb_plan: "{{ evdb_write | bool or ansible_check_mode }}"

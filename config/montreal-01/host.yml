@@ -20,6 +20,8 @@ host:
     dragonfly: docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1@sha256:99eb2dd14ca00b983c302d0a15d15176dccd5a9e85a375bcc5157e1cadd73099
     http: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
     traefik: traefik:v3.7.8@sha256:4299bbed850421258fc5448c2e0e6ad350981d4d335a68de11b92448aedbefe5
+  resources:
+    traefik: unlimited
   secrets:
     restic_password: op://Evanovation/evanovation-db/restic-password
     rclone_config: op://Evanovation/evanovation-db/rclone-config

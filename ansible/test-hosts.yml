@@ -5,7 +5,6 @@ all:
         local:
           ansible_connection: local
           ansible_python_interpreter: "{{ ansible_playbook_python }}"
-          evdb_prod: false
           evdb_become: false
           evdb_root: /tmp/evanovation-db-test/opt
           evdb_config_dir: /tmp/evanovation-db-test/etc

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
@@ -42,28 +44,40 @@ def run(
     if env:
         command_env.update({str(key): str(value) for key, value in env.items()})
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=cwd,
             env=command_env,
-            stdout=stdout or subprocess.PIPE,
+            stdout=stdout if stdout is not None else subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
             start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        safe = redact(" ".join(command), secrets)
-        raise CommandError(f"command timed out after {timeout}s: {safe}") from exc
     except OSError as exc:
         safe = redact(" ".join(command), secrets)
         raise CommandError(f"command failed to start: {safe}: {exc}") from exc
 
-    out = "" if stdout else completed.stdout.decode(errors="replace")
-    err = completed.stderr.decode(errors="replace")
-    result = Result(command, completed.returncode, redact(out, secrets), redact(err, secrets))
+    try:
+        out_data, err_data = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill(process)
+        process.communicate()
+        safe = redact(" ".join(command), secrets)
+        raise CommandError(f"command timed out after {timeout}s: {safe}") from exc
+    except BaseException:
+        _kill(process)
+        process.communicate()
+        raise
+
+    out = "" if stdout is not None else (out_data or b"").decode(errors="replace")
+    err = (err_data or b"").decode(errors="replace")
+    result = Result(command, process.returncode, redact(out, secrets), redact(err, secrets))
     if check and result.code != 0:
         safe = redact(" ".join(command), secrets)
         detail = result.err.strip() or result.out.strip() or "no output"
         raise CommandError(f"command failed ({result.code}): {safe}: {detail}")
     return result
+
+
+def _kill(process: subprocess.Popen) -> None:
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)

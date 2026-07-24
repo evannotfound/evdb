@@ -27,3 +27,12 @@ def test_incomplete_manifest_fails(tmp_path):
 
     with pytest.raises(BackupError, match="not complete"):
         check(tmp_path)
+
+
+def test_unlisted_file_fails(tmp_path):
+    (tmp_path / "dump.rdb").write_bytes(b"backup")
+    write(tmp_path, {"status": "complete", "files": files(tmp_path, ["dump.rdb"])})
+    (tmp_path / "unexpected").write_bytes(b"extra")
+
+    with pytest.raises(BackupError, match="unlisted file"):
+        check(tmp_path)

@@ -28,7 +28,9 @@ Humans edit `config/<host>/host.yml`, `postgres.yml`, and `kv.yml`. Host config 
 paths, repositories, retention, pinned infrastructure images, and `op://` references.
 Every instance records `id`, `env`, `engine`, `container`, `project`, `data`,
 `domain`, durability, current and pinned target facts, backup policy, secrets, and engine
-settings. KV instances also define `http.enabled`, `port`, `domain`, pinned image,
+settings. Read-only Docker inspection records the current database, PgBouncer, HTTP, and
+Traefik resource contract as `unlimited`; generated Compose therefore adds no CPU, memory,
+cpuset, or PID limit. KV instances also define `http.enabled`, `port`, `domain`, pinned image,
 token reference, and `max_connections`.
 
 Validate source YAML and render runtime JSON with:
@@ -46,7 +48,7 @@ Postgres and KV groups.
 
 ```text
 evanovation-db backup <postgres|kv> <instance>
-evanovation-db restore-check <postgres|kv> <instance> [--folder PATH]
+evanovation-db restore-check <postgres|kv> <instance> [--folder PATH | --snapshot ID]
 evanovation-db restore-due [--run]
 evanovation-db status [--json]
 evanovation-db maintain <init|forget|prune|check> <postgres|kv>

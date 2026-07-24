@@ -56,6 +56,7 @@ def restore(host: Host, instance: Instance, folder: Path, name: str) -> dict:
         current=instance.current,
         target=instance.target,
         backup=instance.backup,
+        resources=instance.resources,
         secrets={},
         settings=instance.settings,
     )

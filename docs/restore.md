@@ -1,6 +1,7 @@
 # Restore checks
 
-Restore checks accept a complete local backup whose manifest sizes and hashes still match.
+Restore checks accept a complete local backup or an explicit Restic snapshot whose manifest
+sizes and hashes still match. Snapshot files are staged privately and removed after the test.
 They refuse configured live data paths and use temporary Docker names and storage without
 Traefik labels or published host ports. Temporary resources are removed after success,
 failure, timeout, or interruption.
@@ -19,6 +20,7 @@ Run a named check or select the most overdue durable instance:
 ```sh
 uv run evanovation-db restore-check postgres vercount-prod-01
 uv run evanovation-db restore-check kv vercount-prod-01
+uv run evanovation-db restore-check postgres vercount-prod-01 --snapshot SNAPSHOT_ID
 uv run evanovation-db restore-due
 uv run evanovation-db restore-due --run
 ```

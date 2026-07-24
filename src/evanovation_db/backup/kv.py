@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 
 from .. import docker
@@ -59,8 +60,7 @@ def _sample(instance: Instance, password: str, database: str, key: str) -> dict[
         "zset": ["ZRANGE", key, "0", "-1", "WITHSCORES"],
     }.get(kind)
     value = command(instance, password, ["-n", database, *(args or ["DUMP", key])])
-    if kind in {"set", "hash", "zset"}:
-        value = "\n".join(sorted(value.splitlines()))
+    value = _canonical(kind, value)
     ttl = int(command(instance, password, ["-n", database, "PTTL", key]))
     return {
         "database": int(database),
@@ -69,6 +69,16 @@ def _sample(instance: Instance, password: str, database: str, key: str) -> dict[
         "sha256": hashlib.sha256(value.encode()).hexdigest(),
         "ttl_ms": ttl,
     }
+
+
+def _canonical(kind: str, value: str) -> str:
+    lines = value.splitlines()
+    if kind == "set":
+        return json.dumps(sorted(lines), separators=(",", ":"))
+    if kind in {"hash", "zset"}:
+        pairs = [lines[index : index + 2] for index in range(0, len(lines), 2)]
+        return json.dumps(sorted(pairs), separators=(",", ":"))
+    return value
 
 
 def _info(text: str) -> dict[str, str]:

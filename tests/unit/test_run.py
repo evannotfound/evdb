@@ -1,4 +1,6 @@
+import os
 import sys
+import time
 
 import pytest
 
@@ -42,5 +44,32 @@ def test_run_times_out():
         run([sys.executable, "-c", "import time; time.sleep(2)"], timeout=1)
 
 
+def test_timeout_kills_descendants(tmp_path):
+    child = tmp_path / "child.pid"
+    script = (
+        "import pathlib, subprocess, sys, time; "
+        "p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        f"pathlib.Path({str(child)!r}).write_text(str(p.pid)); "
+        "time.sleep(60)"
+    )
+
+    with pytest.raises(CommandError, match="timed out"):
+        run([sys.executable, "-c", script], timeout=1)
+
+    pid = int(child.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _running(pid):
+        time.sleep(0.05)
+    assert not _running(pid)
+
+
 def test_redact_uses_longest_values_first():
     assert redact("token-long token", ["token", "token-long"]) == "<redacted> <redacted>"
+
+
+def _running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True

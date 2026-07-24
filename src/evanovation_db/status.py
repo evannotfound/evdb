@@ -18,22 +18,30 @@ def get(config: Config, *, now: datetime | None = None) -> tuple[list[dict], boo
         backup = data.get("backup", {})
         upload = backup.get("upload", {})
         restore = data.get("restore", {})
-        backup_time = _time(upload.get("time"))
+        local_time = _time(backup.get("finished"))
+        upload_time = _time(upload.get("time"))
         restore_time = _time(restore.get("time"))
-        backup_stale = backup_time is None or current - backup_time > timedelta(hours=26)
+        backup_stale = upload_time is None or current - upload_time > timedelta(hours=26)
         restore_stale = restore_time is None or current - restore_time > timedelta(days=30)
-        failed = failed or backup_stale or restore_stale
+        errors = data.get("errors", {})
+        if data.get("error"):
+            errors = {**errors, "legacy": data["error"]}
+        error = errors or None
+        failed = failed or backup_stale or restore_stale or bool(error)
         rows.append(
             {
                 "group": instance.group,
                 "instance": instance.id,
                 "engine": instance.engine,
-                "backup": backup_time.isoformat() if backup_time else None,
+                "backup": local_time.isoformat() if local_time else None,
+                "upload": upload_time.isoformat() if upload_time else None,
+                "upload_ok": bool(upload.get("ok")),
                 "snapshot": upload.get("snapshot"),
                 "backup_stale": backup_stale,
                 "restore": restore_time.isoformat() if restore_time else None,
+                "restore_ok": bool(restore.get("ok")),
                 "restore_stale": restore_stale,
-                "error": data.get("error"),
+                "error": error,
             }
         )
     return rows, failed

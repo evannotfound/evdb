@@ -40,8 +40,18 @@ def check(folder: str | Path) -> dict[str, Any]:
     data = read(root)
     if data.get("status") != "complete":
         raise BackupError(f"backup is not complete: {root}")
+    recorded = set()
     for item in data.get("files", []):
+        recorded.add(item["name"])
         path = require_file(root / item["name"])
         if path.stat().st_size != item["size"] or file_hash(path) != item["sha256"]:
             raise BackupError(f"backup file changed: {item['name']}")
+    actual = {
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if path.is_file() and path.name != NAME
+    }
+    extra = actual - recorded
+    if extra:
+        raise BackupError(f"backup has unlisted file: {min(extra)}")
     return data

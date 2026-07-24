@@ -2,6 +2,8 @@
 
 `montreal-01` currently has 25 managed database instances under `/home/ubuntu/databases`: 14 Postgres, 7 Dragonfly, and 4 Redis. The current scripts back up only 6 Postgres and 4 KV instances. They delete prior local files before upload is known to be good, handle each engine as one batch, do not check Restic results well enough, and cannot produce a safe Dragonfly RDB.
 
+Read-only Docker inspection confirmed that the managed database, PgBouncer, HTTP sidecar, and native Traefik containers have no Docker CPU, memory, cpuset, or PID limits. Source config records that current resource contract as `unlimited`, and generated Compose preserves it by adding no resource limit keys.
+
 Every instance Compose file is a link to one shared template for its engine group. The current KV template says Dragonfly for all instances even though four running containers still use Redis. This means the files on disk do not fully describe what is running.
 
 All 11 KV instances run a `serverless-redis-http` sidecar on a unique loopback port. An external proxy owns public HTTP routing. `oai-co-prod-02` has no public route, and two routes still use the old `kv-na01.storage.evanovation.com` suffix. Those external route facts are recorded only for the later production move.

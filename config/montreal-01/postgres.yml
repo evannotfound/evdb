@@ -10,6 +10,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/api-test-01/data, compose: /home/ubuntu/databases/postgres/api-test-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/api-test-01/data}
     backup: {enabled: true}
+    resources: &postgres_resources {database: unlimited, pgbouncer: unlimited}
     secrets: {password: "op://Evanovation/api-test-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -24,6 +25,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/code-share-prod-01/data, compose: /home/ubuntu/databases/postgres/code-share-prod-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/code-share-prod-01/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/code-share-prod-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -38,6 +40,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/cs-ai-prod-01/data, compose: /home/ubuntu/databases/postgres/cs-ai-prod-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/cs-ai-prod-01/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/cs-ai-prod-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -52,6 +55,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/dialogue-dev-01/data, compose: /home/ubuntu/databases/postgres/dialogue-dev-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/dialogue-dev-01/data}
     backup: {enabled: true}
+    resources: {database: unlimited}
     secrets: {password: "op://Evanovation/dialogue-dev-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: false, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -66,6 +70,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/gpt-accounts-manager-prod-01/data, compose: /home/ubuntu/databases/postgres/gpt-accounts-manager-prod-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/gpt-accounts-manager-prod-01/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/gpt-accounts-manager-prod-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -80,6 +85,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/gpt-share-prod-01/data, compose: /home/ubuntu/databases/postgres/gpt-share-prod-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/gpt-share-prod-01/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/gpt-share-prod-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 2000, pool_size: 30, reserve_size: 10}
 
@@ -94,6 +100,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/gpt-share-prod-02/data, compose: /home/ubuntu/databases/postgres/gpt-share-prod-02/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/gpt-share-prod-02/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/gpt-share-prod-02-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -108,6 +115,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/gpt-share-prod-03/data, compose: /home/ubuntu/databases/postgres/gpt-share-prod-03/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/gpt-share-prod-03/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/gpt-share-prod-03-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -122,6 +130,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/test-dev-01/data, compose: /home/ubuntu/databases/postgres/test-dev-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/test-dev-01/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/test-dev-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -136,6 +145,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/umami-prod-01/data, compose: /home/ubuntu/databases/postgres/umami-prod-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/umami-prod-01/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/umami-prod-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -150,6 +160,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/vercount-prod-01/data, compose: /home/ubuntu/databases/postgres/vercount-prod-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/vercount-prod-01/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/vercount-prod-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -164,6 +175,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/waline-prod-01/data, compose: /home/ubuntu/databases/postgres/waline-prod-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/waline-prod-01/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/waline-prod-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -178,6 +190,7 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/waline-prod-02/data, compose: /home/ubuntu/databases/postgres/waline-prod-02/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/waline-prod-02/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/waline-prod-02-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}
 
@@ -192,5 +205,6 @@ instances:
     current: {engine: postgres, image: "postgres:16", image_id: "sha256:f91377b220f1c6d94a42b63b2b203d558fcd2b45871c5ae4e397c164097cb1a0", data: /home/ubuntu/databases/postgres/whereto-prod-01/data, compose: /home/ubuntu/databases/postgres/whereto-prod-01/docker-compose.yaml}
     target: {engine: postgres, image: "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881", data: /home/ubuntu/databases/postgres/whereto-prod-01/data}
     backup: {enabled: true}
+    resources: *postgres_resources
     secrets: {password: "op://Evanovation/whereto-prod-01-postgres/password"}
     settings: {user: default, database: postgres, pgbouncer: true, max_clients: 100, pool_size: 20, reserve_size: 5}

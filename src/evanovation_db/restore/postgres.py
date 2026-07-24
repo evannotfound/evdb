@@ -112,6 +112,7 @@ def restore(host: Host, instance: Instance, folder: Path, name: str) -> dict:
 
 def _wait(name: str, timeout: int = 120) -> None:
     deadline = time.monotonic() + timeout
+    ready = 0
     while time.monotonic() < deadline:
         result = docker.exec(
             name,
@@ -120,6 +121,10 @@ def _wait(name: str, timeout: int = 120) -> None:
             check=False,
         )
         if result.code == 0:
-            return
+            ready += 1
+            if ready == 2:
+                return
+        else:
+            ready = 0
         time.sleep(1)
     raise RestoreError("Postgres restore container did not become ready")

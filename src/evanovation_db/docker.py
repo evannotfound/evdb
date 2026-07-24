@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from .errors import CommandError
 from .run import Result, run
 
 
@@ -80,4 +81,11 @@ def stop(name: str, *, timeout: int = 60) -> None:
 
 
 def remove(name: str, *, timeout: int = 60) -> None:
-    run(["docker", "rm", "--force", "--volumes", name], timeout=timeout, check=False)
+    result = run(["docker", "rm", "--force", "--volumes", name], timeout=timeout, check=False)
+    if result.code == 0 or "no such container" in result.err.lower():
+        return
+    probe = run(["docker", "container", "inspect", name], timeout=timeout, check=False)
+    if probe.code != 0 and "no such" in probe.err.lower():
+        return
+    detail = result.err.strip() or result.out.strip() or "container removal could not be confirmed"
+    raise CommandError(f"failed to remove container {name}: {detail}")

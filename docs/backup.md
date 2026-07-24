@@ -15,7 +15,8 @@ and `instance:` tags. Work for each repository is serialized by a local lock.
 
 The configured policy retains 7 daily, 4 weekly, and 12 monthly snapshots per instance.
 Weekly maintenance applies `forget` and a repository structure check; monthly maintenance
-runs prune. Data subset checks can be run explicitly with `maintain check --part N`.
+runs prune. Weekly maintenance also selects a deterministic rotating data subset. A specific
+subset can be run with `maintain check --part N`.
 Production repositories remain format v1.
 
 Local history keeps at least two uploaded backups and never automatically removes an

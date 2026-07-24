@@ -22,6 +22,7 @@ def test_local_restic_upload_returns_confirmed_snapshot_json(config, tmp_path):
 
     snapshot_id = restic.upload(config.host, instance, folder)
     snapshots = restic.snapshots(config.host, "kv", instance.id)
+    restored = restic.restore(config.host, instance, snapshot_id, tmp_path / "restored")
 
     assert len(snapshot_id) == 64
     selected = next(item for item in snapshots if item["id"] == snapshot_id)
@@ -32,6 +33,8 @@ def test_local_restic_upload_returns_confirmed_snapshot_json(config, tmp_path):
         f"instance:{instance.id}",
     }
     assert Path(config.host.repos["kv"]).is_relative_to(tmp_path)
+    assert manifest.check(restored)["status"] == "complete"
+    assert (restored / "data").read_bytes() == b"local integration backup"
 
 
 def test_local_restic_failure_keeps_completed_backup(config, tmp_path):
@@ -71,7 +74,7 @@ def test_local_restic_retention_prune_and_subset_check(config, tmp_path):
                 "backup",
                 str(folder),
                 "--time",
-                (now - timedelta(days=days)).isoformat(),
+                (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"),
                 "--tag",
                 "host:local-test",
                 "--tag",

@@ -10,6 +10,7 @@ Group=evanovation-db
 Environment=PYTHONPATH=/opt/evanovation-db/current/src
 ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /etc/evanovation-db maintain forget %i --apply
 ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /etc/evanovation-db maintain check %i
+ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /etc/evanovation-db maintain check %i --rotate
 TimeoutStartSec=24h
 Nice=15
 IOSchedulingClass=idle

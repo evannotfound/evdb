@@ -1,6 +1,8 @@
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
 import yaml
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
@@ -131,3 +133,49 @@ def test_external_network_has_no_shared_database_aliases():
     for instance in CONFIG.instances:
         names = set(render(instance)["services"])
         assert not names.intersection({"postgres", "pgbouncer", "redis", "http"})
+
+
+def test_current_unlimited_resources_remain_unlimited():
+    limited = {"mem_limit", "mem_reservation", "cpus", "cpu_shares", "cpuset", "pids_limit"}
+    services = []
+    for instance in CONFIG.instances:
+        services.extend(render(instance)["services"].values())
+    traefik = yaml.safe_load(JINJA.get_template("traefik.yml.j2").render(host=CONFIG.host))
+    services.extend(traefik["services"].values())
+
+    assert CONFIG.host.resources == {"traefik": "unlimited"}
+    assert all(not limited.intersection(item) for item in services)
+
+
+@pytest.mark.parametrize("engine", ["postgres", "redis", "dragonfly", "traefik"])
+def test_rendered_compose_passes_docker_validation(engine, tmp_path):
+    if engine == "traefik":
+        data = yaml.safe_load(JINJA.get_template("traefik.yml.j2").render(host=CONFIG.host))
+    else:
+        instance = next(item for item in CONFIG.instances if item.engine == engine)
+        data = render(instance)
+    env_file = tmp_path / "http.env"
+    env_file.write_text("SRH_TOKEN=test\nSRH_CONNECTION_STRING=redis://test\n")
+    for item in data["services"].values():
+        if "env_file" in item:
+            item["env_file"] = [str(env_file)]
+    path = tmp_path / f"{engine}.yml"
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(path),
+            "config",
+            "--quiet",
+            "--no-env-resolution",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
