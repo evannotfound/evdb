@@ -1,0 +1,133 @@
+from copy import deepcopy
+from pathlib import Path
+
+import yaml
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+from evanovation_db.config import Instance, load
+
+ROOT = Path(__file__).parents[2]
+CONFIG = load(ROOT / "config/montreal-01")
+JINJA = Environment(
+    loader=FileSystemLoader(ROOT / "compose"),
+    undefined=StrictUndefined,
+    autoescape=False,
+    keep_trailing_newline=True,
+)
+
+
+def render(instance: Instance) -> dict:
+    name = "postgres" if instance.engine == "postgres" else instance.engine
+    text = JINJA.get_template(f"{name}.yml.j2").render(
+        host=CONFIG.host,
+        instance=instance,
+        config_dir="/etc/evanovation-db",
+        secret_dir="/etc/evanovation-db/secrets",
+    )
+    return yaml.safe_load(text)
+
+
+def labels(data: dict) -> dict:
+    return next(service["labels"] for service in data["services"].values() if "labels" in service)
+
+
+def service(data: dict, container: str) -> dict:
+    return next(item for item in data["services"].values() if item["container_name"] == container)
+
+
+def test_every_instance_renders_with_its_pinned_engine_image():
+    for instance in CONFIG.instances:
+        data = render(instance)
+        database = service(data, instance.container)
+
+        assert database["image"] == instance.target["image"]
+        assert "@sha256:" in database["image"]
+        assert database["container_name"] == instance.container
+        assert database["volumes"][0].startswith(f"{instance.data}:")
+
+
+def test_redis_instances_stay_redis_and_use_private_config():
+    redis = [item for item in CONFIG.instances if item.engine == "redis"]
+
+    assert len(redis) == 4
+    for instance in redis:
+        database = service(render(instance), instance.container)
+        assert database["image"].startswith("redis:7.2.5@sha256:")
+        assert database["command"] == ["redis-server", "/run/secrets/redis.conf"]
+        assert "/run/secrets/redis.conf:ro" in database["volumes"][1]
+
+
+def test_database_services_publish_no_native_host_ports():
+    for instance in CONFIG.instances:
+        for item in render(instance)["services"].values():
+            if item["container_name"] != f"{instance.id}-http-1":
+                assert "ports" not in item
+
+    traefik = yaml.safe_load(JINJA.get_template("traefik.yml.j2").render(host=CONFIG.host))[
+        "services"
+    ]["traefik"]
+    assert set(traefik["ports"]) == {"5432:5432/tcp", "6379:6379/tcp"}
+    assert "@sha256:" in traefik["image"]
+
+
+def test_sni_routes_use_instance_specific_backends():
+    routes = {}
+    for instance in CONFIG.instances:
+        data = render(instance)
+        route_labels = labels(data)
+        prefix = "pg" if instance.engine == "postgres" else "kv"
+        rule = route_labels[f"traefik.tcp.routers.{prefix}-{instance.id}.rule"]
+        backend = next(
+            service
+            for service in data["services"].values()
+            if service.get("labels") == route_labels
+        )
+
+        assert rule == f"HostSNI(`{instance.domain}`)"
+        assert backend["container_name"].startswith(instance.id)
+        assert backend["container_name"] not in {"postgres", "redis", "pgbouncer"}
+        routes[instance.domain] = backend["container_name"]
+
+    assert len(routes) == 25
+    assert len(set(routes.values())) == 25
+
+
+def test_http_sidecars_are_loopback_only_and_instance_specific():
+    for instance in (item for item in CONFIG.instances if item.group == "kv"):
+        sidecar = service(render(instance), f"{instance.id}-http-1")
+
+        assert sidecar["ports"] == [f"127.0.0.1:{instance.http['port']}:80"]
+        assert sidecar["container_name"] == f"{instance.id}-http-1"
+        assert sidecar["environment"] == {
+            "SRH_MODE": "env",
+            "SRH_MAX_CONNECTIONS": str(instance.http["max_connections"]),
+        }
+        assert sidecar["env_file"] == [f"/etc/evanovation-db/secrets/kv-{instance.id}-http.env"]
+        assert "labels" not in sidecar
+
+
+def test_per_instance_http_choices_change_only_the_sidecar():
+    instance = next(item for item in CONFIG.instances if item.group == "kv")
+    disabled_data = deepcopy(vars(instance))
+    disabled_data["data"] = str(instance.data)
+    disabled_data["http"]["enabled"] = False
+    disabled = Instance.from_dict(disabled_data)
+
+    assert f"{instance.id}-http" not in render(disabled)["services"]
+
+
+def test_postgres_uses_password_file_and_private_pgbouncer_users():
+    for instance in (item for item in CONFIG.instances if item.engine == "postgres"):
+        services = render(instance)["services"]
+        assert services[f"{instance.id}-postgres"]["environment"]["POSTGRES_PASSWORD_FILE"] == (
+            "/run/secrets/postgres-password"
+        )
+        if instance.settings["pgbouncer"]:
+            mounts = services[f"{instance.id}-pgbouncer"]["volumes"]
+            assert any("/run/secrets/pgbouncer-users:ro" in mount for mount in mounts)
+
+
+def test_external_network_has_no_shared_database_aliases():
+    for instance in CONFIG.instances:
+        names = set(render(instance)["services"])
+        assert not names.intersection({"postgres", "pgbouncer", "redis", "http"})

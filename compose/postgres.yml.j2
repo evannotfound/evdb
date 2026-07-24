@@ -1,0 +1,54 @@
+name: {{ instance.project }}
+
+services:
+  {{ instance.id }}-postgres:
+    image: {{ instance.target.image }}
+    container_name: {{ instance.container }}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: {{ instance.settings.user }}
+      POSTGRES_DB: {{ instance.settings.database }}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+    volumes:
+      - {{ instance.data }}:/var/lib/postgresql/data
+      - {{ secret_dir }}/postgres-{{ instance.id }}.password:/run/secrets/postgres-password:ro
+    networks:
+      - traefik-net
+{% if not instance.settings.pgbouncer %}
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-net
+      traefik.tcp.routers.pg-{{ instance.id }}.entrypoints: postgres
+      traefik.tcp.routers.pg-{{ instance.id }}.rule: HostSNI(`{{ instance.domain }}`)
+      traefik.tcp.routers.pg-{{ instance.id }}.tls: "true"
+      traefik.tcp.services.pg-{{ instance.id }}.loadbalancer.server.port: "5432"
+{% endif %}
+{% if instance.settings.pgbouncer %}
+
+  {{ instance.id }}-pgbouncer:
+    image: {{ host.images.pgbouncer }}
+    container_name: {{ instance.id }}-pgbouncer-1
+    restart: unless-stopped
+    command:
+      - pgbouncer
+      - /etc/pgbouncer/pgbouncer.ini
+    depends_on:
+      - {{ instance.id }}-postgres
+    volumes:
+      - {{ config_dir }}/pgbouncer/{{ instance.id }}.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - {{ secret_dir }}/postgres-{{ instance.id }}.users:/run/secrets/pgbouncer-users:ro
+    networks:
+      - traefik-net
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-net
+      traefik.tcp.routers.pg-{{ instance.id }}.entrypoints: postgres
+      traefik.tcp.routers.pg-{{ instance.id }}.rule: HostSNI(`{{ instance.domain }}`)
+      traefik.tcp.routers.pg-{{ instance.id }}.tls: "true"
+      traefik.tcp.services.pg-{{ instance.id }}.loadbalancer.server.port: "5432"
+{% endif %}
+
+networks:
+  traefik-net:
+    external: true
+    name: traefik-net

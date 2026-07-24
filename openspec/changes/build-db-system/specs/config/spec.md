@@ -44,26 +44,30 @@ Source config SHALL contain only `op://` references for database passwords, Redi
 - **THEN** validation fails without printing the value
 
 ### Requirement: Unique names and routes
-Validation SHALL reject duplicate instance ids, container names, Compose projects, published host ports, and database domains.
+Validation SHALL reject duplicate instance ids and Compose projects within the same `postgres` or `kv` group. Container names, published host ports, and database domains SHALL remain unique across the host.
 
 #### Scenario: REST port is reused
 - **WHEN** two managed instances publish the same host address, port, and protocol
 - **THEN** validation fails and names both instances
+
+#### Scenario: Product has Postgres and KV
+- **WHEN** one product id exists once in the `postgres` group and once in the `kv` group
+- **THEN** validation accepts both and commands distinguish them by group
 
 #### Scenario: Shared database listener is valid
 - **WHEN** Traefik owns host ports 5432 and 6379 and individual database services publish neither port
 - **THEN** validation accepts the shared listeners and checks instance routes by unique domain
 
 ### Requirement: HTTP settings
-Each KV instance SHALL record whether its serverless HTTP sidecar is enabled, whether it is public, its unique loopback port, target domain, pinned image, token reference, and connection limit. The initial `montreal-01` config SHALL enable the sidecar and public route for all 11 KV instances.
+Each KV instance SHALL record whether its serverless HTTP sidecar is enabled, its unique loopback port, intended external domain, pinned image, token reference, and connection limit. The initial `montreal-01` config SHALL enable the sidecar for all 11 KV instances.
 
-#### Scenario: Public HTTP is disabled
-- **WHEN** a KV instance sets `http.public` to false
-- **THEN** its sidecar can run locally but no Nginx Proxy Manager route is rendered
+#### Scenario: External route data is recorded
+- **WHEN** a KV instance defines its intended HTTP domain and loopback port
+- **THEN** validation checks the contract without inspecting or changing the external proxy
 
 #### Scenario: Initial HTTP coverage is checked
 - **WHEN** the initial `montreal-01` config is validated
-- **THEN** all 11 KV instances have enabled public HTTP settings with unique loopback ports
+- **THEN** all 11 KV instances have enabled HTTP settings with unique loopback ports
 
 ### Requirement: Standard HTTP domains
 Target HTTP domains SHALL use `<instance>.kv-montreal-01.storage.evanovation.com`. Current legacy domains MAY be recorded as current facts, but the target SHALL NOT use `kv-na01.storage.evanovation.com`.

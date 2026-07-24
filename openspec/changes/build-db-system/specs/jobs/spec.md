@@ -1,11 +1,15 @@
 ## ADDED Requirements
 
 ### Requirement: Direct commands
-The CLI SHALL provide `backup <instance>`, `restore-check <instance>`, `status`, and `validate` commands. Commands SHALL use short option and function names that match the terms used by operators.
+The CLI SHALL provide `backup <group> <instance>`, `restore-check <group> <instance>`, `status`, and `validate` commands, where group is `postgres` or `kv`. Commands SHALL use short option and function names that match the terms used by operators.
 
 #### Scenario: Named backup runs
-- **WHEN** an operator runs `evanovation-db backup vercount-prod-01`
-- **THEN** only that instance is backed up and the command returns success only after its required checks and upload succeed
+- **WHEN** an operator runs `evanovation-db backup postgres vercount-prod-01`
+- **THEN** only the Postgres instance is backed up and the command returns success only after its required checks and upload succeed
+
+#### Scenario: Product has Postgres and KV
+- **WHEN** an operator runs `evanovation-db backup kv vercount-prod-01`
+- **THEN** the KV instance is selected without changing or backing up its Postgres instance
 
 ### Requirement: Safe command execution
 External commands SHALL use argument arrays without `shell=True`, enforce timeouts, check return codes, and redact secret values from logs and errors.

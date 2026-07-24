@@ -1,0 +1,67 @@
+---
+- name: Read release revision on the controller
+  ansible.builtin.command:
+    argv:
+      - git
+      - rev-parse
+      - HEAD
+    chdir: "{{ evdb_repo }}"
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  changed_when: false
+  register: evdb_git
+  when: evdb_release | length == 0
+
+- name: Select release revision
+  ansible.builtin.set_fact:
+    evdb_release_id: "{{ evdb_release if evdb_release | length > 0 else evdb_git.stdout }}"
+
+- name: Check release revision
+  ansible.builtin.assert:
+    that:
+      - evdb_release_id is match('^[0-9a-f]{7,40}$')
+    fail_msg: evdb_release must be a 7-40 character Git SHA
+
+- name: Create release directory
+  ansible.builtin.file:
+    path: "{{ evdb_root }}/releases/{{ evdb_release_id }}"
+    state: directory
+    owner: "{{ evdb_admin_user }}"
+    group: "{{ evdb_admin_group }}"
+    mode: "0755"
+  when: evdb_plan | bool
+
+- name: Install application package
+  ansible.builtin.copy:
+    src: "{{ evdb_repo }}/src/evanovation_db"
+    dest: "{{ evdb_root }}/releases/{{ evdb_release_id }}/src/"
+    owner: "{{ evdb_admin_user }}"
+    group: "{{ evdb_admin_group }}"
+    mode: preserve
+  when: evdb_plan | bool
+
+- name: Install release metadata
+  ansible.builtin.copy:
+    src: "{{ evdb_repo }}/{{ item }}"
+    dest: "{{ evdb_root }}/releases/{{ evdb_release_id }}/{{ item }}"
+    owner: "{{ evdb_admin_user }}"
+    group: "{{ evdb_admin_group }}"
+    mode: "0644"
+  loop:
+    - pyproject.toml
+    - README.md
+  when: evdb_plan | bool
+
+- name: Check installed Python files
+  ansible.builtin.command:
+    argv:
+      - "{{ evdb_python }}"
+      - -m
+      - compileall
+      - -q
+      - "{{ evdb_root }}/releases/{{ evdb_release_id }}/src/evanovation_db"
+  changed_when: false
+  when:
+    - evdb_write | bool
+    - not ansible_check_mode

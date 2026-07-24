@@ -1,0 +1,21 @@
+[Unit]
+Description=Check Evanovation database backup status
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=evanovation-db
+Group=evanovation-db
+Environment=PYTHONPATH=/opt/evanovation-db/current/src
+ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /etc/evanovation-db status
+TimeoutStartSec=15m
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+IOWeight=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/evanovation-db

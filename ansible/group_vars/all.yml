@@ -1,0 +1,21 @@
+evdb_user: evanovation-db
+evdb_group: evanovation-db
+evdb_admin_user: root
+evdb_admin_group: root
+evdb_root: /opt/evanovation-db
+evdb_config_dir: /etc/evanovation-db
+evdb_secret_dir: /etc/evanovation-db/secrets
+evdb_state_dir: /var/lib/evanovation-db
+evdb_unit_dir: /etc/systemd/system
+evdb_repo: "{{ playbook_dir }}/.."
+evdb_source_dir: "{{ evdb_repo }}/config/montreal-01"
+evdb_python: /usr/bin/python3
+evdb_manage_user: true
+evdb_manage_systemd: true
+evdb_enable_timers: false
+evdb_skip_secrets: false
+evdb_release: ""
+
+# Local hosts are disposable. Production writes additionally require apply=yes.
+evdb_write: "{{ (not (evdb_prod | default(false) | bool)) or (apply | default('no') == 'yes') }}"
+evdb_plan: "{{ evdb_write | bool or ansible_check_mode }}"

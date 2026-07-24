@@ -1,0 +1,28 @@
+---
+- name: Validate rendered config with the new release
+  ansible.builtin.command:
+    argv:
+      - "{{ evdb_python }}"
+      - -m
+      - evanovation_db.cli
+      - --config
+      - "{{ evdb_config_dir }}"
+      - validate
+  environment:
+    PYTHONPATH: "{{ evdb_root }}/releases/{{ evdb_release_id }}/src"
+  changed_when: false
+  when:
+    - evdb_write | bool
+    - not ansible_check_mode
+
+- name: Switch current release after checks
+  ansible.builtin.file:
+    src: "{{ evdb_root }}/releases/{{ evdb_release_id }}"
+    dest: "{{ evdb_root }}/current"
+    state: link
+    owner: "{{ evdb_admin_user }}"
+    group: "{{ evdb_admin_group }}"
+    force: true
+  when:
+    - evdb_write | bool
+    - not ansible_check_mode

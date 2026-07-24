@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Evanovation database status check
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+RandomizedDelaySec=30m
+FixedRandomDelay=true
+AccuracySec=1m
+Unit=evanovation-db-status.service
+
+[Install]
+WantedBy=timers.target

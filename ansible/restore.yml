@@ -1,0 +1,46 @@
+---
+- name: Install and optionally run restore checks
+  hosts: "{{ target | default('test') }}"
+  become: "{{ evdb_become | default(true) }}"
+  gather_facts: false
+  pre_tasks:
+    - name: Require explicit production target
+      ansible.builtin.assert:
+        that:
+          - not (evdb_prod | default(false) | bool) or target | default('') == 'production'
+        fail_msg: Production must be selected with -e target=production
+  roles:
+    - base
+    - app
+    - backup
+  post_tasks:
+    - name: Activate checked release
+      ansible.builtin.include_role:
+        name: app
+        tasks_from: activate
+
+    - name: Require a named restore when apply is requested
+      ansible.builtin.assert:
+        that:
+          - restore_group | default('') in ['postgres', 'kv']
+          - restore_name | default('') | length > 0
+        fail_msg: Restore apply requires restore_group and restore_name
+      when: apply | default('no') == 'yes'
+
+    - name: Run the isolated restore check
+      ansible.builtin.command:
+        argv:
+          - "{{ evdb_python }}"
+          - -m
+          - evanovation_db.cli
+          - --config
+          - "{{ evdb_config_dir }}"
+          - restore-check
+          - "{{ restore_group }}"
+          - "{{ restore_name }}"
+      environment:
+        PYTHONPATH: "{{ evdb_root }}/current/src"
+      when:
+        - apply | default('no') == 'yes'
+        - not ansible_check_mode
+      changed_when: false

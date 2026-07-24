@@ -1,33 +1,33 @@
 ## 1. Project Setup
 
-- [ ] 1.1 Add `pyproject.toml` for Python 3.10+, the `evanovation-db` command, Ruff, and pytest
+- [x] 1.1 Add `pyproject.toml` for Python 3.10+, the `evanovation-db` command, Ruff, and pytest
 - [ ] 1.2 Add the agreed `src`, `config`, `compose`, `ansible`, `systemd`, `tests`, and `docs` folders as real files need them
 - [ ] 1.3 Add a Makefile with `check`, `plan`, `deploy-backup`, `deploy-db`, `backup`, `restore-check`, and `status` targets
-- [ ] 1.4 Add README and AGENTS guidance covering scope, simple naming, no production writes, and development commands
+- [x] 1.4 Add README and AGENTS guidance covering scope, simple naming, no production writes, and development commands
 - [ ] 1.5 Add CI for lint, unit tests, integration tests, config checks, Compose checks, Ansible syntax, systemd checks, and secret scanning
 
 ## 2. Config
 
-- [ ] 2.1 Add `Host` and `Instance` config types with JSON loading in `config.py`
-- [ ] 2.2 Add checks for required fields, engine values, backup rules, HTTP settings, current and target settings, and safe data paths
-- [ ] 2.3 Add checks for duplicate ids, containers, projects, loopback ports, and domains while allowing Traefik's shared host ports
-- [ ] 2.4 Add checks for `op://` secret references and pinned target image versions and digests
-- [ ] 2.5 Add source YAML loading and JSON rendering for development and the Ansible controller
-- [ ] 2.6 Record the 14 Postgres, 7 Dragonfly, and 4 Redis instances from read-only production facts
-- [ ] 2.7 Record current Docker image ids and safe target database and HTTP images without changing an engine or data path
-- [ ] 2.8 Add exact 1Password references without reading or storing secret values
-- [ ] 2.9 Add config tests for all valid and invalid cases, including the four Redis instances whose current Compose template says Dragonfly and all 11 initial HTTP routes
+- [x] 2.1 Add `Host` and `Instance` config types with JSON loading in `config.py`
+- [x] 2.2 Add checks for required fields, engine values, backup rules, HTTP settings, current and target settings, and safe data paths
+- [x] 2.3 Check ids and projects within Postgres or KV, check host-wide names and routes, and allow Traefik's shared host ports
+- [x] 2.4 Add checks for `op://` secret references and pinned target image versions and digests
+- [x] 2.5 Add source YAML loading and JSON rendering for development and the Ansible controller
+- [x] 2.6 Record the 14 Postgres, 7 Dragonfly, and 4 Redis instances from read-only production facts
+- [x] 2.7 Record current Docker image ids and safe target database and HTTP images without changing an engine or data path
+- [x] 2.8 Add exact 1Password references without reading or storing secret values
+- [x] 2.9 Add config tests for all valid and invalid cases, including the four Redis instances whose current Compose template says Dragonfly and all 11 initial HTTP routes
 
 ## 3. Shared Python Code
 
-- [ ] 3.1 Add direct error types for config, commands, backups, restores, and Restic failures
-- [ ] 3.2 Implement `run.py` with argument arrays, timeouts, streamed output, checked return codes, and no shell
-- [ ] 3.3 Add secret redaction for arguments, stdout, stderr, exceptions, and structured logs
-- [ ] 3.4 Implement `docker.py` for inspect, exec, copy, run, stop, and remove operations
-- [ ] 3.5 Implement `lock.py` with instance and repository `fcntl` locks and clear lock timeouts
-- [ ] 3.6 Implement `files.py` with private folders, free-space checks, SHA-256, atomic JSON writes, and safe renames
-- [ ] 3.7 Implement `manifest.py` for reading, writing, and checking `backup.json`
-- [ ] 3.8 Add unit tests for command handling, timeouts, redaction, Docker commands, locks, files, and manifests
+- [x] 3.1 Add direct error types for config, commands, backups, restores, and Restic failures
+- [x] 3.2 Implement `run.py` with argument arrays, timeouts, streamed output, checked return codes, and no shell
+- [x] 3.3 Add secret redaction for arguments, stdout, stderr, exceptions, and structured logs
+- [x] 3.4 Implement `docker.py` for inspect, exec, copy, run, stop, and remove operations
+- [x] 3.5 Implement `lock.py` with instance and repository `fcntl` locks and clear lock timeouts
+- [x] 3.6 Implement `files.py` with private folders, free-space checks, SHA-256, atomic JSON writes, and safe renames
+- [x] 3.7 Implement `manifest.py` for reading, writing, and checking `backup.json`
+- [x] 3.8 Add unit tests for command handling, timeouts, redaction, Docker commands, locks, files, and manifests
 
 ## 4. Backup Flow
 
@@ -70,16 +70,16 @@
 
 ## 8. Serverless HTTP
 
-- [ ] 8.1 Add per-instance `enabled`, `public`, `port`, `domain`, `image`, `token`, and `max_connections` HTTP config
-- [ ] 8.2 Enable the sidecar and public route for all 11 initial KV instances with unique loopback ports and standard target domains
+- [ ] 8.1 Add per-instance `enabled`, `port`, `domain`, `image`, `token`, and `max_connections` HTTP config
+- [ ] 8.2 Enable the sidecar for all 11 initial KV instances with unique loopback ports and standard intended domains
 - [ ] 8.3 Add the pinned `serverless-redis-http` sidecar to both Redis and Dragonfly Compose output
 - [ ] 8.4 Bind each sidecar only to its unique `127.0.0.1:133xx` port and connect it to the instance-specific backend name
 - [ ] 8.5 Render `SRH_TOKEN` and `SRH_CONNECTION_STRING` through a private environment file built from 1Password references
-- [ ] 8.6 Add the HTTP Ansible role to plan NPM proxy hosts through its API without editing generated config files
-- [ ] 8.7 Guard all NPM API writes behind the explicit production apply flag and reject unapproved NPM versions
-- [ ] 8.8 Record the missing `oai-co-prod-02` route and the two `kv-na01` to `kv-montreal-01` target domain moves for `move-prod`
-- [ ] 8.9 Test invalid and valid tokens, Redis and Dragonfly support, loopback-only binding, and per-instance public choices
-- [ ] 8.10 Test two HTTPS hostnames on one port 443 and prove each sidecar reaches only its own seeded backend
+- [ ] 8.6 Treat the domain and loopback port as a read-only contract for an external proxy
+- [ ] 8.7 Assert that Ansible has no external proxy credentials, API calls, image checks, or route writes
+- [ ] 8.8 Record the missing `oai-co-prod-02` route and two legacy domains as informational `move-prod` follow-ups
+- [ ] 8.9 Test invalid and valid tokens, Redis and Dragonfly support, loopback-only binding, and per-instance enablement
+- [ ] 8.10 Test two enabled sidecars and prove each reaches only its own seeded backend
 
 ## 9. Restic
 
@@ -105,7 +105,7 @@
 
 ## 11. CLI, Status, and Jobs
 
-- [ ] 11.1 Implement `cli.py` with `backup`, `restore-check`, `status`, and `validate` commands
+- [ ] 11.1 Implement `cli.py` with grouped `backup` and `restore-check` commands plus `status` and `validate`
 - [ ] 11.2 Add concise human output, useful exit codes, and optional JSON output for automation
 - [ ] 11.3 Implement `status.py` for local backup, upload, snapshot, failure, and restore-test state
 - [ ] 11.4 Mark confirmed snapshots older than about 26 hours and restore tests older than 30 days as stale
@@ -125,7 +125,7 @@
 - [ ] 12.6 Add the base role for the service account, directories, permissions, and documented Docker trust
 - [ ] 12.7 Add the app role for root-owned versioned releases and checked current-link changes
 - [ ] 12.8 Add the backup role for rendered JSON, secrets, mutable rclone config seeding, state folders, and disabled systemd units
-- [ ] 12.9 Add Postgres, KV, Traefik, and HTTP roles that render files without applying production changes by default
+- [ ] 12.9 Add Postgres, KV, and Traefik roles that render files without applying production changes by default
 - [ ] 12.10 Add backup, databases, and restore playbooks with explicit target and production apply guards
 - [ ] 12.11 Keep 1Password resolution on the controller with `no_log` and make check mode work without secret values
 - [ ] 12.12 Add Compose render checks, Ansible syntax checks, systemd verification, and disposable-host deployment tests
@@ -135,7 +135,7 @@
 - [ ] 13.1 Document local setup, config fields, commands, test requirements, and release layout
 - [ ] 13.2 Document backup files, status, Restic work, local history, and failure handling
 - [ ] 13.3 Document Postgres, Redis, and Dragonfly restore tests and their limits
-- [ ] 13.4 Document native Traefik routes, serverless HTTP, NPM routes, tokens, and per-instance HTTP choices
+- [ ] 13.4 Document native Traefik routes, serverless HTTP, tokens, and the external proxy ownership boundary
 - [ ] 13.5 Document secrets, rclone token ownership, reconnect, and safe 1Password handling
 - [ ] 13.6 Document Ansible, Compose, systemd, image updates, and the production guard
 - [ ] 13.7 Write `move-prod.md` with the missing HTTP route and legacy domain moves, without running any production step

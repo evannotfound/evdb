@@ -1,0 +1,21 @@
+[Unit]
+Description=Monthly Evanovation Restic prune for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=evanovation-db
+Group=evanovation-db
+Environment=PYTHONPATH=/opt/evanovation-db/current/src
+ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /etc/evanovation-db maintain prune %i --apply
+TimeoutStartSec=48h
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=5
+IOWeight=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/evanovation-db

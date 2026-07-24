@@ -1,0 +1,13 @@
+[Unit]
+Description=Monthly Evanovation Restic prune for %i
+
+[Timer]
+OnCalendar=*-*-01 04:00:00
+Persistent=true
+RandomizedDelaySec=1d
+FixedRandomDelay=true
+AccuracySec=10m
+Unit=evanovation-db-monthly@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,44 @@
+name: {{ instance.project }}
+
+services:
+  {{ instance.id }}-redis:
+    image: {{ instance.target.image }}
+    container_name: {{ instance.container }}
+    restart: unless-stopped
+    command:
+      - --flagfile=/run/secrets/dragonfly.flags
+    volumes:
+      - {{ instance.data }}:/data
+      - {{ secret_dir }}/kv-{{ instance.id }}.flags:/run/secrets/dragonfly.flags:ro
+    networks:
+      - traefik-net
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: traefik-net
+      traefik.tcp.routers.kv-{{ instance.id }}.entrypoints: redis
+      traefik.tcp.routers.kv-{{ instance.id }}.rule: HostSNI(`{{ instance.domain }}`)
+      traefik.tcp.routers.kv-{{ instance.id }}.tls: "true"
+      traefik.tcp.services.kv-{{ instance.id }}.loadbalancer.server.port: "6379"
+{% if instance.http.enabled %}
+
+  {{ instance.id }}-http:
+    image: {{ instance.http.image }}
+    container_name: {{ instance.id }}-http-1
+    restart: unless-stopped
+    env_file:
+      - {{ secret_dir }}/kv-{{ instance.id }}-http.env
+    environment:
+      SRH_MODE: env
+      SRH_MAX_CONNECTIONS: "{{ instance.http.max_connections }}"
+    depends_on:
+      - {{ instance.id }}-redis
+    ports:
+      - "127.0.0.1:{{ instance.http.port }}:80"
+    networks:
+      - traefik-net
+{% endif %}
+
+networks:
+  traefik-net:
+    external: true
+    name: traefik-net

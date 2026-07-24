@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Evanovation database backup for %i
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+Persistent=true
+RandomizedDelaySec=6h
+FixedRandomDelay=true
+AccuracySec=1m
+Unit=evanovation-db-backup@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -4,11 +4,11 @@
 
 Every instance Compose file is a link to one shared template for its engine group. The current KV template says Dragonfly for all instances even though four running containers still use Redis. This means the files on disk do not fully describe what is running.
 
-All 11 KV instances run a `serverless-redis-http` sidecar on a unique loopback port. Nginx Proxy Manager owns public ports 80 and 443 and currently routes ten HTTPS domains to those ports. `oai-co-prod-02` has no public route, and two routes still use the old `kv-na01.storage.evanovation.com` suffix. The target config enables public HTTP for all 11 and uses the `kv-montreal-01.storage.evanovation.com` suffix.
+All 11 KV instances run a `serverless-redis-http` sidecar on a unique loopback port. An external proxy owns public HTTP routing. `oai-co-prod-02` has no public route, and two routes still use the old `kv-na01.storage.evanovation.com` suffix. Those external route facts are recorded only for the later production move.
 
 The repository is currently empty apart from project setup. This change builds the full system locally. It can read production facts over SSH, but it does not deploy to production or change production files, jobs, repositories, containers, images, or secrets. A later `move-prod` change will do that work.
 
-Production uses Ubuntu 22.04 ARM64, Python 3.10, Docker 29, Compose 2.40, Restic 0.12.1, rclone 1.68.1, two existing Restic repositories on OneDrive, Traefik TCP TLS/SNI routing, and Nginx Proxy Manager HTTPS routing. The new runtime should need only Python's standard library.
+Production uses Ubuntu 22.04 ARM64, Python 3.10, Docker 29, Compose 2.40, Restic 0.12.1, rclone 1.68.1, two existing Restic repositories on OneDrive, Traefik TCP TLS/SNI routing, and an externally managed HTTPS proxy. The new runtime should need only Python's standard library.
 
 ## Goals / Non-Goals
 
@@ -17,8 +17,8 @@ Production uses Ubuntu 22.04 ARM64, Python 3.10, Docker 29, Compose 2.40, Restic
 - Build one clear system for config, backup, restore tests, Restic, status, deployment, and scheduled jobs.
 - Record all 25 managed instances without committing secrets.
 - Support Postgres, Redis, and Dragonfly as separate engines.
-- Support an optional authenticated serverless HTTP sidecar for each KV instance, with all 11 initially enabled and public.
-- Preserve shared Postgres and KV ports through Traefik and shared HTTPS through Nginx Proxy Manager.
+- Support an optional authenticated serverless HTTP sidecar for each KV instance, with all 11 initially enabled on loopback.
+- Preserve shared Postgres and KV ports through Traefik and leave public HTTPS routing outside this repository.
 - Prove backup and restore behavior with disposable local containers and a local Restic repository.
 - Build and test Ansible, Compose, and systemd files without running them on production.
 - Keep file, function, class, and command names short, direct, and natural.
@@ -29,7 +29,7 @@ Production uses Ubuntu 22.04 ARM64, Python 3.10, Docker 29, Compose 2.40, Restic
 - Replacing cron, changing Compose ownership, restarting databases, changing images, upgrading Restic, rotating secrets, or touching the OneDrive repositories.
 - Changing any running Redis instance to Dragonfly.
 - Moving database data or redesigning Traefik.
-- Replacing Nginx Proxy Manager or taking over its unrelated proxy hosts.
+- Inspecting, configuring, authenticating to, or changing the external HTTP proxy.
 - Adding PITR, WAL tools, replication, failover, Kubernetes, a dashboard, a daemon, or a plugin system.
 - Choosing the production alert service. Status and exit codes are built here; alert wiring is part of `move-prod`.
 
@@ -66,11 +66,11 @@ Related deployment and test files use the same names:
 config/montreal-01/{host,postgres,kv}.yml
 compose/{postgres,redis,dragonfly,traefik}.yml.j2
 ansible/{hosts,backup,databases,restore}.yml
-ansible/roles/{base,app,backup,postgres,kv,traefik,http}/
+ansible/roles/{base,app,backup,postgres,kv,traefik}/
 tests/{unit,integration,config,fixtures}/
 ```
 
-Module names give functions their context, so names stay short: `postgres.backup()`, `redis.restore()`, `restic.upload()`, `manifest.write()`, and `docker.exec()`. The implementation will not add service, provider, adapter, manager, factory, or plugin classes unless a concrete need appears.
+Module names give functions their context, so names stay short: `postgres.backup()`, `redis.restore()`, `restic.upload()`, `manifest.write()`, and `docker.exec()`. CLI commands use `postgres <name>` or `kv <name>` because four product ids exist in both groups. The implementation will not add service, provider, adapter, manager, factory, or plugin classes unless a concrete need appears.
 
 The alternative flat layout was shorter but would mix engine backup and restore work in large files. A deeper framework layout would add names without adding useful boundaries.
 
@@ -83,7 +83,7 @@ Each instance keeps two simple sections:
 - `current`: what Docker reports now, including engine, image name, image id, data path, and Compose file.
 - `target`: what this repository will render later, including pinned image and the same engine and data path.
 
-KV config also has a short `http` section with `enabled`, `public`, `port`, `domain`, `image`, `token`, and `max_connections`. These are per-instance choices. All 11 start enabled and public, but future instances can choose otherwise.
+KV config also has a short `http` section with `enabled`, `port`, `domain`, `image`, `token`, and `max_connections`. The domain and loopback port are an integration contract for the external proxy owner. All 11 sidecars start enabled.
 
 This handles the four Redis containers whose shared Compose template now says Dragonfly. It also lets validation reject accidental engine or data-path changes before any future production run.
 
@@ -172,7 +172,7 @@ Git stores only `op://` references. The Ansible controller resolves them with `n
 
 Postgres uses `POSTGRES_PASSWORD_FILE`. Redis uses a private mounted config. Dragonfly uses a private mounted flag file and `--flagfile`; this avoids putting `--requirepass` in the Compose command. The HTTP bridge uses a private environment file because its image expects `SRH_TOKEN` and `SRH_CONNECTION_STRING` in the environment.
 
-Compose templates are separate for Postgres, Redis, and Dragonfly. They preserve the existing project names, paths, resources, network, and Traefik TCP TLS/SNI labels. The four current Redis instances render as Redis. Traefik behavior is copied, not redesigned.
+Compose templates are separate for Postgres, Redis, and Dragonfly. They preserve the existing project names, paths, resources, network, and Traefik TCP TLS/SNI labels. The four current Redis instances render as Redis. Traefik behavior is copied, not redesigned. The target uses Traefik 3.7.8 because 3.6.0 cannot negotiate the Docker 29 API; this target change is tested locally and belongs to the later production migration.
 
 ### Native database routing
 
@@ -194,21 +194,17 @@ The instance-specific backend name is required. A shared `redis` alias is unsafe
 
 Every enabled KV HTTP sidecar runs in its instance's Compose project, connects to that instance's unique Redis or Dragonfly container name, and publishes container port 80 only on its configured `127.0.0.1:133xx` port. It has no Traefik labels.
 
-Nginx Proxy Manager remains in host network mode and owns public ports 80 and 443:
+Public HTTP is owned by an external proxy:
 
 ```text
 https://<instance>.kv-montreal-01.storage.evanovation.com
-  -> Nginx Proxy Manager :443
+  -> external proxy :443
   -> 127.0.0.1:133xx
   -> serverless-redis-http
   -> <instance>-redis-1:6379
 ```
 
-The same KV hostname therefore supports native TLS on port 6379 and HTTPS on port 443. All 11 target instances are public initially. `http.public: false` keeps a sidecar local, and `http.enabled: false` removes it.
-
-The `http` Ansible role reads desired routes from KV config. It uses the Nginx Proxy Manager API to list and plan routes. Write calls require the same explicit production apply guard as database deployment. The role never edits NPM's generated `data/nginx/proxy_host` files and never changes unrelated proxy hosts.
-
-The target route set adds `oai-co-prod-02` and moves the two old `kv-na01.storage.evanovation.com` domains to matching `kv-montreal-01.storage.evanovation.com` domains during `move-prod`. This change only builds and tests that target state.
+The repository records the intended domain and loopback port but never inspects or changes the external proxy. `http.enabled: false` removes the sidecar. The missing route and two legacy domains remain informational follow-up items for the external proxy owner during `move-prod`.
 
 ### Releases and Ansible
 
@@ -216,7 +212,7 @@ The `app` role installs a root-owned release at `/opt/evanovation-db/releases/<g
 
 The service account owns state and secret files and belongs to the Docker group. Documentation calls out that Docker access is root-equivalent.
 
-Production is never the default target. Make and Ansible require an explicit target, and any production apply also requires an explicit production flag. The integration suite creates disposable local inventory and does not use `montreal-01`. HTTP route tests use a local HTTPS listener and NPM API fixtures or a pinned disposable NPM instance; they never call the production NPM API.
+Production is never the default target. Make and Ansible require an explicit target, and any production apply also requires an explicit production flag. The integration suite creates disposable local inventory and does not use `montreal-01`. HTTP tests exercise only disposable sidecars and never contact an external proxy.
 
 ### Systemd jobs and status
 
@@ -228,7 +224,7 @@ Systemd has per-instance backup units plus status, restore, and maintenance unit
 
 Unit tests cover config, command execution, redaction, locks, files, manifests, Restic JSON, status, and engine command building.
 
-Integration tests use disposable Postgres, Redis, and Dragonfly containers. They seed strings, sets, hashes, databases, tables, roles, and TTLs; then run backup and restore checks. They also cover stale files, partial folders, failed uploads, one-instance failure, generated Compose, Ansible, systemd units, shared Traefik ports, HTTP auth, NPM host routing, and cross-instance isolation.
+Integration tests use disposable Postgres, Redis, and Dragonfly containers. They seed strings, sets, hashes, databases, tables, roles, and TTLs; then run backup and restore checks. They also cover stale files, partial folders, failed uploads, one-instance failure, generated Compose, Ansible, systemd units, shared Traefik ports, HTTP auth, and cross-instance isolation.
 
 CI runs Ruff, pytest, secret scanning, Compose validation, Ansible syntax checks, and the local integration suite where Docker is available.
 
@@ -241,7 +237,7 @@ CI runs Ruff, pytest, secret scanning, Compose validation, Ansible syntax checks
 - [Risk] Local unuploaded backups can grow after a long remote failure. -> Keep them, stop before a free-space limit, and return a visible failure instead of deleting recovery data.
 - [Risk] Preserved Postgres role hashes make `globals.sql` sensitive. -> Keep folders private, encrypt off-site copies with Restic, redact logs, and never include globals in test output.
 - [Risk] A stale rclone token escrow might not rebuild a blank host. -> Keep the live file mutable and document reconnect plus manual escrow refresh before production migration.
-- [Risk] Nginx Proxy Manager's API can change between releases. -> Record the current NPM version, test the exact API contract locally, and refuse route writes when the version is not approved.
+- [Risk] External proxy routes can drift from the recorded domain and loopback contract. -> Keep the contract documented and verify it separately during `move-prod`; this repository never reconciles it.
 - [Risk] Shared Docker aliases can send a KV route to the wrong instance. -> Use only instance-specific backend names and test two projects on the same network.
 - [Trade-off] Standard-library-only production code means direct subprocess and JSON handling. -> Keep wrappers small and test command boundaries heavily.
 - [Trade-off] Building deployment files before using them cannot prove all production details. -> Test disposable hosts now and require a separate production plan and fresh facts later.

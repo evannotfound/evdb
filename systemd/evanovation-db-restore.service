@@ -1,0 +1,22 @@
+[Unit]
+Description=Restore-check the most overdue Evanovation database
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=evanovation-db
+Group=evanovation-db
+SupplementaryGroups=docker
+Environment=PYTHONPATH=/opt/evanovation-db/current/src
+ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /etc/evanovation-db restore-due --run
+TimeoutStartSec=8h
+Nice=15
+IOSchedulingClass=idle
+CPUWeight=10
+IOWeight=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/evanovation-db
