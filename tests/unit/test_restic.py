@@ -132,6 +132,24 @@ def test_restore_finds_checked_backup(config, tmp_path, monkeypatch):
     target = tmp_path / "staging"
 
     def fake_run(host, group, args, **kwargs):
+        if args == ["snapshots", "--json", "snapshot"]:
+            return Result(
+                ("restic",),
+                0,
+                json.dumps(
+                    [
+                        {
+                            "id": "snapshot",
+                            "tags": [
+                                f"host:{host.id}",
+                                f"engine:{instance.engine}",
+                                f"instance:{instance.id}",
+                            ],
+                        }
+                    ]
+                ),
+                "",
+            )
         if args == ["cat", "config"]:
             return Result(("restic",), 0, '{"version":1}', "")
         folder = target / "source/backup"
@@ -148,3 +166,118 @@ def test_restore_finds_checked_backup(config, tmp_path, monkeypatch):
     folder = restic.restore(config.host, instance, "snapshot", target)
 
     assert folder == (target / "source/backup").resolve()
+
+
+def test_snapshots_requires_all_exact_identity_tags(config, monkeypatch):
+    instance = config.get("postgres", "test-dev-01")
+    seen = {}
+
+    def fake_run(host, group, args, **kwargs):
+        seen["args"] = args
+        return Result(
+            ("restic",),
+            0,
+            json.dumps(
+                [
+                    {
+                        "id": "correct",
+                        "tags": [
+                            f"host:{host.id}",
+                            f"engine:{instance.engine}",
+                            f"instance:{instance.id}",
+                        ],
+                    },
+                    {"id": "wrong-host", "tags": [f"instance:{instance.id}"]},
+                ]
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(restic, "_run", fake_run)
+
+    snapshots = restic.snapshots(config.host, instance)
+
+    assert [item["id"] for item in snapshots] == ["correct"]
+    assert seen["args"] == [
+        "snapshots",
+        "--json",
+        "--tag",
+        f"engine:{instance.engine},host:{config.host.id},instance:{instance.id}",
+    ]
+
+
+def test_select_snapshot_rejects_cross_host_or_database(config, monkeypatch):
+    instance = config.get("postgres", "test-dev-01")
+    monkeypatch.setattr(
+        restic,
+        "_run",
+        lambda *args, **kwargs: Result(
+            ("restic",),
+            0,
+            json.dumps(
+                [
+                    {
+                        "id": "snapshot-id",
+                        "tags": [
+                            "host:other-host",
+                            f"engine:{instance.engine}",
+                            "instance:other-database",
+                        ],
+                    }
+                ]
+            ),
+            "",
+        ),
+    )
+
+    with pytest.raises(ResticError, match="does not belong"):
+        restic.select_snapshot(config.host, instance, "snapshot-id")
+
+
+def test_select_snapshot_latest_uses_newest_exact_identity(config, monkeypatch):
+    instance = config.get("postgres", "test-dev-01")
+    monkeypatch.setattr(
+        restic,
+        "snapshots",
+        lambda host, selected: [
+            {"id": "older", "time": "2026-07-24T10:00:00Z"},
+            {"id": "newest", "time": "2026-07-25T10:00:00+00:00"},
+            {"id": "invalid", "time": "not-a-time"},
+        ],
+    )
+
+    assert restic.select_snapshot(config.host, instance, "latest")["id"] == "newest"
+
+
+def test_select_snapshot_latest_rejects_missing_exact_identity(config, monkeypatch):
+    instance = config.get("postgres", "test-dev-01")
+    monkeypatch.setattr(restic, "snapshots", lambda host, selected: [])
+
+    with pytest.raises(ResticError, match="no snapshot exists"):
+        restic.select_snapshot(config.host, instance, "latest")
+
+
+def test_run_redacts_password_and_rclone_values_without_putting_them_in_arguments(
+    config, monkeypatch
+):
+    rclone = config.host.state_dir / "rclone/rclone.conf"
+    rclone.parent.mkdir(parents=True)
+    rclone.write_text(
+        "[remote]\ntype = s3\naccess_key_id = private-access\nsecret_access_key = private-secret\n"
+    )
+    seen = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return Result(tuple(args), 0, "", "")
+
+    monkeypatch.setattr(restic, "run", fake_run)
+
+    restic._run(config.host, "postgres", ["snapshots"])
+
+    command = " ".join(seen["args"])
+    assert "test-password" not in command
+    assert "private-access" not in command
+    assert "private-secret" not in command
+    assert {"test-password", "private-access", "private-secret"}.issubset(seen["kwargs"]["secrets"])

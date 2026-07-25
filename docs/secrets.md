@@ -1,25 +1,54 @@
-# Secrets and rclone
+# 1Password and secret output
 
-Git stores `op://` references only. Database passwords, HTTP tokens, Restic passwords, and
-rclone bootstrap config must not be replaced with resolved values in source YAML, Compose,
-tests, logs, or release directories.
+## Controller authentication
 
-Ansible runs `op read` on the trusted controller with `command.argv`, `delegate_to:
-localhost`, and `no_log`. The value is immediately written to the managed host as the
-service account with mode `0600`. Check mode and the disposable inventory skip resolution,
-so non-secret templates remain checkable without 1Password access or placeholder secrets.
+The complete controller workflow requires 1Password CLI authenticated through either:
 
-Postgres receives a mounted password file through `POSTGRES_PASSWORD_FILE`. PgBouncer uses
-a private users file. Redis starts from a private config containing `requirepass`.
-Dragonfly starts with only `--flagfile` in Compose and reads its password from that private
-file. HTTP sidecars read `SRH_TOKEN` and `SRH_CONNECTION_STRING` from a private environment
-file.
+- A desktop-authenticated account that can read and write the configured vault.
+- A service account with `write_items` for that vault.
 
-The live rclone config is mutable OAuth state, not a normal rendered secret. Ansible checks
-`/var/lib/evanovation-db/rclone/rclone.conf`, seeds it from 1Password only when absent, sets
-mode `0600`, and uses `force: false`. Later deploys leave refreshed tokens untouched.
+1Password Connect supports the controller's `op read` credential path, so read-only credential
+resolution such as `evdb show` can use it. Connect cannot create or edit items. `evdb create` and
+any credential-creation path preflight write access and reject Connect-only authentication before
+changing source or the remote host. Use desktop authentication or a write-capable service account
+for normal operator work.
 
-If rclone loses authorization, stop jobs using that repository, run the documented rclone
-reconnect flow interactively as the service account, test read access, then resume jobs.
-After a successful reconnect, refresh the separately controlled bootstrap escrow before a
-host rebuild. Never copy the live file into Git, Ansible output, a ticket, or a release.
+The host config stores only vault and system item names. Database item names are derived as
+`<name>-postgres` for Postgres and `<name>-kv` for Redis or Dragonfly. Every item has a concealed
+`password`; HTTP-enabled KV items also have a concealed `http-token`. The system item supplies
+concealed `restic-password` and `rclone-config` fields.
+
+Create is idempotent. Existing concealed values are reused and never rotated. Missing fields are
+generated and passed to `op item create` or `op item edit` through a JSON stdin template, never
+through process arguments.
+
+## Deliberate show output
+
+**`evdb show <database>` always prints complete current credentials to the terminal on every
+successful run.** Postgres output includes a complete percent-encoded `postgresql://` URL. Redis
+and Dragonfly output includes a complete `rediss://` URL and, when HTTP is enabled, the current
+HTTP token. Treat terminal output, scrollback, recordings, and transcripts accordingly.
+
+`show` obtains non-secret deployment facts over SSH, validates the complete response, then reads
+credentials directly from local 1Password. Credential values are never requested from the host or
+sent over SSH by `show`. If any required field is unavailable, it exits nonzero without printing a
+partial URL, endpoint, or token.
+
+No other command output displays credentials. Source YAML, generated locks, normalized runtime
+JSON, release files and manifests, state, backup and release histories, structured logs, errors,
+SSH arguments, and remote protocol output remain credential-free. Protected runtime files needed
+by services are separate from releases and are never normal command output.
+
+## Protected host files
+
+Confirmed apply resolves deployment values locally and transfers protected content through stdin
+with redaction. The host writes mode `0600` service files under `/etc/evanovation-db/secrets` and
+the mutable rclone config under `/var/lib/evanovation-db/rclone`.
+
+Postgres receives a password file through `POSTGRES_PASSWORD_FILE`; PgBouncer uses a private users
+file. Redis reads a private config with `requirepass`. Dragonfly reads a private flag file. HTTP
+sidecars use a private environment file. The rclone config is seeded only when absent so refreshed
+OAuth state survives apply.
+
+Never put resolved values in Git, source or lock files, tests, tickets, Compose JSON, release
+directories, or command arguments.

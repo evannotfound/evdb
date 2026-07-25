@@ -15,6 +15,17 @@ def test_run_captures_output():
     assert result.out == "ok\n"
 
 
+@pytest.mark.parametrize("value", ["text input", b"byte input"])
+def test_run_sends_text_or_bytes_to_stdin(value):
+    result = run(
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+        input=value,
+    )
+
+    expected = "text input" if isinstance(value, str) else "byte input"
+    assert result.out == expected
+
+
 def test_run_streams_binary_output(tmp_path):
     target = tmp_path / "output"
     with target.open("wb") as output:

@@ -10,7 +10,7 @@ Group=evanovation-db
 SupplementaryGroups=docker
 Environment=PYTHONPATH=/opt/evanovation-db/current/src
 EnvironmentFile=/etc/evanovation-db/jobs/%i
-ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /etc/evanovation-db backup ${GROUP} ${NAME}
+ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /opt/evanovation-db/current/runtime backup ${GROUP} ${NAME}
 TimeoutStartSec=6h
 Nice=10
 IOSchedulingClass=idle

@@ -85,7 +85,7 @@ def _psql(instance: Instance, user: str, database: str, sql: str) -> str:
 def _check_archive(instance: Instance, archive: Path) -> None:
     if archive.stat().st_size == 0:
         raise BackupError(f"{archive.name} is empty")
-    image = str(instance.target["image"])
+    image = instance.image
     run(
         [
             "docker",

@@ -6,22 +6,28 @@ Traefik is the only Compose service that publishes host ports 5432 and 6379. Pos
 PgBouncer, Redis, and Dragonfly remain internal on the external `traefik-net` network.
 Every database container has an instance-specific name.
 
+The shared network and Traefik are release infrastructure. Apply inspects `traefik-net`, creates it
+when absent, applies and health-checks Traefik before affected databases, and restores the prior
+Traefik definition if a candidate release fails. Primary database and Traefik containers carry a
+generated service-contract hash label; plan and status treat a missing or wrong label as drift even
+when the image is unchanged.
+
 Traefik reads labels from the matching backend container. TLS `HostSNI` routes send
-`<instance>.postgres-montreal-01.storage.evanovation.com:5432` to that instance's PgBouncer
-or Postgres container and send `<instance>.kv-montreal-01.storage.evanovation.com:6379` to
-that instance's Redis or Dragonfly container. Shared aliases such as `redis` are not used
-across projects.
+`<name>.postgres-<host>.<domain>:5432` to that database's PgBouncer or Postgres container and
+send `<name>.kv-<host>.<domain>:6379` to that database's Redis or Dragonfly container. Shared
+aliases such as `redis` are not used across projects.
 
 ## Serverless HTTP
 
-When `http.enabled` is true, the KV Compose file adds the pinned
-`serverless-redis-http` image with `SRH_MODE=env` and the configured connection limit. Its
-private environment file contains the token and an instance-specific backend connection.
-Container port 80 publishes only as `127.0.0.1:<http.port>:80`; it has no Traefik labels.
+HTTP is enabled by default for Redis and Dragonfly. Generated Compose adds the locked
+`serverless-redis-http` image with `SRH_MODE=env` and a 20-connection default. Its private
+environment file contains the token and a database-specific backend connection. Container port
+80 publishes only as `127.0.0.1:<generated-port>:80`; it has no Traefik labels.
 
-`http.enabled: false` removes the sidecar. The initial config enables all 11 KV sidecars.
-The configured domain and loopback port form an integration contract for the external proxy
-owner; they do not cause any public route change.
+Per-database `http: false` removes the sidecar. Stable loopback ports are allocated and retained
+in tool-owned `host.lock.json`; operators do not set or edit them. The derived domain and locked
+port form an integration contract for the external proxy owner. Apply does not cause a public
+route change.
 
 ## External HTTP proxy
 

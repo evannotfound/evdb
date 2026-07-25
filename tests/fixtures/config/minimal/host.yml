@@ -1,0 +1,27 @@
+host:
+  id: test-01
+  ssh: test-01
+  domain: storage.example.com
+  data_root: /srv/databases
+  images:
+    postgres: postgres:16
+    pgbouncer: edoburu/pgbouncer:v1.25.1-p0
+    redis: redis:7.2.5
+    dragonfly: docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1
+    http: hiett/serverless-redis-http@sha256:5555555555555555555555555555555555555555555555555555555555555555
+    traefik: traefik:v3.7.8
+  backup:
+    repos:
+      postgres: local:/backups/postgres
+      kv: local:/backups/kv
+  one_password:
+    vault: Test
+    system_item: evanovation-db
+
+databases:
+  - name: example-prod-01
+    type: postgres
+  - name: cache-dev-01
+    type: redis
+  - name: queue-test-01
+    type: dragonfly

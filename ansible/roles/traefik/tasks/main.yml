@@ -1,25 +1,7 @@
 ---
-- name: Load host deployment config
-  ansible.builtin.include_vars:
-    file: "{{ evdb_source_dir }}/host.yml"
-    name: evdb_host
-
-- name: Create Traefik render directory
-  ansible.builtin.file:
-    path: "{{ evdb_config_dir }}/compose/traefik"
-    state: directory
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0750"
-  when: evdb_plan | bool
-
-- name: Render Traefik Compose file
-  ansible.builtin.template:
-    src: "{{ evdb_repo }}/compose/traefik.yml.j2"
-    dest: "{{ evdb_config_dir }}/compose/traefik/compose.yml"
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0640"
-  vars:
-    host: "{{ evdb_host.host }}"
-  when: evdb_plan | bool
+- name: Validate direct normalized Traefik image
+  ansible.builtin.assert:
+    that:
+      - evdb_host.images.traefik is string
+      - "'@sha256:' in evdb_host.images.traefik"
+    fail_msg: evdb_config.host.images.traefik must be a locked image

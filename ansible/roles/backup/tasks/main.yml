@@ -1,224 +1,54 @@
 ---
-- name: Load deployment config
-  ansible.builtin.include_vars:
-    file: "{{ item.file }}"
-    name: "{{ item.name }}"
-  loop:
-    - {file: "{{ evdb_source_dir }}/host.yml", name: evdb_host}
-    - {file: "{{ evdb_source_dir }}/postgres.yml", name: evdb_postgres}
-    - {file: "{{ evdb_source_dir }}/kv.yml", name: evdb_kv}
+- name: Refresh normalized bootstrap runtime host JSON
+  ansible.builtin.copy:
+    content: "{{ {'host': evdb_host} | to_nice_json }}\n"
+    dest: "{{ evdb_bootstrap_runtime }}/host.json"
+    owner: "{{ evdb_admin_user }}"
+    group: "{{ evdb_group }}"
+    mode: "0640"
+  when: evdb_plan | bool
 
-- name: Build runtime host paths
+- name: Initialize expected bootstrap runtime database files
   ansible.builtin.set_fact:
-    evdb_runtime_host: >-
-      {{ evdb_host.host | combine({
-        'config_dir': evdb_config_dir,
-        'state_dir': evdb_state_dir,
-        'backup_dir': evdb_state_dir + '/backups',
-        'lock_dir': evdb_state_dir + '/locks',
-        'repos': evdb_repos | default(evdb_host.host.repos),
-        'runtime': true,
-        'secrets': {
-          'restic_password': evdb_secret_dir + '/restic_password',
-          'rclone_config': evdb_state_dir + '/rclone/rclone.conf'
-        }
-      }) }}
+    evdb_bootstrap_instances: []
 
-- name: Create config and unit directories
+- name: Collect expected bootstrap runtime database files
+  ansible.builtin.set_fact:
+    evdb_bootstrap_instances: >-
+      {{ evdb_bootstrap_instances +
+         [('postgres' if item.engine == 'postgres' else 'kv') ~ '-' ~ item.id ~ '.json'] }}
+  loop: "{{ evdb_databases }}"
+  loop_control:
+    label: "{{ item.engine }}/{{ item.id }}"
+
+- name: Refresh normalized bootstrap runtime database JSON
+  ansible.builtin.copy:
+    content: "{{ {'instance': item} | to_nice_json }}\n"
+    dest: >-
+      {{ evdb_bootstrap_runtime }}/instances/{{ 'postgres' if item.engine == 'postgres' else 'kv' }}-{{ item.id }}.json
+    owner: "{{ evdb_admin_user }}"
+    group: "{{ evdb_group }}"
+    mode: "0640"
+  loop: "{{ evdb_databases }}"
+  loop_control:
+    label: "{{ item.engine }}/{{ item.id }}"
+  when: evdb_plan | bool
+
+- name: Find installed bootstrap runtime database JSON
+  ansible.builtin.find:
+    paths: "{{ evdb_bootstrap_runtime }}/instances"
+    patterns: "*.json"
+    file_type: file
+  register: evdb_installed_bootstrap_instances
+  when: evdb_plan | bool
+
+- name: Remove stale bootstrap runtime database JSON
   ansible.builtin.file:
-    path: "{{ item }}"
-    state: directory
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0750"
-  loop:
-    - "{{ evdb_config_dir }}/instances"
-    - "{{ evdb_config_dir }}/jobs"
-    - "{{ evdb_unit_dir }}"
-  when: evdb_plan | bool
-
-- name: Render host JSON
-  ansible.builtin.copy:
-    content: "{{ {'host': evdb_runtime_host} | to_nice_json }}\n"
-    dest: "{{ evdb_config_dir }}/host.json"
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0640"
-  when: evdb_plan | bool
-
-- name: Render Postgres instance JSON
-  ansible.builtin.copy:
-    content: >-
-      {{ {'instance': item | combine({
-        'secrets': {'password': evdb_secret_dir + '/postgres-' + item.id + '.password'}
-      }, recursive=true)} | to_nice_json }}
-    dest: "{{ evdb_config_dir }}/instances/postgres-{{ item.id }}.json"
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0640"
-  loop: "{{ evdb_postgres.instances }}"
-  when: evdb_plan | bool
-
-- name: Render KV instance JSON
-  ansible.builtin.copy:
-    content: >-
-      {{ {'instance': item | combine({
-        'secrets': {'password': evdb_secret_dir + '/kv-' + item.id + '.password'},
-        'http': item.http | combine({
-          'token': evdb_secret_dir + '/kv-' + item.id + '-http.token'
-        })
-      }, recursive=true)} | to_nice_json }}
-    dest: "{{ evdb_config_dir }}/instances/kv-{{ item.id }}.json"
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0640"
-  loop: "{{ evdb_kv.instances }}"
-  when: evdb_plan | bool
-
-- name: Render per-instance backup job settings
-  ansible.builtin.copy:
-    content: |
-      GROUP={{ item.0 }}
-      NAME={{ item.1.id }}
-    dest: "{{ evdb_config_dir }}/jobs/{{ item.0 }}-{{ item.1.id }}"
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0640"
-  loop: >-
-    {{ (['postgres'] | product(evdb_postgres.instances) | list)
-       + (['kv'] | product(evdb_kv.instances) | list) }}
-  when: evdb_plan | bool
-
-- name: Resolve Restic password on the controller
-  ansible.builtin.command:
-    argv:
-      - op
-      - read
-      - "{{ evdb_host.host.secrets.restic_password }}"
-  delegate_to: localhost
-  become: false
-  check_mode: false
-  changed_when: false
-  register: evdb_restic_password
-  no_log: true
-  when:
-    - evdb_write | bool
-    - not ansible_check_mode
-    - not evdb_skip_secrets | bool
-
-- name: Write Restic password
-  ansible.builtin.copy:
-    content: "{{ evdb_restic_password.stdout }}\n"
-    dest: "{{ evdb_secret_dir }}/restic_password"
-    owner: "{{ evdb_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0600"
-  no_log: true
-  when:
-    - evdb_write | bool
-    - not ansible_check_mode
-    - not evdb_skip_secrets | bool
-
-- name: Check mutable rclone config
-  ansible.builtin.stat:
-    path: "{{ evdb_state_dir }}/rclone/rclone.conf"
-  register: evdb_rclone_file
-
-- name: Resolve rclone seed on the controller
-  ansible.builtin.command:
-    argv:
-      - op
-      - read
-      - "{{ evdb_host.host.secrets.rclone_config }}"
-  delegate_to: localhost
-  become: false
-  check_mode: false
-  changed_when: false
-  register: evdb_rclone_seed
-  no_log: true
-  when:
-    - evdb_write | bool
-    - not ansible_check_mode
-    - not evdb_skip_secrets | bool
-    - not evdb_rclone_file.stat.exists
-
-- name: Seed mutable rclone config once
-  ansible.builtin.copy:
-    content: "{{ evdb_rclone_seed.stdout }}\n"
-    dest: "{{ evdb_state_dir }}/rclone/rclone.conf"
-    owner: "{{ evdb_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0600"
-    force: false
-  no_log: true
-  when:
-    - evdb_write | bool
-    - not ansible_check_mode
-    - not evdb_skip_secrets | bool
-    - not evdb_rclone_file.stat.exists
-
-- name: Install systemd units disabled by default
-  ansible.builtin.copy:
-    src: "{{ evdb_repo }}/systemd/{{ item }}"
-    dest: "{{ evdb_unit_dir }}/{{ item }}"
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_admin_group }}"
-    mode: "0644"
-  loop:
-    - evanovation-db-backup@.service
-    - evanovation-db-backup@.timer
-    - evanovation-db-status.service
-    - evanovation-db-status.timer
-    - evanovation-db-restore.service
-    - evanovation-db-restore.timer
-    - evanovation-db-weekly@.service
-    - evanovation-db-weekly@.timer
-    - evanovation-db-monthly@.service
-    - evanovation-db-monthly@.timer
-  when: evdb_plan | bool
-
-- name: Keep timers in the requested state
-  ansible.builtin.systemd_service:
-    name: "{{ item }}"
-    daemon_reload: true
-    enabled: "{{ evdb_enable_timers | bool }}"
-    state: "{{ 'started' if evdb_enable_timers | bool else 'stopped' }}"
-  loop:
-    - evanovation-db-status.timer
-    - evanovation-db-restore.timer
-    - evanovation-db-weekly@postgres.timer
-    - evanovation-db-weekly@kv.timer
-    - evanovation-db-monthly@postgres.timer
-    - evanovation-db-monthly@kv.timer
-  when:
-    - evdb_manage_systemd | bool
-    - evdb_write | bool
-    - not ansible_check_mode
-
-- name: Keep Postgres backup timers in the requested state
-  ansible.builtin.systemd_service:
-    name: "evanovation-db-backup@postgres-{{ item.id }}.timer"
-    daemon_reload: true
-    enabled: "{{ evdb_enable_timers | bool }}"
-    state: "{{ 'started' if evdb_enable_timers | bool else 'stopped' }}"
-  loop: "{{ evdb_postgres.instances }}"
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ evdb_installed_bootstrap_instances.files | default([]) }}"
   loop_control:
-    label: "{{ item.id }}"
+    label: "{{ item.path | basename }}"
   when:
-    - evdb_manage_systemd | bool
-    - evdb_write | bool
-    - not ansible_check_mode
-
-- name: Keep KV backup timers in the requested state
-  ansible.builtin.systemd_service:
-    name: "evanovation-db-backup@kv-{{ item.id }}.timer"
-    daemon_reload: true
-    enabled: "{{ evdb_enable_timers | bool }}"
-    state: "{{ 'started' if evdb_enable_timers | bool else 'stopped' }}"
-  loop: "{{ evdb_kv.instances }}"
-  loop_control:
-    label: "{{ item.id }}"
-  when:
-    - evdb_manage_systemd | bool
-    - evdb_write | bool
-    - not ansible_check_mode
+    - evdb_plan | bool
+    - item.path | basename not in evdb_bootstrap_instances

@@ -1,51 +1,68 @@
+import json
 import subprocess
-from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
-import yaml
-from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from evanovation_db.config import Instance, load
+from evanovation_db import deployment
+from evanovation_db.config import Config, Instance, load, load_lock
+from evanovation_db.files import hash as file_hash
 
 ROOT = Path(__file__).parents[2]
 CONFIG = load(ROOT / "config/montreal-01")
-JINJA = Environment(
-    loader=FileSystemLoader(ROOT / "compose"),
-    undefined=StrictUndefined,
-    autoescape=False,
-    keep_trailing_newline=True,
-)
 
 
 def render(instance: Instance) -> dict:
-    name = "postgres" if instance.engine == "postgres" else instance.engine
-    text = JINJA.get_template(f"{name}.yml.j2").render(
-        host=CONFIG.host,
-        instance=instance,
-        config_dir="/etc/evanovation-db",
-        secret_dir="/etc/evanovation-db/secrets",
-    )
-    return yaml.safe_load(text)
+    name = f"compose/{instance.group}/{instance.id}.json"
+    return json.loads(deployment.compose(Config(CONFIG.host, (instance,)))[name])
+
+
+def traefik() -> dict:
+    return json.loads(deployment.compose(CONFIG)["compose/traefik/compose.json"])
 
 
 def labels(data: dict) -> dict:
-    return next(service["labels"] for service in data["services"].values() if "labels" in service)
+    return next(
+        service["labels"]
+        for service in data["services"].values()
+        if any(key.startswith("traefik.tcp.") for key in service.get("labels", {}))
+    )
 
 
 def service(data: dict, container: str) -> dict:
     return next(item for item in data["services"].values() if item["container_name"] == container)
 
 
-def test_every_instance_renders_with_its_pinned_engine_image():
+def test_every_instance_renders_with_its_direct_pinned_engine_image():
     for instance in CONFIG.instances:
         data = render(instance)
         database = service(data, instance.container)
 
-        assert database["image"] == instance.target["image"]
+        assert database["image"] == instance.image
         assert "@sha256:" in database["image"]
         assert database["container_name"] == instance.container
         assert database["volumes"][0].startswith(f"{instance.data}:")
+
+
+def test_every_managed_service_has_manifest_contract_label_and_identity():
+    bundle = deployment.build(
+        CONFIG,
+        load_lock(ROOT / "config/montreal-01/host.lock.json"),
+        file_hash(ROOT / "config/montreal-01/host.yml"),
+    )
+    for instance in CONFIG.instances:
+        services = render(instance)["services"]
+        expected = bundle.manifest["databases"][instance.selector]
+        assert set(services) == set(expected["services"])
+        for name, current in services.items():
+            assert current["labels"][deployment.CONTRACT_LABEL] == expected["service_hash"]
+            assert expected["services"][name]["container"] == current["container_name"]
+            assert expected["services"][name]["image"] == current["image"]
+        assert expected["labels"] == {deployment.CONTRACT_LABEL: expected["service_hash"]}
+    proxy = traefik()["services"]["traefik"]
+    expected = bundle.manifest["infrastructure"]["traefik"]
+    assert proxy["labels"][deployment.CONTRACT_LABEL] == expected["service_hash"]
 
 
 def test_redis_instances_stay_redis_and_use_private_config():
@@ -65,11 +82,9 @@ def test_database_services_publish_no_native_host_ports():
             if item["container_name"] != f"{instance.id}-http-1":
                 assert "ports" not in item
 
-    traefik = yaml.safe_load(JINJA.get_template("traefik.yml.j2").render(host=CONFIG.host))[
-        "services"
-    ]["traefik"]
-    assert set(traefik["ports"]) == {"5432:5432/tcp", "6379:6379/tcp"}
-    assert "@sha256:" in traefik["image"]
+    proxy = traefik()["services"]["traefik"]
+    assert set(proxy["ports"]) == {"5432:5432/tcp", "6379:6379/tcp"}
+    assert "@sha256:" in proxy["image"]
 
 
 def test_sni_routes_use_instance_specific_backends():
@@ -80,9 +95,9 @@ def test_sni_routes_use_instance_specific_backends():
         prefix = "pg" if instance.engine == "postgres" else "kv"
         rule = route_labels[f"traefik.tcp.routers.{prefix}-{instance.id}.rule"]
         backend = next(
-            service
-            for service in data["services"].values()
-            if service.get("labels") == route_labels
+            current
+            for current in data["services"].values()
+            if current.get("labels") == route_labels
         )
 
         assert rule == f"HostSNI(`{instance.domain}`)"
@@ -105,15 +120,43 @@ def test_http_sidecars_are_loopback_only_and_instance_specific():
             "SRH_MAX_CONNECTIONS": str(instance.http["max_connections"]),
         }
         assert sidecar["env_file"] == [f"/etc/evanovation-db/secrets/kv-{instance.id}-http.env"]
-        assert "labels" not in sidecar
+        assert sidecar["labels"][deployment.CONTRACT_LABEL]
+
+
+def test_infrastructure_sidecars_have_concrete_image_available_healthchecks():
+    proxy = traefik()["services"]["traefik"]
+    assert "--ping=true" in proxy["command"]
+    assert proxy["healthcheck"]["test"] == ["CMD", "traefik", "healthcheck", "--ping"]
+
+    postgres = next(item for item in CONFIG.instances if item.settings.get("pgbouncer") is True)
+    pooler = service(render(postgres), f"{postgres.id}-pgbouncer-1")
+    assert pooler["healthcheck"]["test"] == [
+        "CMD",
+        "pg_isready",
+        "-h",
+        "127.0.0.1",
+        "-p",
+        "5432",
+    ]
+
+    kv = next(item for item in CONFIG.instances if item.group == "kv")
+    http = service(render(kv), f"{kv.id}-http-1")
+    assert http["healthcheck"]["test"] == [
+        "CMD",
+        "wget",
+        "--spider",
+        "--quiet",
+        "http://127.0.0.1:80/",
+    ]
+    for current in (proxy, pooler, http):
+        assert current["healthcheck"]["interval"] == "10s"
+        assert current["healthcheck"]["timeout"] == "5s"
+        assert current["healthcheck"]["retries"] == 12
 
 
 def test_per_instance_http_choices_change_only_the_sidecar():
     instance = next(item for item in CONFIG.instances if item.group == "kv")
-    disabled_data = deepcopy(vars(instance))
-    disabled_data["data"] = str(instance.data)
-    disabled_data["http"]["enabled"] = False
-    disabled = Instance.from_dict(disabled_data)
+    disabled = replace(instance, http={**instance.http, "enabled": False, "port": None})
 
     assert f"{instance.id}-http" not in render(disabled)["services"]
 
@@ -135,22 +178,27 @@ def test_external_network_has_no_shared_database_aliases():
         assert not names.intersection({"postgres", "pgbouncer", "redis", "http"})
 
 
-def test_current_unlimited_resources_remain_unlimited():
+def test_normalized_services_remain_unlimited():
     limited = {"mem_limit", "mem_reservation", "cpus", "cpu_shares", "cpuset", "pids_limit"}
     services = []
     for instance in CONFIG.instances:
         services.extend(render(instance)["services"].values())
-    traefik = yaml.safe_load(JINJA.get_template("traefik.yml.j2").render(host=CONFIG.host))
-    services.extend(traefik["services"].values())
+    services.extend(traefik()["services"].values())
 
     assert CONFIG.host.resources == {"traefik": "unlimited"}
     assert all(not limited.intersection(item) for item in services)
 
 
+def test_migration_target_compatibility_and_jinja_compose_are_removed():
+    assert not hasattr(Instance, "target")
+    assert not list((ROOT / "compose").glob("*.j2"))
+    assert '"target"' not in json.dumps(deployment.compose(CONFIG), sort_keys=True)
+
+
 @pytest.mark.parametrize("engine", ["postgres", "redis", "dragonfly", "traefik"])
-def test_rendered_compose_passes_docker_validation(engine, tmp_path):
+def test_generated_compose_passes_docker_validation(engine, tmp_path):
     if engine == "traefik":
-        data = yaml.safe_load(JINJA.get_template("traefik.yml.j2").render(host=CONFIG.host))
+        data = traefik()
     else:
         instance = next(item for item in CONFIG.instances if item.engine == engine)
         data = render(instance)
@@ -159,8 +207,8 @@ def test_rendered_compose_passes_docker_validation(engine, tmp_path):
     for item in data["services"].values():
         if "env_file" in item:
             item["env_file"] = [str(env_file)]
-    path = tmp_path / f"{engine}.yml"
-    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    path = tmp_path / f"{engine}.json"
+    path.write_text(json.dumps(data))
 
     result = subprocess.run(
         [

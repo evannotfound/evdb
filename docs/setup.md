@@ -1,62 +1,81 @@
-# Local setup
+# Controller setup
 
 ## Requirements
 
-- Python 3.10 or newer and `uv`
-- Ansible Core 2.17 through 2.20 for deployment checks
-- `systemd-analyze` for unit verification
-- Docker, Compose, Restic, and rclone only for the integration tests that exercise them
-- 1Password CLI only for a future secret-resolving deployment
+The operator controller needs:
 
-Install the locked development environment and run the deployment-focused checks:
+- A long-lived repository checkout, Python 3.10 or newer, and `uv`.
+- OpenSSH with batch authentication to the `host.ssh` destination.
+- Ansible Core 2.17 through 2.20 on `PATH` for first install and protocol upgrades.
+- Docker CLI on `PATH`; plan and apply use `docker manifest inspect` to resolve changed image
+  tags for Linux/amd64. They do not start or change local containers.
+- 1Password CLI on `PATH`, authenticated through the desktop app or a service account with
+  `write_items` for the complete create/apply workflow.
+
+The managed host needs `/usr/bin/python3`, Docker with Compose, Restic, rclone, and passwordless
+non-interactive sudo for the controller's fixed remote runtime command. SSH and sudo access are
+operational prerequisites; `evdb` does not provision controller authentication.
+
+## Development environment
 
 ```sh
 uv sync --locked
-uv run pytest tests/config tests/integration/test_deploy.py
-uv run ansible-playbook --syntax-check -i ansible/test-hosts.yml ansible/backup.yml
-uv run ansible-playbook --syntax-check -i ansible/test-hosts.yml ansible/databases.yml
-uv run ansible-playbook --syntax-check -i ansible/test-hosts.yml ansible/restore.yml
-systemd-analyze verify systemd/*.service systemd/*.timer
+uv run evdb --config tests/fixtures/config/minimal validate
+uv run pytest tests/unit/test_controller.py tests/config/test_make.py
 ```
 
-`ansible/test-hosts.yml` uses the local connection and `/tmp/evanovation-db-test`. It does
-not resolve production secrets, manage systemd, or start Compose projects.
+Repository commands use `uv run evdb`. Developer-only Compose, Ansible, systemd, and full test
+checks remain available through `make check` and its component targets.
 
-## Configuration
+## Installed command
 
-Humans edit `config/<host>/host.yml`, `postgres.yml`, and `kv.yml`. Host config defines
-paths, repositories, retention, pinned infrastructure images, and `op://` references.
-Every instance records `id`, `env`, `engine`, `container`, `project`, `data`,
-`domain`, durability, current and pinned target facts, backup policy, secrets, and engine
-settings. Read-only Docker inspection records the current database, PgBouncer, HTTP, and
-Traefik resource contract as `unlimited`; generated Compose therefore adds no CPU, memory,
-cpuset, or PID limit. KV instances also define `http.enabled`, `port`, `domain`, pinned image,
-token reference, and `max_connections`.
-
-Validate source YAML and render runtime JSON with:
+The controller's Ansible assets live in this checkout, so install the command in editable mode
+from a stable path:
 
 ```sh
-uv run evanovation-db validate --source config/montreal-01
-uv run evanovation-db validate --source config/montreal-01 --output /tmp/evdb-config
+uv tool install --editable --with "PyYAML>=6.0" .
 ```
 
-Runtime Python reads JSON. Ansible writes `host.json` plus group-prefixed instance files
-under `/etc/evanovation-db/instances`; the prefixes preserve products that exist in both
-Postgres and KV groups.
+Ensure `ansible-playbook` is installed separately on `PATH`, then select one host explicitly:
 
-## Commands
-
-```text
-evanovation-db backup <postgres|kv> <instance>
-evanovation-db restore-check <postgres|kv> <instance> [--folder PATH | --snapshot ID]
-evanovation-db restore-due [--run]
-evanovation-db status [--json]
-evanovation-db maintain <init|forget|prune|check> <postgres|kv>
+```sh
+export EVANOVATION_DB_CONFIG=/path/to/evanovation-db/config/my-host
+evdb validate
+evdb status
 ```
 
-## Releases
+Alternatively, pass `--config /path/to/config/my-host` before the subcommand. The value may be
+the host directory or its `host.yml`. `evdb` has no implicit production config.
 
-The app role stages root-owned code in `/opt/evanovation-db/releases/<git-sha>`. It checks
-the Python files and rendered config before switching `/opt/evanovation-db/current`.
-Configuration and secrets remain outside releases, under `/etc/evanovation-db`; mutable
-state remains under `/var/lib/evanovation-db`.
+## First apply
+
+Create `config/<host>/host.yml` as described in [configuration.md](configuration.md). A first
+apply resolves the desired lock in memory and attempts the fixed SSH runtime. If the runtime is
+absent or incompatible, the controller displays the host and asks permission to install or
+update only that internal runtime. No database project is started by this bootstrap step.
+
+After bootstrap, the controller uses the bootstrap runtime to replan and asks separately before
+applying the production plan. Confirmed apply writes `host.lock.json`, resolves deployment secrets
+locally, and sends staged runtime, release, Compose, and protected inputs through the versioned
+remote operation. It does not run Ansible again. `--yes` accepts both confirmations and must be
+used deliberately.
+
+The remote protocol uses `BatchMode=yes`, a bounded connect timeout, a fixed `sudo -n` command,
+and validated JSON on stdin/stdout. Secret values never appear in SSH arguments. Protocol
+version mismatch is one of the two explicit bootstrap conditions, along with a missing runtime.
+SSH failures, malformed responses, invalid active config, and remote operation failures do not
+trigger Ansible and fail closed.
+
+## Boundaries
+
+Normal remote operations and systemd jobs read code and generated JSON from the active
+`/opt/evanovation-db/current` release; they do not read source YAML on the host. The stable
+bootstrap code reads only the always-refreshed normalized
+`/opt/evanovation-db/host-runtime/runtime`, never preserved legacy JSON under `/etc`. Bootstrap
+atomically refreshes that runtime and removes stale instance JSON without replacing active unit
+files. Protected files remain outside releases under `/etc/evanovation-db/secrets` and
+`/var/lib/evanovation-db/rclone`.
+
+Bootstrap and release activation preserve existing timer state. Timer enablement or disablement is
+a separate production migration. The external HTTP proxy remains outside this repository, along
+with certificates, public ports 80/443, and route changes.

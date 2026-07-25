@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import restic, status
+from . import remote, restic, status
 from .backup import backup
 from .config import ConfigError, load, render
 from .errors import Error
@@ -25,6 +25,8 @@ def parser() -> argparse.ArgumentParser:
     validate = sub.add_parser("validate")
     validate.add_argument("--source")
     validate.add_argument("--output")
+
+    sub.add_parser("remote", help="internal JSON protocol runtime")
 
     for name in ("backup", "restore-check"):
         command = sub.add_parser(name)
@@ -54,6 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     clock = time.monotonic()
     try:
+        if args.command == "remote":
+            return remote.serve(args.config)
         if args.command == "validate":
             source = Path(args.source or args.config)
             config = load(source)
@@ -87,24 +91,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             rows, failed = status.get(config)
             if args.json:
-                print(json.dumps(rows, sort_keys=True))
+                print(json.dumps({"version": status.VERSION, "databases": rows}, sort_keys=True))
             else:
                 for row in rows:
                     state = _status_result(row)
-                    print(
-                        f"{row['group']}/{row['instance']}: {'ok' if state == 'success' else state}"
-                    )
+                    print(f"{row['selector']}: {'ok' if state == 'success' else state}")
             for row in rows:
+                engine, instance = row["selector"].split("/", 1)
                 log(
                     "status_result",
                     host=config.host.id,
-                    group=row["group"],
-                    instance=row["instance"],
+                    group="postgres" if engine == "postgres" else "kv",
+                    instance=instance,
                     command="status",
                     step="assess",
                     result=_status_result(row),
                     duration=round(time.monotonic() - clock, 3),
-                    error=row["error"],
+                    error=row["errors"] or row["details"] or None,
                 )
             return 1 if failed else 0
         if args.command == "restore-due":
@@ -159,11 +162,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _status_result(row: dict) -> str:
-    if row["error"]:
-        return "failed"
-    if row["backup_stale"] or row["restore_stale"]:
-        return "stale"
-    return "success"
+    return "success" if row["state"] in {"healthy", "pending"} else row["state"]
 
 
 if __name__ == "__main__":

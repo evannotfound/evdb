@@ -33,6 +33,7 @@ def run(
     timeout: int = 300,
     env: Mapping[str, str] | None = None,
     cwd: str | Path | None = None,
+    input: str | bytes | None = None,
     stdout: IO[bytes] | None = None,
     secrets: Sequence[str] = (),
     check: bool = True,
@@ -43,11 +44,13 @@ def run(
     command_env = os.environ.copy()
     if env:
         command_env.update({str(key): str(value) for key, value in env.items()})
+    input_data = input.encode() if isinstance(input, str) else input
     try:
         process = subprocess.Popen(
             command,
             cwd=cwd,
             env=command_env,
+            stdin=subprocess.PIPE if input_data is not None else None,
             stdout=stdout if stdout is not None else subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -57,7 +60,7 @@ def run(
         raise CommandError(f"command failed to start: {safe}: {exc}") from exc
 
     try:
-        out_data, err_data = process.communicate(timeout=timeout)
+        out_data, err_data = process.communicate(input_data, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         _kill(process)
         process.communicate()

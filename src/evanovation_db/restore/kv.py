@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from .. import docker, manifest
@@ -9,11 +10,21 @@ from ..config import Host, Instance
 from ..errors import RestoreError
 
 
-def restore(host: Host, instance: Instance, folder: Path, name: str) -> dict:
+def restore(
+    host: Host,
+    instance: Instance,
+    folder: Path,
+    name: str,
+    data_dir: Path | None = None,
+) -> dict:
     del host
     data = manifest.check(folder)
-    work = folder.parent / f".{name}-data"
-    work.mkdir(mode=0o700)
+    work = data_dir or folder.parent / f".{name}-data"
+    if work.exists():
+        if not work.is_dir() or any(work.iterdir()):
+            raise RestoreError("KV restore candidate directory is not empty")
+    else:
+        work.mkdir(mode=0o700)
     target = work / "dump.rdb"
     target.write_bytes((folder / "dump.rdb").read_bytes())
     target.chmod(0o600)
@@ -35,7 +46,7 @@ def restore(host: Host, instance: Instance, folder: Path, name: str) -> dict:
             "--primary_port_http_enabled=false",
         ]
     docker.start(
-        str(instance.target["image"]),
+        instance.image,
         name,
         args,
         mounts=[(work, "/data", False)],
@@ -44,21 +55,11 @@ def restore(host: Host, instance: Instance, folder: Path, name: str) -> dict:
         timeout=300,
     )
     _wait(name)
-    restored_instance = Instance(
-        id=instance.id,
-        env=instance.env,
-        engine=instance.engine,
+    restored_instance = replace(
+        instance,
         container=name,
-        project=instance.project,
         data=work,
-        domain=instance.domain,
-        durable=instance.durable,
-        current=instance.current,
-        target=instance.target,
-        backup=instance.backup,
-        resources=instance.resources,
         secrets={},
-        settings=instance.settings,
     )
     expected = data.get("facts", {})
     facts = kv_backup.facts(restored_instance, "", sample_limit=0)

@@ -1,29 +1,47 @@
-# Backups and status
+# Backup operations
 
-Each backup operates on one named instance under an instance lock. It writes to a private
-`<utc-time>.partial` directory and renames that directory only after engine checks, sizes,
-SHA-256 hashes, and `backup.json` are complete.
+## Operator workflow
 
-Postgres backups contain `globals.sql` and one custom archive under `databases/` for every
-connectable non-template database. Redis and Dragonfly backups contain `dump.rdb`.
-`backup.json` records host, group, instance, engine, times, version, engine facts, files,
-checks, and upload state. Treat the entire folder as sensitive.
+```sh
+evdb backup app-prod-01
+evdb backups app-prod-01
+evdb backup-check app-prod-01
+evdb backup-check app-prod-01 SNAPSHOT_ID
+```
 
-Restic receives only complete, checked folders. A successful upload requires a zero exit
-code and a final JSON summary with `snapshot_id`. Snapshots use stable `host:`, `engine:`,
-and `instance:` tags. Work for each repository is serialized by a local lock.
+`backup` runs the checked backup and Restic upload path on the managed host. It reports the
+completed backup time and exact snapshot ID only after dump validation, manifest hashing, and
+upload succeed. Cache-mode KV databases reject backups because durability is disabled.
 
-The configured policy retains 7 daily, 4 weekly, and 12 monthly snapshots per instance.
-Weekly maintenance applies `forget` and a repository structure check; monthly maintenance
-runs prune. Weekly maintenance also selects a deterministic rotating data subset. A specific
-subset can be run with `maintain check --part N`.
-Production repositories remain format v1.
+`backups` merges completed local folders and tagged Restic snapshots in reverse chronological
+order. Each row shows local, remote, or combined source, time, backup ID, snapshot ID, and that
+backup's latest full verification state. Verification records remain attached to older backups
+when later backups are checked. A remote-only snapshot remains visible after local retention.
 
-Local history keeps at least two uploaded backups and never automatically removes an
-unuploaded backup. Low free space stops a new run. A failed instance job does not prevent
-another instance's independent job from running.
+`backup-check` defaults to the newest restorable backup for that typed database. An optional
+argument selects an exact backup folder ID or Restic snapshot ID from `backups`. Selection rejects
+missing, ambiguous, cross-host, and cross-database snapshots.
 
-`evanovation-db status` reports local backup, confirmed upload and snapshot, restore result,
-and current failure state. A snapshot older than about 26 hours or restore proof older than
-30 days is stale and makes status exit nonzero. Journald receives concise structured command
-records; credentials are redacted.
+## Verification
+
+Every backup first uses a private `<utc-time>.partial` directory and becomes complete only after
+engine checks, sizes, SHA-256 hashes, and `backup.json` are valid. Postgres stores globals and one
+custom archive per connectable non-template database. Redis and Dragonfly store `dump.rdb`.
+
+Full backup-check verifies exact host and typed database identity plus manifest hashes, then
+restores into an isolated compatible engine container with no published ports or live data mounts.
+The locked current image may differ by patch tag or digest from the backup image, but the engine
+must match and its major version cannot be older than the backup's. Postgres checks restored
+databases and catalog facts. Redis and Dragonfly compare database and key counts, key types,
+sampled value hashes, and TTL behavior without persisting raw values.
+Temporary containers and download staging are removed after success, failure, timeout, or
+interruption. Live data is never changed.
+
+If upload fails after a checked local backup, the local folder remains and failure is recorded.
+The latest local completion, last successful upload, last successful verification, per-backup
+verification records, and current operation error are independent. A current upload failure does
+not make a still-recent prior successful snapshot stale. A failed scheduled database does not stop
+other eligible databases. Repository and instance locks serialize conflicting work.
+
+Backup command output, history, manifests, state, and structured logs are secret-free. Treat local
+backup folders as sensitive database contents even though they contain no controller credentials.

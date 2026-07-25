@@ -68,11 +68,10 @@ def test_status_prints_current_failure_and_exits_nonzero(config, monkeypatch, ca
         lambda current: (
             [
                 {
-                    "group": "postgres",
-                    "instance": "test-dev-01",
-                    "error": {"message": "backup failed"},
-                    "backup_stale": False,
-                    "restore_stale": False,
+                    "selector": "postgres/test-dev-01",
+                    "state": "failed",
+                    "errors": {"backup": {"message": "backup failed"}},
+                    "details": ["backup: backup failed"],
                 }
             ],
             True,

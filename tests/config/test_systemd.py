@@ -47,15 +47,30 @@ def test_services_have_limits_and_low_priority():
         assert service["IOSchedulingClass"] == "idle"
         assert int(service["CPUWeight"]) <= 20
         assert int(service["IOWeight"]) <= 20
+        assert service["Environment"] == "PYTHONPATH=/opt/evanovation-db/current/src"
+        assert (
+            "-m evanovation_db.cli --config /opt/evanovation-db/current/runtime"
+            in service["ExecStart"]
+        )
 
 
-def test_deployment_keeps_timers_disabled_by_default():
-    ansible = ROOT / "ansible"
-    defaults = (ansible / "group_vars/all.yml").read_text()
-    role = (ansible / "roles/backup/tasks/main.yml").read_text()
+def test_units_execute_the_active_release_runtime_code():
+    text = "\n".join(path.read_text() for path in SYSTEMD.glob("*.service"))
 
-    assert "evdb_enable_timers: false" in defaults
-    assert 'enabled: "{{ evdb_enable_timers | bool }}"' in role
+    assert "/current/src" in text
+    assert "/host-runtime/" not in text
+    assert "/releases/" not in text
+
+
+def test_deployment_preserves_timer_state_without_explicit_migration():
+    deployment = (ROOT / "src/evanovation_db/deployment.py").read_text()
+    ansible = "\n".join(path.read_text() for path in (ROOT / "ansible").rglob("*.yml"))
+
+    assert '["systemctl", "daemon-reload"]' in deployment
+    assert "systemd_service" not in ansible
+    assert "enabled:" not in ansible
+    assert "state: started" not in ansible
+    assert "state: stopped" not in ansible
 
 
 def test_weekly_maintenance_rotates_data_checks():

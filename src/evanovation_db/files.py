@@ -51,6 +51,26 @@ def write_json(path: str | Path, data: Any, *, mode: int = 0o600) -> None:
         temp.unlink(missing_ok=True)
 
 
+def write_text(path: str | Path, text: str, *, mode: int = 0o600) -> None:
+    write_bytes(path, text.encode(), mode=mode)
+
+
+def write_bytes(path: str | Path, data: bytes, *, mode: int = 0o600) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp.chmod(mode)
+        temp.replace(target)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def read_json(path: str | Path) -> Any:
     return json.loads(Path(path).read_text())
 

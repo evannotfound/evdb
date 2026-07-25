@@ -2,9 +2,25 @@ UV ?= uv
 PYTHON ?= $(UV) run python
 RUFF ?= $(UV) run ruff
 PYTEST ?= $(UV) run pytest
-APP = $(PYTHON) -m evanovation_db.cli
+EVDB ?= $(UV) run evdb
+YES_ARG = $(if $(filter yes,$(YES)),--yes,)
+DB_ARG = $(if $(DB),"$(DB)",)
+BACKUP_ARG = $(if $(BACKUP),"$(BACKUP)",)
+LINES_ARG = $(if $(LINES),--lines "$(LINES)",)
 
-.PHONY: check lint test config-check compose-check ansible-check systemd-check plan deploy-backup deploy-db backup restore-check status
+.PHONY: help check lint test config-check compose-check ansible-check systemd-check \
+	validate plan apply create show status start stop restart logs backup backups \
+	backup-check releases rollback restore promote require-config require-db require-create \
+	require-snapshot require-restore-id require-release
+
+help:
+	@printf '%s\n' \
+		'Usage: make TARGET CONFIG=path [DB=selector] [YES=yes]' \
+		'Operator: validate plan apply status releases' \
+		'Database: create show start stop restart logs backup backups backup-check' \
+		'Recovery: restore promote rollback' \
+		'Developer: check lint test config-check compose-check ansible-check systemd-check' \
+		'Run the selected target without arguments to see its required variables.'
 
 check: lint test config-check compose-check ansible-check systemd-check
 
@@ -16,7 +32,7 @@ test:
 	$(PYTEST)
 
 config-check:
-	$(APP) validate --source config/montreal-01
+	$(EVDB) --config config/montreal-01 validate
 
 compose-check:
 	$(PYTEST) tests/config/test_compose.py
@@ -29,29 +45,63 @@ ansible-check:
 systemd-check:
 	systemd-analyze verify systemd/*.service systemd/*.timer
 
-plan:
-	@test -n "$(HOST)" || (printf '%s\n' 'HOST is required: make plan HOST=test' >&2; exit 2)
-	$(UV) run ansible-playbook --check --diff -i $(if $(filter test,$(HOST)),ansible/test-hosts.yml,ansible/hosts.yml) ansible/backup.yml -e target=$(HOST)
+require-config:
+	@test -n "$(CONFIG)" || (printf '%s\n' 'CONFIG is required: CONFIG=config/<host>' >&2; exit 2)
 
-deploy-backup:
-	@test -n "$(HOST)" || (printf '%s\n' 'HOST is required' >&2; exit 2)
-	@test "$(APPLY)" = "yes" || (printf '%s\n' 'APPLY=yes is required' >&2; exit 2)
-	$(UV) run ansible-playbook -i ansible/hosts.yml ansible/backup.yml -e target=$(HOST) -e apply=yes
+require-db:
+	@test -n "$(DB)" || (printf '%s\n' 'DB is required: DB=<name|type/name>' >&2; exit 2)
 
-deploy-db:
-	@test -n "$(HOST)" || (printf '%s\n' 'HOST is required' >&2; exit 2)
-	@test "$(APPLY)" = "yes" || (printf '%s\n' 'APPLY=yes is required' >&2; exit 2)
-	$(UV) run ansible-playbook -i ansible/hosts.yml ansible/databases.yml -e target=$(HOST) -e apply=yes
+require-create:
+	@test "$(TYPE)" = "postgres" -o "$(TYPE)" = "redis" -o "$(TYPE)" = "dragonfly" || (printf '%s\n' 'TYPE must be postgres, redis, or dragonfly' >&2; exit 2)
+	@test -n "$(NAME)" || (printf '%s\n' 'NAME is required: NAME=example-prod-01' >&2; exit 2)
 
-backup:
-	@test "$(ENGINE)" = "postgres" -o "$(ENGINE)" = "kv" || (printf '%s\n' 'ENGINE must be postgres or kv' >&2; exit 2)
-	@test -n "$(NAME)" || (printf '%s\n' 'NAME is required: make backup NAME=test-dev-01' >&2; exit 2)
-	$(APP) backup $(ENGINE) $(NAME)
+require-snapshot:
+	@test -n "$(SNAPSHOT)" || (printf '%s\n' 'SNAPSHOT is required: SNAPSHOT=latest' >&2; exit 2)
 
-restore-check:
-	@test "$(ENGINE)" = "postgres" -o "$(ENGINE)" = "kv" || (printf '%s\n' 'ENGINE must be postgres or kv' >&2; exit 2)
-	@test -n "$(NAME)" || (printf '%s\n' 'NAME is required: make restore-check NAME=test-dev-01' >&2; exit 2)
-	$(APP) restore-check $(ENGINE) $(NAME)
+require-restore-id:
+	@test -n "$(RESTORE_ID)" || (printf '%s\n' 'RESTORE_ID is required' >&2; exit 2)
 
-status:
-	$(APP) status
+require-release:
+	@test -n "$(RELEASE)" || (printf '%s\n' 'RELEASE is required' >&2; exit 2)
+
+validate: require-config
+	$(EVDB) --config "$(CONFIG)" validate
+
+plan: require-config
+	$(EVDB) --config "$(CONFIG)" plan
+
+apply: require-config
+	$(EVDB) --config "$(CONFIG)" apply $(YES_ARG)
+
+create: require-config require-create
+	$(EVDB) --config "$(CONFIG)" create "$(TYPE)" "$(NAME)" $(YES_ARG)
+
+show: require-config require-db
+	$(EVDB) --config "$(CONFIG)" show "$(DB)"
+
+status: require-config
+	$(EVDB) --config "$(CONFIG)" status $(DB_ARG)
+
+start stop restart: require-config require-db
+	$(EVDB) --config "$(CONFIG)" $@ "$(DB)" $(YES_ARG)
+
+logs: require-config require-db
+	$(EVDB) --config "$(CONFIG)" logs "$(DB)" $(LINES_ARG)
+
+backup backups: require-config require-db
+	$(EVDB) --config "$(CONFIG)" $@ "$(DB)"
+
+backup-check: require-config require-db
+	$(EVDB) --config "$(CONFIG)" backup-check "$(DB)" $(BACKUP_ARG)
+
+releases: require-config
+	$(EVDB) --config "$(CONFIG)" releases
+
+rollback: require-config require-release
+	$(EVDB) --config "$(CONFIG)" rollback "$(RELEASE)" $(YES_ARG)
+
+restore: require-config require-db require-snapshot
+	$(EVDB) --config "$(CONFIG)" restore "$(DB)" --snapshot "$(SNAPSHOT)"
+
+promote: require-config require-db require-restore-id
+	$(EVDB) --config "$(CONFIG)" promote "$(DB)" "$(RESTORE_ID)" $(YES_ARG)

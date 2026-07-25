@@ -1,66 +1,73 @@
 ---
-- name: Read release revision on the controller
-  ansible.builtin.command:
-    argv:
-      - git
-      - rev-parse
-      - HEAD
-    chdir: "{{ evdb_repo }}"
-  delegate_to: localhost
-  become: false
-  check_mode: false
-  changed_when: false
-  register: evdb_git
-  when: evdb_release | length == 0
-
-- name: Select release revision
-  ansible.builtin.set_fact:
-    evdb_release_id: "{{ evdb_release if evdb_release | length > 0 else evdb_git.stdout }}"
-
-- name: Check release revision
-  ansible.builtin.assert:
-    that:
-      - evdb_release_id is match('^[0-9a-f]{7,40}$')
-    fail_msg: evdb_release must be a 7-40 character Git SHA
-
-- name: Create release directory
+- name: Create host runtime source directory
   ansible.builtin.file:
-    path: "{{ evdb_root }}/releases/{{ evdb_release_id }}"
+    path: "{{ item }}"
     state: directory
     owner: "{{ evdb_admin_user }}"
     group: "{{ evdb_admin_group }}"
     mode: "0755"
+  loop:
+    - "{{ evdb_runtime_root }}/src"
+    - "{{ evdb_runtime_root }}/src/evanovation_db"
   when: evdb_plan | bool
 
-- name: Install application package
-  ansible.builtin.copy:
-    src: "{{ evdb_repo }}/src/evanovation_db"
-    dest: "{{ evdb_root }}/releases/{{ evdb_release_id }}/src/"
+- name: Find internal host runtime source directories
+  ansible.builtin.find:
+    paths: "{{ evdb_repo }}/src/evanovation_db"
+    file_type: directory
+    recurse: true
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  changed_when: false
+  register: evdb_runtime_directories
+
+- name: Create internal host runtime package directories
+  ansible.builtin.file:
+    path: >-
+      {{ evdb_runtime_root }}/src/{{ item.path | relpath(evdb_repo + '/src') }}
+    state: directory
     owner: "{{ evdb_admin_user }}"
     group: "{{ evdb_admin_group }}"
-    mode: preserve
+    mode: "0755"
+  loop: "{{ evdb_runtime_directories.files }}"
+  loop_control:
+    label: "{{ item.path | relpath(evdb_repo + '/src') }}"
   when: evdb_plan | bool
 
-- name: Install release metadata
+- name: Find internal host runtime Python files
+  ansible.builtin.find:
+    paths: "{{ evdb_repo }}/src/evanovation_db"
+    patterns: "*.py"
+    file_type: file
+    recurse: true
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  changed_when: false
+  register: evdb_runtime_files
+
+- name: Install internal host runtime Python files
   ansible.builtin.copy:
-    src: "{{ evdb_repo }}/{{ item }}"
-    dest: "{{ evdb_root }}/releases/{{ evdb_release_id }}/{{ item }}"
+    src: "{{ item.path }}"
+    dest: >-
+      {{ evdb_runtime_root }}/src/{{ item.path | relpath(evdb_repo + '/src') }}
     owner: "{{ evdb_admin_user }}"
     group: "{{ evdb_admin_group }}"
     mode: "0644"
-  loop:
-    - pyproject.toml
-    - README.md
+  loop: "{{ evdb_runtime_files.files }}"
+  loop_control:
+    label: "{{ item.path | relpath(evdb_repo + '/src') }}"
   when: evdb_plan | bool
 
-- name: Check installed Python files
+- name: Check installed host runtime Python files
   ansible.builtin.command:
     argv:
       - "{{ evdb_python }}"
       - -m
       - compileall
       - -q
-      - "{{ evdb_root }}/releases/{{ evdb_release_id }}/src/evanovation_db"
+      - "{{ evdb_runtime_root }}/src/evanovation_db"
   changed_when: false
   when:
     - evdb_write | bool

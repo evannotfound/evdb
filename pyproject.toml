@@ -19,6 +19,7 @@ dev = [
 ]
 
 [project.scripts]
+evdb = "evanovation_db.controller:main"
 evanovation-db = "evanovation_db.cli:main"
 
 [tool.setuptools.packages.find]

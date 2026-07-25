@@ -1,27 +1,105 @@
 host:
   id: montreal-01
-  config_dir: /etc/evanovation-db
-  state_dir: /var/lib/evanovation-db
-  backup_dir: /var/lib/evanovation-db/backups
-  lock_dir: /var/lib/evanovation-db/locks
-  min_free_gb: 5
-  repos:
-    postgres: rclone:onedrive-evanovation:montreal-01/databases/postgres
-    kv: rclone:onedrive-evanovation:montreal-01/databases/kv
-  retention:
-    daily: 7
-    weekly: 4
-    monthly: 12
-    data_parts: 12
+  ssh: montreal-01
+  domain: storage.evanovation.com
+  data_root: /home/ubuntu/databases
   images:
-    postgres: postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881
-    pgbouncer: edoburu/pgbouncer:v1.25.1-p0@sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4
-    redis: redis:7.2.5@sha256:f5ef9e24a9ef3b7cc552ae0cbc3cbade4f2877502683496c5d775605ae071412
-    dragonfly: docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1@sha256:99eb2dd14ca00b983c302d0a15d15176dccd5a9e85a375bcc5157e1cadd73099
+    postgres: postgres:16
+    pgbouncer: edoburu/pgbouncer:v1.25.1-p0
+    redis: redis:7.2.5
+    dragonfly: docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1
     http: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
-    traefik: traefik:v3.7.8@sha256:4299bbed850421258fc5448c2e0e6ad350981d4d335a68de11b92448aedbefe5
-  resources:
-    traefik: unlimited
-  secrets:
-    restic_password: op://Evanovation/evanovation-db/restic-password
-    rclone_config: op://Evanovation/evanovation-db/rclone-config
+    traefik: traefik:v3.7.8
+  backup:
+    repos:
+      postgres: rclone:onedrive-evanovation:montreal-01/databases/postgres
+      kv: rclone:onedrive-evanovation:montreal-01/databases/kv
+  one_password:
+    vault: Evanovation
+    system_item: evanovation-db
+
+databases:
+  - name: api-test-01
+    type: postgres
+
+  - name: code-share-prod-01
+    type: postgres
+
+  - name: cs-ai-prod-01
+    type: postgres
+
+  - name: dialogue-dev-01
+    type: postgres
+    pooler: false
+
+  - name: gpt-accounts-manager-prod-01
+    type: postgres
+
+  - name: gpt-share-prod-01
+    type: postgres
+    max_clients: 2000
+    pool_size: 30
+    reserve_size: 10
+
+  - name: gpt-share-prod-02
+    type: postgres
+
+  - name: gpt-share-prod-03
+    type: postgres
+
+  - name: test-dev-01
+    type: postgres
+
+  - name: umami-prod-01
+    type: postgres
+
+  - name: vercount-prod-01
+    type: postgres
+
+  - name: waline-prod-01
+    type: postgres
+
+  - name: waline-prod-02
+    type: postgres
+
+  - name: whereto-prod-01
+    type: postgres
+
+  - name: code-share-prod-01
+    type: dragonfly
+    memory: 1024mb
+    threads: 4
+
+  - name: gpt-share-dev-01
+    type: dragonfly
+
+  - name: gpt-share-prod-01
+    type: dragonfly
+    memory: 1024mb
+    threads: 4
+
+  - name: oai-co-prod-01
+    type: redis
+
+  - name: oai-co-prod-02
+    type: redis
+
+  - name: portfolio-prod-01
+    type: dragonfly
+
+  - name: redefine-version-prod-01
+    type: dragonfly
+
+  - name: stock-selector-prod-01
+    type: redis
+
+  - name: test-dev-01
+    type: dragonfly
+
+  - name: vercount-prod-01
+    type: dragonfly
+    memory: 2048mb
+    threads: 4
+
+  - name: xai-server-prod-01
+    type: redis

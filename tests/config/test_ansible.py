@@ -26,7 +26,7 @@ def test_production_is_not_the_default_and_requires_apply():
 
     defaults = (ANSIBLE / "group_vars/all.yml").read_text()
     assert "apply | default('no') == 'yes'" in defaults
-    assert "'production' not in group_names" in defaults
+    assert "evdb_write:" in defaults
     assert "evdb_prod" not in defaults
 
     production = yaml.safe_load((ANSIBLE / "hosts.yml").read_text())
@@ -34,31 +34,61 @@ def test_production_is_not_the_default_and_requires_apply():
     assert "montreal-01" in production["all"]["children"]["production"]["hosts"]
 
 
-def test_secret_resolution_is_controller_side_hidden_and_check_safe():
-    secret_files = [
-        ANSIBLE / "roles/backup/tasks/main.yml",
-        ANSIBLE / "roles/postgres/tasks/secret.yml",
-        ANSIBLE / "roles/kv/tasks/secret.yml",
-    ]
+def test_roles_consume_only_normalized_controller_input_and_filter_databases():
+    role_text = "\n".join(
+        path.read_text() for path in (ANSIBLE / "roles").rglob("*.yml") if path.is_file()
+    )
+    postgres = (ANSIBLE / "roles/postgres/tasks/main.yml").read_text()
+    kv = (ANSIBLE / "roles/kv/tasks/main.yml").read_text()
 
-    for path in secret_files:
-        text = path.read_text()
-        assert "delegate_to: localhost" in text
-        assert "no_log: true" in text
-        assert "ansible.builtin.command:" in text
-        assert "argv:" in text
-        assert "shell:" not in text
+    assert "evdb_config.host" in role_text
+    assert "evdb_config.databases" in role_text
+    assert "include_vars" not in role_text
+    assert "evdb_source_dir" not in role_text
+    assert "postgres.yml" not in role_text
+    assert "kv.yml" not in role_text
+    assert "selectattr('engine', 'equalto', 'postgres')" in postgres
+    assert "rejectattr('engine', 'equalto', 'postgres')" in kv
+    assert "instance.image" in postgres + kv
+    assert "instance.data" in postgres + kv
+    assert "instance.settings" in postgres + kv
+    assert "instance.http" in postgres + kv
 
-    for path in secret_files:
-        if path.name != "secret.yml":
-            assert "not ansible_check_mode" in path.read_text()
+
+def test_ansible_bootstrap_never_accepts_or_writes_protected_files():
+    text = (ANSIBLE / "roles/backup/tasks/main.yml").read_text()
+
+    assert "evdb_secret_files" not in text
+    assert "Stage protected runtime files" not in text
+    assert "ansible.builtin.command:" not in text
+    assert "shell:" not in text
 
 
 def test_rclone_seed_is_never_overwritten():
     text = (ANSIBLE / "roles/backup/tasks/main.yml").read_text()
-    assert "Check mutable rclone config" in text
-    assert "not evdb_rclone_file.stat.exists" in text
-    assert "force: false" in text
+    assert "rclone.conf" not in text
+
+
+def test_ansible_installs_assets_without_compose_or_release_lifecycle():
+    text = "\n".join(path.read_text() for path in ANSIBLE.rglob("*") if path.is_file())
+
+    assert "host-runtime/src" not in text
+    assert "evdb_runtime_root" in text
+    assert "docker compose" not in text
+    assert "tasks_from: activate" not in text
+    assert "state: restarted" not in text
+    assert "/etc/systemd/system" not in text
+    assert "systemd_service" not in text
+
+
+def test_bootstrap_refreshes_only_dedicated_normalized_runtime():
+    backup = (ANSIBLE / "roles/backup/tasks/main.yml").read_text()
+
+    assert "evdb_bootstrap_runtime" in backup
+    assert "force: false" not in backup
+    assert "Remove stale bootstrap runtime database JSON" in backup
+    assert "{{ evdb_config_dir }}/host.json" not in backup
+    assert "jobs/" not in backup
 
 
 def test_external_http_proxy_is_not_managed():

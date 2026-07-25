@@ -62,7 +62,7 @@ def _check(instance: Instance, path: Path) -> None:
             "none",
             "--volume",
             f"{path.resolve()}:/dump.rdb:ro",
-            str(instance.target["image"]),
+            instance.image,
             "redis-check-rdb",
             "/dump.rdb",
         ],

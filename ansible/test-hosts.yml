@@ -13,11 +13,9 @@ all:
           evdb_repos:
             postgres: "{{ evdb_state_dir }}/repos/postgres"
             kv: "{{ evdb_state_dir }}/repos/kv"
-          evdb_unit_dir: /tmp/evanovation-db-test/systemd
           evdb_user: "{{ lookup('env', 'USER') }}"
           evdb_group: "{{ lookup('env', 'USER') }}"
           evdb_admin_user: "{{ lookup('env', 'USER') }}"
           evdb_admin_group: "{{ lookup('env', 'USER') }}"
           evdb_manage_user: false
-          evdb_manage_systemd: false
-          evdb_skip_secrets: true
+          evdb_secret_files: []

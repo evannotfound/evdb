@@ -8,7 +8,7 @@ Type=oneshot
 User=evanovation-db
 Group=evanovation-db
 Environment=PYTHONPATH=/opt/evanovation-db/current/src
-ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /etc/evanovation-db status
+ExecStart=/usr/bin/python3 -m evanovation_db.cli --config /opt/evanovation-db/current/runtime status
 TimeoutStartSec=15m
 Nice=10
 IOSchedulingClass=idle

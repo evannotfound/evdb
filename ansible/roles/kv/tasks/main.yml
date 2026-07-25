@@ -1,45 +1,19 @@
 ---
-- name: Load KV deployment config
-  ansible.builtin.include_vars:
-    file: "{{ item.file }}"
-    name: "{{ item.name }}"
-  loop:
-    - {file: "{{ evdb_source_dir }}/host.yml", name: evdb_host}
-    - {file: "{{ evdb_source_dir }}/kv.yml", name: evdb_kv}
+- name: Select normalized KV databases
+  ansible.builtin.set_fact:
+    evdb_kv: "{{ evdb_databases | rejectattr('engine', 'equalto', 'postgres') | list }}"
 
-- name: Create KV render directories
-  ansible.builtin.file:
-    path: "{{ evdb_config_dir }}/compose/kv"
-    state: directory
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0750"
-  when: evdb_plan | bool
-
-- name: Render engine-specific KV Compose files
-  ansible.builtin.template:
-    src: "{{ evdb_repo }}/compose/{{ instance.engine }}.yml.j2"
-    dest: "{{ evdb_config_dir }}/compose/kv/{{ instance.id }}.yml"
-    owner: "{{ evdb_admin_user }}"
-    group: "{{ evdb_group }}"
-    mode: "0640"
-  loop: "{{ evdb_kv.instances }}"
+- name: Validate direct KV runtime fields
+  ansible.builtin.assert:
+    that:
+      - instance.engine in ['redis', 'dragonfly']
+      - instance.image is string
+      - "'@sha256:' in instance.image"
+      - instance.data is string
+      - instance.settings is mapping
+      - instance.http is mapping
+    fail_msg: "{{ instance.id }} must use normalized KV image, data, settings, and HTTP fields"
+  loop: "{{ evdb_kv }}"
   loop_control:
     loop_var: instance
     label: "{{ instance.id }} ({{ instance.engine }})"
-  vars:
-    host: "{{ evdb_host.host }}"
-    config_dir: "{{ evdb_config_dir }}"
-    secret_dir: "{{ evdb_secret_dir }}"
-  when: evdb_plan | bool
-
-- name: Write private KV files
-  ansible.builtin.include_tasks: secret.yml
-  loop: "{{ evdb_kv.instances }}"
-  loop_control:
-    loop_var: instance
-    label: "{{ instance.id }}"
-  when:
-    - evdb_write | bool
-    - not ansible_check_mode
-    - not evdb_skip_secrets | bool

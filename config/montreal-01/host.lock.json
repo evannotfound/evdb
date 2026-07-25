@@ -1,0 +1,47 @@
+{
+  "host": "montreal-01",
+  "http_ports": {
+    "dragonfly/code-share-prod-01": 13390,
+    "dragonfly/gpt-share-dev-01": 13389,
+    "dragonfly/gpt-share-prod-01": 13385,
+    "dragonfly/portfolio-prod-01": 13388,
+    "dragonfly/redefine-version-prod-01": 13380,
+    "dragonfly/test-dev-01": 13379,
+    "dragonfly/vercount-prod-01": 13381,
+    "redis/oai-co-prod-01": 13382,
+    "redis/oai-co-prod-02": 13383,
+    "redis/stock-selector-prod-01": 13386,
+    "redis/xai-server-prod-01": 13387
+  },
+  "images": {
+    "dragonfly": {
+      "digest": "sha256:99eb2dd14ca00b983c302d0a15d15176dccd5a9e85a375bcc5157e1cadd73099",
+      "source": "docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1"
+    },
+    "http": {
+      "digest": "sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150",
+      "source": "hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150"
+    },
+    "pgbouncer": {
+      "digest": "sha256:c7bfcaa24de830e29588bb9ad1eb39cebaf07c27149e1974445899b695634bb4",
+      "source": "edoburu/pgbouncer:v1.25.1-p0"
+    },
+    "postgres": {
+      "digest": "sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881",
+      "source": "postgres:16"
+    },
+    "redis": {
+      "digest": "sha256:f5ef9e24a9ef3b7cc552ae0cbc3cbade4f2877502683496c5d775605ae071412",
+      "source": "redis:7.2.5"
+    },
+    "traefik": {
+      "digest": "sha256:4299bbed850421258fc5448c2e0e6ad350981d4d335a68de11b92448aedbefe5",
+      "source": "traefik:v3.7.8"
+    }
+  },
+  "platform": {
+    "architecture": "amd64",
+    "os": "linux"
+  },
+  "version": 1
+}

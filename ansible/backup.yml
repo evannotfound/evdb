@@ -13,9 +13,6 @@
   roles:
     - base
     - app
+    - postgres
+    - kv
     - backup
-  post_tasks:
-    - name: Activate checked release
-      ansible.builtin.include_role:
-        name: app
-        tasks_from: activate

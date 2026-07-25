@@ -10,6 +10,22 @@ class CommandError(Error):
     pass
 
 
+class ProtocolError(Error):
+    pass
+
+
+class RuntimeUnavailableError(ProtocolError):
+    pass
+
+
+class ProtocolMismatchError(ProtocolError):
+    pass
+
+
+class DeploymentError(Error):
+    pass
+
+
 class LockError(Error):
     pass
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import time
 from pathlib import Path
 from urllib.parse import unquote
@@ -15,16 +16,37 @@ OBJECT_SQL = (
 )
 
 
-def restore(host: Host, instance: Instance, folder: Path, name: str) -> dict:
+def restore(
+    host: Host,
+    instance: Instance,
+    folder: Path,
+    name: str,
+    data_dir: Path | None = None,
+) -> dict:
     del host
     data = manifest.check(folder)
+    mounts = []
+    if data_dir is not None:
+        if data_dir.exists():
+            if not data_dir.is_dir() or any(data_dir.iterdir()):
+                raise RestoreError("Postgres restore candidate directory is not empty")
+        else:
+            data_dir.mkdir(mode=0o700)
+        mounts.append((data_dir, "/var/lib/postgresql/data", False))
+    password = secrets.token_urlsafe(32)
     docker.start(
-        str(instance.target["image"]),
+        instance.image,
         name,
-        env={"POSTGRES_USER": "restore_admin", "POSTGRES_HOST_AUTH_METHOD": "trust"},
+        mounts=mounts,
+        env={
+            "POSTGRES_USER": "restore_admin",
+            "POSTGRES_PASSWORD": password,
+            "POSTGRES_INITDB_ARGS": "--auth-host=scram-sha-256",
+        },
         memory="2g",
         network="none",
         timeout=300,
+        secrets=[password],
     )
     _wait(name)
     docker.copy(folder / "globals.sql", f"{name}:/tmp/globals.sql")

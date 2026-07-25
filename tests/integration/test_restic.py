@@ -21,7 +21,7 @@ def test_local_restic_upload_returns_confirmed_snapshot_json(config, tmp_path):
     folder = _backup(tmp_path / "complete")
 
     snapshot_id = restic.upload(config.host, instance, folder)
-    snapshots = restic.snapshots(config.host, "kv", instance.id)
+    snapshots = restic.snapshots(config.host, instance)
     restored = restic.restore(config.host, instance, snapshot_id, tmp_path / "restored")
 
     assert len(snapshot_id) == 64
@@ -56,6 +56,7 @@ def test_local_restic_failure_keeps_completed_backup(config, tmp_path):
 
 def test_local_restic_retention_prune_and_subset_check(config, tmp_path):
     require_binary("restic")
+    instance = config.get("postgres", "test-dev-01")
     host = replace(
         config.host,
         retention={"daily": 1, "weekly": 1, "monthly": 1, "data_parts": 2},
@@ -76,7 +77,7 @@ def test_local_restic_retention_prune_and_subset_check(config, tmp_path):
                 "--time",
                 (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"),
                 "--tag",
-                "host:local-test",
+                f"host:{host.id}",
                 "--tag",
                 "engine:postgres",
                 "--tag",
@@ -84,9 +85,9 @@ def test_local_restic_retention_prune_and_subset_check(config, tmp_path):
             ],
         )
 
-    before = restic.snapshots(host, "postgres", "test-dev-01")
+    before = restic.snapshots(host, instance)
     restic.forget(host, "postgres", dry_run=False)
-    after = restic.snapshots(host, "postgres", "test-dev-01")
+    after = restic.snapshots(host, instance)
     restic.prune(host, "postgres")
     result = restic.check(host, "postgres", part=1)
 
