@@ -1,0 +1,94 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.10"
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Verify release version
+        run: |
+          VERSION="$(uv run evdb --version)"
+          test "v${VERSION#evdb }" = "${GITHUB_REF_NAME}"
+      - run: make check
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.10"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: make binary
+      - name: Smoke test standalone executable
+        run: |
+          VERSION="$(dist/evdb --version)"
+          test "v${VERSION#evdb }" = "${GITHUB_REF_NAME}"
+      - name: Assemble release archive
+        run: |
+          ASSET="evdb_linux_${{ matrix.arch }}.tar.gz"
+          install -d -m 0755 release/bin release/units artifacts
+          install -m 0755 dist/evdb release/bin/evdb
+          install -m 0644 src/evanovation_db/units/*.service release/units/
+          install -m 0644 src/evanovation_db/units/*.timer release/units/
+          (cd release && tar -czf "../artifacts/${ASSET}" bin/evdb units/*.service units/*.timer)
+          tar -tzf "artifacts/${ASSET}"
+          (cd artifacts && sha256sum "${ASSET}" > "${ASSET}.sha256")
+          uv run python tools/check_release.py "artifacts/${ASSET}" "${GITHUB_REF_NAME}"
+        working-directory: ${{ github.workspace }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Add installer
+        run: install -m 0755 install.sh release/install.sh
+      - name: Attest release archives
+        uses: actions/attest@v4
+        with:
+          subject-path: release/evdb_linux_*.tar.gz
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" release/*
+          --verify-tag --generate-notes --title "evdb ${GITHUB_REF_NAME#v}"

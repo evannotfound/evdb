@@ -1,6 +1,7 @@
 UV ?= uv
 RUFF ?= $(UV) run ruff
 PYTEST ?= $(UV) run pytest
+PYINSTALLER ?= $(UV) run pyinstaller
 EVDB ?= /usr/local/bin/evdb
 
 YES_ARG = $(if $(filter yes,$(YES)),--yes,)
@@ -10,7 +11,7 @@ ENGINE_ARG = $(if $(ENGINE),--engine "$(ENGINE)",)
 LINES_ARG = $(if $(LINES),--lines "$(LINES)",)
 JSON_ARG = $(if $(filter yes,$(JSON)),--json,)
 
-.PHONY: help check lint test unit config-check restic-integration integration-collect status \
+.PHONY: help check lint test unit config-check restic-integration integration-collect binary status \
 	database-list database-add database-info database-configure database-start \
 	database-stop database-restart database-logs backup-create backup-list backup-test \
 	restore host-check host-setup host-update require-db require-project-role require-version
@@ -22,13 +23,13 @@ help:
 		'Database: database-add database-configure database-start database-stop database-restart database-logs' \
 		'Recovery: backup-create backup-list backup-test restore' \
 		'Host: host-check host-setup host-update' \
-		'Development: check lint test unit config-check restic-integration integration-collect'
+		'Development: check lint test unit config-check restic-integration integration-collect binary'
 
 check: lint test restic-integration integration-collect
 
 lint:
-	$(RUFF) check src tests
-	$(RUFF) format --check src tests
+	$(RUFF) check src tests tools
+	$(RUFF) format --check src tests tools
 
 test: unit config-check
 
@@ -47,6 +48,9 @@ restic-integration:
 
 integration-collect:
 	$(PYTEST) --collect-only -q tests/integration
+
+binary:
+	$(PYINSTALLER) --clean --noconfirm --onefile --name evdb --paths src src/evanovation_db/__main__.py
 
 require-db:
 	@test -n "$(DB)" || (printf '%s\n' 'DB is required: DB=example-prod-01/postgres' >&2; exit 2)

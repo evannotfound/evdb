@@ -296,26 +296,20 @@ def test_port_preflight_trusts_only_owned_traefik(labels, available, monkeypatch
     assert host._ports_available() is available
 
 
-def test_prerequisites_report_incompatible_python_without_installing(monkeypatch):
+def test_prerequisites_do_not_require_python_or_uv(monkeypatch):
     calls = []
     monkeypatch.setattr(host.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def fake_run(args, **kwargs):
         calls.append(args)
-        output = "3.9\n" if args[0] == "/usr/bin/python3" else ""
-        return Result(tuple(args), 0, output, "")
+        return Result(tuple(args), 0, "", "")
 
     monkeypatch.setattr(host, "run", fake_run)
 
-    assert host.prerequisites() == ["Python 3.10 or newer"]
-    assert calls == [
-        [
-            "/usr/bin/python3",
-            "-c",
-            "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
-        ],
-        ["docker", "compose", "version"],
-    ]
+    assert host.prerequisites() == []
+    assert calls == [["docker", "compose", "version"]]
+    assert "python3" not in host.TOOLS
+    assert "uv" not in host.TOOLS
 
 
 def test_setup_refuses_production_migration(paths, tmp_path):
@@ -380,6 +374,9 @@ def _prepare_update(config, units):
     (old / "bin").mkdir(parents=True)
     (old / "bin/evdb").write_text("old")
     (old / "bin/evdb").chmod(0o755)
+    (old / "units").mkdir()
+    for source in host._units():
+        shutil.copy2(source, old / "units" / source.name)
     (config.paths.tool / "current").symlink_to(old)
     return old
 
@@ -389,7 +386,7 @@ def _install_candidate(config, version="1.1.0", marker="# candidate package", ex
     (candidate / "bin").mkdir(parents=True, exist_ok=True)
     (candidate / "bin/evdb").write_text("candidate")
     (candidate / "bin/evdb").chmod(0o755)
-    packaged = candidate / "tools/evanovation-db/lib/python3.10/site-packages/evanovation_db/units"
+    packaged = candidate / "units"
     packaged.mkdir(parents=True)
     for source in host._units():
         text = source.read_text()
@@ -403,6 +400,16 @@ def _install_candidate(config, version="1.1.0", marker="# candidate package", ex
             "[Install]\nWantedBy=timers.target\n"
         )
     return candidate
+
+
+@pytest.fixture(autouse=True)
+def _release_candidate(config, monkeypatch):
+    def install(target, selected, current_units, *, timeout):
+        del current_units, timeout
+        assert target == config.paths.tool / f"versions/{selected}"
+        _install_candidate(config, selected)
+
+    monkeypatch.setattr(host, "_install_release", install)
 
 
 def _status(config, *, healthy=True, version=status.VERSION, errors=None):
@@ -454,10 +461,7 @@ def test_exact_update_uses_candidate_units_preserves_timers_and_cleans_versions(
 ):
     units = tmp_path / "systemd"
     old = _prepare_update(config, units)
-    stale = config.paths.tool / "versions/0.9.0"
-    (stale / "bin").mkdir(parents=True)
-    (stale / "bin/evdb").write_text("stale")
-    (stale / "bin/evdb").chmod(0o755)
+    stale = _install_candidate(config, version="0.9.0")
     calls = []
     timer_state = {
         name: (index % 2 == 0, index % 3 == 0)
@@ -493,9 +497,7 @@ def test_exact_update_uses_candidate_units_preserves_timers_and_cleans_versions(
         "1.0.0",
         "1.1.0",
     ]
-    uv = next(item for item in calls if item[0][:3] == ["uv", "tool", "install"])
-    assert uv[0][-1] == "evanovation-db==1.1.0"
-    assert uv[1]["env"]["UV_TOOL_BIN_DIR"] == str(candidate / "bin")
+    assert not any(args[0] in {"python", "python3", "pip", "pipx", "uv"} for args, _ in calls)
     assert not any(args[:2] == ["docker", "compose"] for args, _ in calls)
     assert not any(
         args[:2]
@@ -523,6 +525,8 @@ def test_update_preview_names_state_and_unit_migrations(config, tmp_path, monkey
     previews = []
 
     def fake_run(args, **kwargs):
+        if args[-1] == "--version":
+            return Result(tuple(args), 0, "evdb 1.1.0\n", "")
         if args and args[0].endswith("/bin/evdb"):
             return Result(tuple(args), 0, _status(config), "")
         return Result(tuple(args), 0, "", "")
@@ -542,6 +546,27 @@ def test_update_preview_names_state_and_unit_migrations(config, tmp_path, monkey
     assert "Systemd units: evdb-status.service" in previews[0]
     assert "Database Compose and services will not change" in previews[0]
     assert (config.paths.tool / "current").resolve() == old
+
+
+def test_update_rejects_preexisting_candidate_with_wrong_executable_version(
+    config, tmp_path, monkeypatch
+):
+    units = tmp_path / "systemd"
+    old = _prepare_update(config, units)
+    candidate = _install_candidate(config)
+
+    def fake_run(args, **kwargs):
+        if args[-1] == "--version":
+            return Result(tuple(args), 0, "evdb 9.9.9\n", "")
+        return Result(tuple(args), 0, "", "")
+
+    monkeypatch.setattr(host, "run", fake_run)
+
+    with pytest.raises(HostError, match="version does not match"):
+        host.update(config, "1.1.0", yes=True, unit_dir=units)
+
+    assert (config.paths.tool / "current").resolve() == old
+    assert candidate.is_dir()
 
 
 def test_update_rejects_candidate_units_that_systemd_cannot_verify(config, tmp_path, monkeypatch):
@@ -573,6 +598,13 @@ def test_update_enables_only_new_global_timer(config, tmp_path, monkeypatch):
     }
     before = dict(timer_state)
     calls = []
+    monkeypatch.setattr(
+        host,
+        "_install_release",
+        lambda target, selected, current_units, *, timeout: _install_candidate(
+            config, selected, extra_timer=added
+        ),
+    )
 
     def fake_run(args, **kwargs):
         calls.append(args)
@@ -647,6 +679,13 @@ def test_update_rejects_invalid_candidate_version_directory_before_activation(
     old = _prepare_update(config, units)
     checks = []
 
+    def install(target, selected, current_units, *, timeout):
+        del target, current_units, timeout
+        candidate = _install_candidate(config, selected)
+        (candidate / "bin/evdb").chmod(0o644)
+
+    monkeypatch.setattr(host, "_install_release", install)
+
     def fake_run(args, **kwargs):
         if args[:3] == ["uv", "tool", "install"]:
             candidate = _install_candidate(config)
@@ -668,10 +707,7 @@ def test_update_rejects_invalid_candidate_version_directory_before_activation(
 def test_update_reports_deferred_inactive_version_cleanup(config, tmp_path, monkeypatch):
     units = tmp_path / "systemd"
     old = _prepare_update(config, units)
-    stale = config.paths.tool / "versions/0.9.0"
-    (stale / "bin").mkdir(parents=True)
-    (stale / "bin/evdb").write_text("stale")
-    (stale / "bin/evdb").chmod(0o755)
+    stale = _install_candidate(config, version="0.9.0")
     real_rmtree = shutil.rmtree
 
     def fake_run(args, **kwargs):
@@ -700,33 +736,20 @@ def test_update_reports_deferred_inactive_version_cleanup(config, tmp_path, monk
     assert any(path.name.startswith(".cleanup-") for path in stale.parent.iterdir())
 
 
-def test_exact_version_bootstrap_builds_managed_layout(config, tmp_path, monkeypatch):
-    tool = tmp_path / "opt/evdb"
-    target = tool / "versions/1.2.3"
-    stable = tmp_path / "usr/local/bin/evdb"
-    calls = []
+def test_frozen_command_reads_units_from_adjacent_release(tmp_path, monkeypatch):
+    target = tmp_path / "versions/1.2.3"
+    executable = target / "bin/evdb"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("candidate")
+    units = target / "units"
+    units.mkdir()
+    source = host._units()[0]
+    shutil.copy2(source, units / source.name)
 
-    def fake_run(args, **kwargs):
-        calls.append((args, kwargs))
-        (target / "bin").mkdir(parents=True, exist_ok=True)
-        (target / "bin/evdb").write_text("candidate")
-        (target / "bin/evdb").chmod(0o755)
-        return Result(tuple(args), 0, "", "")
+    monkeypatch.setattr(host.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(host.sys, "executable", str(executable))
 
-    monkeypatch.setattr(host, "run", fake_run)
-    monkeypatch.setattr(host, "_stable_path", lambda current: stable)
-
-    host._bootstrap_version(target, "1.2.3", config)
-    host._link(tool / "current", target)
-    host._stable_command(tool)
-
-    assert calls[0][0] == ["uv", "tool", "install", "evanovation-db==1.2.3"]
-    assert calls[0][1]["env"] == {
-        "UV_TOOL_DIR": str(target / "tools"),
-        "UV_TOOL_BIN_DIR": str(target / "bin"),
-    }
-    assert (tool / "current").resolve() == target
-    assert stable.resolve() == target / "bin/evdb"
+    assert host._units() == (units / source.name,)
 
 
 @pytest.mark.parametrize(
@@ -917,10 +940,7 @@ def test_update_restores_managed_file_replaced_by_candidate_symlink(config, tmp_
 def test_failed_update_restores_links_state_units_and_timer_state(config, tmp_path, monkeypatch):
     units = tmp_path / "systemd"
     old = _prepare_update(config, units)
-    prior = config.paths.tool / "versions/0.9.0"
-    (prior / "bin").mkdir(parents=True)
-    (prior / "bin/evdb").write_text("prior")
-    (prior / "bin/evdb").chmod(0o755)
+    prior = _install_candidate(config, version="0.9.0")
     (config.paths.tool / "previous").symlink_to(prior)
     old_state = config.paths.machine_state.read_bytes()
     old_units = {path.name: (units / path.name).read_bytes() for path in host._units()}
@@ -1090,6 +1110,17 @@ def test_update_rejects_backup_record_with_wrong_engine_format(config, tmp_path,
 
 
 def test_update_rejects_non_exact_versions_before_install(config):
-    for value in ("latest", "1", "1.2", ">=1.2.3", "1.2.x", "01.2.3"):
+    for value in (
+        "latest",
+        "1",
+        "1.2",
+        ">=1.2.3",
+        "1.2.x",
+        "01.2.3",
+        "1.2.3-01",
+        "1.2.3-..",
+        "1.2.3-alpha..1",
+        "1.2.3+build..1",
+    ):
         with pytest.raises(HostError, match="exact semantic version"):
             host.update(config, value, yes=True)

@@ -4,13 +4,12 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from . import compose, docker, secrets
+from . import __version__, compose, docker, secrets
 from .config import Config, Database, load_state
 from .engines import dragonfly, postgres, redis
 from .files import free_gb
@@ -666,10 +665,7 @@ def _existing(path: Path) -> Path:
 
 
 def _version() -> str:
-    try:
-        return version("evanovation-db")
-    except PackageNotFoundError:
-        return "unknown"
+    return __version__
 
 
 def _date(value: Any) -> datetime | None:

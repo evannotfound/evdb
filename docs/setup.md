@@ -1,38 +1,50 @@
 # Host setup and updates
 
-## Prerequisites
+## Requirements
 
-The database host needs a compatible Python, Docker with Compose, Restic, rclone, systemd, writable
-canonical filesystems, DNS-01 routing inputs, and free native ports 5432 and 6379. Setup reports
-missing prerequisites but does not install or upgrade unrelated host software. Docker group access
-is root-equivalent and must be granted deliberately.
+evdb supports Ubuntu 22.04 or newer on ARM64 and x86_64. A database host needs:
 
-Install one exact package version into a candidate version directory and run setup through the
-stable executable:
+- Docker with Compose
+- Restic and rclone
+- systemd
+- DNS-01 credentials for native TLS routing
+- writable configuration, state, tool, and data filesystems
+- free native ports `5432` and `6379`
+
+The standalone release includes evdb's Python runtime. Python, pip, pipx, and `uv` are not production
+prerequisites. Setup reports missing host tools but does not install or upgrade them. Docker group
+membership is root-equivalent and must be granted deliberately.
+
+## Install
+
+Install the latest public release:
 
 ```sh
-VERSION=1.2.3
-UV="$(command -v uv)"
-sudo install -d -m 0755 \
-  "/opt/evdb/versions/${VERSION}/tools" \
-  "/opt/evdb/versions/${VERSION}/bin"
-sudo env \
-  UV_TOOL_DIR="/opt/evdb/versions/${VERSION}/tools" \
-  UV_TOOL_BIN_DIR="/opt/evdb/versions/${VERSION}/bin" \
-  "${UV}" tool install "evanovation-db==${VERSION}"
-sudo ln -sfn "versions/${VERSION}" /opt/evdb/current
-sudo ln -sfn /opt/evdb/current/bin/evdb /usr/local/bin/evdb
-sudo /usr/local/bin/evdb host setup
-/usr/local/bin/evdb host check
+curl -fsSL https://github.com/evannotfound/evanovation-db/releases/latest/download/install.sh | sudo sh
+sudo evdb host setup
 ```
 
-`UV_TOOL_DIR` stores the isolated tool environment and metadata under that version. The separate
-`UV_TOOL_BIN_DIR` places its linked `evdb` executable at
-`/opt/evdb/versions/<version>/bin/evdb`. The exact `==${VERSION}` requirement prevents an
-unbounded package resolution. `/usr/local/bin/evdb` always resolves through `current`, so operators
-and units do not depend on a version-specific command path.
+Pin the first installation to an exact version when reproducibility matters:
 
-For explicit non-interactive setup, provide every required value and `--yes`:
+```sh
+curl -fsSL https://github.com/evannotfound/evanovation-db/releases/download/v1.2.3/install.sh \
+  | sudo sh -s -- 1.2.3
+sudo evdb host setup
+```
+
+The anonymous installer works after the repository and its GitHub Releases are public. Before the
+first public release, download and inspect the matching release assets through authenticated GitHub
+access rather than piping a private URL.
+
+The installer detects ARM64 or x86_64, downloads the matching archive and SHA-256 file, rejects an
+unexpected archive layout, and confirms that `evdb --version` matches the selected release. It stages
+the complete version before changing either managed link. Release assets use the stable names
+`evdb_linux_arm64.tar.gz` and `evdb_linux_amd64.tar.gz`.
+
+## Guided and explicit setup
+
+`sudo evdb host setup` opens a guided session when the initial configuration is absent. For explicit
+non-interactive setup, provide every required value and `--yes`:
 
 ```sh
 sudo evdb host setup \
@@ -48,12 +60,24 @@ sudo evdb host setup \
   --yes
 ```
 
-Setup creates a non-login `evdb` account, canonical config, state, data and tool directories,
-private host files, the dedicated Docker network and native Traefik definition, and packaged
-systemd units. It is idempotent. Repeated setup does not replace database credentials or mutable
-rclone OAuth state, restart healthy databases, or change enabled timers.
+Setup creates the non-login `evdb` service account, `/etc/evdb/host.yml`, machine-owned state,
+private host files, data and tool directories, the dedicated Docker network and Traefik project, and
+canonical systemd units. It finishes with `evdb host check`.
 
-## Versioned tool layout
+Setup is idempotent. Repeated setup does not replace database credentials or mutable rclone OAuth
+state, restart healthy databases, or change enabled timers.
+
+## Version layout
+
+Each release archive contains one standalone executable and the canonical service and timer files:
+
+```text
+bin/evdb
+units/*.service
+units/*.timer
+```
+
+Installation places that archive in the versioned tool layout:
 
 ```text
 /opt/evdb/versions/<version>/
@@ -62,36 +86,44 @@ rclone OAuth state, restart healthy databases, or change enabled timers.
 /usr/local/bin/evdb -> /opt/evdb/current/bin/evdb
 ```
 
-Configuration, generated Compose, secrets, machine-owned state, backups, and data remain outside
-tool versions. Update requires an exact semantic version:
+Configuration, generated Compose, private host files, machine-owned state, backups, and database data
+remain outside tool versions.
+
+## Update
+
+Updates always name an exact semantic version:
 
 ```sh
 sudo evdb host update 1.3.0
 ```
 
-The candidate reads current config, state, Compose, backup records, and packaged units before the
-switch. It previews compatible file migrations, snapshots affected config and unit files,
-activates atomically, refreshes units, and runs `evdb host check`. Failure restores the active tool,
-files, and loaded units. Update retains one previous version and must preserve timer state.
+evdb downloads the architecture-specific archive and checksum from the immutable `v1.3.0` GitHub
+Release. It rejects checksum errors, links, traversal, duplicate or unexpected members, missing units,
+and an executable reporting another version.
 
-A package update does not regenerate database Compose, change image digests, restart databases,
-restore data, or perform an engine migration. A candidate unable to read the installed contracts is
-rejected before activation.
+Before activation, the candidate reads current configuration, state, Compose, backup records, and
+installed units without writing them. evdb previews compatible changes, snapshots affected files,
+switches the active version atomically, refreshes units, preserves timer state, and runs
+`evdb host check`. Failure restores the prior executable, links, files, loaded units, and timers. One
+previous version is retained.
 
-## Package release requirements
+A tool update does not regenerate database Compose, change image digests, restart databases, restore
+data, or perform an engine migration.
 
-Every published release must use one exact semantic version in `pyproject.toml`. Build both the
-wheel and source archive with `uv build`, inspect the wheel to confirm that it contains only the
-`evdb` entry point plus every canonical service and timer, and run the repository checks against the
-same source revision before publishing. Publish immutable artifacts to the configured Python
-registry; host installation and update always request `evanovation-db==<version>` and never a
-floating version. Registry hashes, release signing, and production registry credentials must be
-defined before production migration.
+## Release trust
+
+Semantic-version tags build native ARM64 and x86_64 executables on Ubuntu 22.04 GitHub-hosted runners.
+The release workflow runs repository checks, verifies the tag against `evdb --version`, smoke-tests
+both executables, packages canonical units, publishes SHA-256 files, and records GitHub artifact
+attestations before creating the release.
+
+Checksums protect installation and update from corrupted or substituted archive content within the
+GitHub Release channel. Artifact attestations let operators inspect which workflow and source revision
+produced an archive. The repository and release account remain the trust root.
 
 ## Development boundary
 
-Repository checks use `tests/fixtures/config` and temporary `/etc`, `/var/lib`, `/opt`, data, and
-Restic roots. They do not run setup, package activation, systemd changes, or production commands.
-Initial production conversion and credential import are a separate production migration.
-Operator Make targets do not accept alternate configuration paths; fixture configuration is loaded
-only by tests that inject temporary canonical paths.
+Repository development uses `uv sync --locked`, Ruff, pytest, disposable containers, temporary host
+paths, and local Restic repositories. Development never runs setup, systemd changes, or production
+migration commands against a live host. Operator commands always use `/etc/evdb/host.yml`; alternate
+fixture paths are test inputs only.

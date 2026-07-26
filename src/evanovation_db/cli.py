@@ -9,7 +9,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from . import backup, database, interactive, restic, restore, status
+from . import __version__, backup, database, interactive, restic, restore, status
 from .config import CONFIG_DIR, Config, load, load_state, require_no_orphans
 from .errors import Error
 from .log import sanitize
@@ -18,6 +18,7 @@ from .log import write as log_write
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="evdb")
+    result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     result.add_argument("--config", default=os.getenv("EVDB_CONFIG", str(CONFIG_DIR / "host.yml")))
     commands = result.add_subparsers(dest="command")
 

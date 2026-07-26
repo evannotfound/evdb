@@ -1,22 +1,25 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import platform
 import re
 import secrets as random
 import shutil
 import socket
 import sys
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass, replace
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as package_version
 from importlib.resources import files
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
-from . import backup, compose, status
+from . import __version__, backup, compose, status
 from .config import (
     BackupSettings,
     Config,
@@ -37,12 +40,22 @@ from .lock import operation
 from .log import write as log_write
 from .run import run
 
+_PRERELEASE = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
 VERSION = re.compile(
-    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-    r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
+    rf"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    rf"(?:-{_PRERELEASE}(?:\.{_PRERELEASE})*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+    re.ASCII,
 )
-TOOLS = ("docker", "restic", "rclone", "systemctl", "systemd-escape", "uv")
-MIN_PYTHON = (3, 10)
+TOOLS = ("docker", "restic", "rclone", "systemctl", "systemd-escape")
+RELEASES = "https://github.com/evannotfound/evanovation-db/releases"
+ARCHITECTURES = {
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "amd64": "amd64",
+    "x86_64": "amd64",
+}
+MAX_RELEASE_SIZE = 256 * 1024 * 1024
 DEFAULT_TIMERS = (
     "evdb-status.timer",
     "evdb-backup-test.timer",
@@ -104,25 +117,6 @@ def compatibility(config: Config, unit_root: Path) -> None:
 
 def prerequisites() -> list[str]:
     missing = [name for name in TOOLS if shutil.which(name) is None]
-    python = shutil.which("python3")
-    if python is None:
-        missing.append("python3")
-    else:
-        result = run(
-            [
-                python,
-                "-c",
-                "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
-            ],
-            timeout=30,
-            check=False,
-        )
-        try:
-            discovered = tuple(int(value) for value in result.out.strip().split(".", 1))
-        except ValueError:
-            discovered = ()
-        if result.code != 0 or discovered < MIN_PYTHON:
-            missing.append(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer")
     if "docker" not in missing:
         result = run(["docker", "compose", "version"], timeout=30, check=False)
         if result.code != 0:
@@ -209,7 +203,7 @@ def _setup_locked(
         if not rclone_target.is_file() and rclone_source
         else None
     )
-    running_version, bootstrap_version = _setup_version(managed.tool)
+    running_version = _setup_version(managed.tool)
 
     preview = (
         f"Host: {config.host.id}\n"
@@ -219,7 +213,7 @@ def _setup_locked(
     if not yes and (confirm is None or not confirm(preview)):
         return "Cancelled"
     state = resolve_state(config, current_state, resolver=resolver)
-    state = replace(state, tool_version=state.tool_version or _package_version())
+    state = replace(state, tool_version=state.tool_version or __version__)
     candidate_root, candidate_compose = _traefik_candidate(config, state)
     try:
         unit_root = Path(unit_dir)
@@ -248,7 +242,6 @@ def _setup_locked(
     except Exception:
         shutil.rmtree(candidate_root, ignore_errors=True)
         raise
-    bootstrap_created = False
     transaction = private_dir(managed.state / "transactions" / f"host-setup-{random.token_hex(8)}")
     write_json(
         transaction / "transaction.json",
@@ -263,9 +256,6 @@ def _setup_locked(
     try:
         _account(managed)
         _directories(config)
-        if bootstrap_version is not None:
-            _bootstrap_version(running_version, bootstrap_version, config)
-            bootstrap_created = True
         if not existing:
             write_text(managed.source, dump(config), mode=0o640)
         if not (managed.secrets / "restic-password").exists():
@@ -309,11 +299,6 @@ def _setup_locked(
             old_current,
             old_stable,
         )
-        if bootstrap_created:
-            try:
-                _remove_candidate(running_version, True)
-            except Exception as cleanup_error:
-                failures.append(str(cleanup_error))
         if failures:
             write_json(
                 transaction / "transaction.json",
@@ -369,24 +354,26 @@ def update(
         if not executable.is_file():
             if candidate.exists():
                 raise HostError(f"candidate version directory is incomplete: {candidate}")
-            candidate.mkdir(mode=0o755, exist_ok=True)
-            created = True
             try:
-                run(
-                    ["uv", "tool", "install", f"evanovation-db=={selected}"],
+                _install_release(
+                    candidate,
+                    selected,
+                    current_units,
                     timeout=config.host.timeouts["maintenance"],
-                    env={
-                        "UV_TOOL_DIR": str(candidate / "tools"),
-                        "UV_TOOL_BIN_DIR": str(candidate / "bin"),
-                    },
                 )
+                created = True
             except BaseException as exc:
-                _remove_candidate(candidate, created)
                 _log(config, "host update", started, "failed", exc)
                 raise
 
         try:
             _validate_version_dir(candidate, versions, selected)
+            if not created:
+                _validate_executable_version(
+                    executable,
+                    selected,
+                    timeout=config.host.timeouts["command"],
+                )
             candidate_units = _candidate_units(candidate)
             _validate_unit_sources(candidate_units, current_units)
             _candidate_read_only(
@@ -672,8 +659,14 @@ def _install_units(target: Path, sources: tuple[Path, ...] | None = None) -> tup
 
 
 def _units() -> tuple[Path, ...]:
-    root = Path(str(files("evanovation_db").joinpath("units")))
-    return _unit_files(root)
+    if getattr(sys, "frozen", False):
+        root = Path(sys.executable).resolve().parent.parent / "units"
+    else:
+        root = Path(str(files("evanovation_db").joinpath("units")))
+    units = _unit_files(root)
+    if not units:
+        raise HostError(f"evdb release contains no systemd units: {root}")
+    return units
 
 
 def _candidate_status(
@@ -1022,16 +1015,162 @@ def _public_dir(path: Path) -> Path:
     return path
 
 
-def _package_version() -> str | None:
+def _release_asset(system: str | None = None, machine: str | None = None) -> str:
+    os_name = (system or platform.system()).lower()
+    architecture = (machine or platform.machine()).lower()
+    if os_name != "linux":
+        raise HostError(f"unsupported release operating system: {os_name}")
+    selected = ARCHITECTURES.get(architecture)
+    if selected is None:
+        raise HostError(f"unsupported release architecture: {architecture}")
+    return f"evdb_linux_{selected}.tar.gz"
+
+
+def _release_urls(
+    selected: str,
+    system: str | None = None,
+    machine: str | None = None,
+) -> tuple[str, str]:
+    asset = _release_asset(system, machine)
+    tag = quote(f"v{selected}", safe="")
+    archive = f"{RELEASES}/download/{tag}/{asset}"
+    return archive, archive + ".sha256"
+
+
+def _download(url: str, target: Path, timeout: int) -> None:
+    request = Request(url, headers={"User-Agent": f"evdb/{__version__}"})
+    limit = 1024 if target.name.endswith(".sha256") else MAX_RELEASE_SIZE
     try:
-        return package_version("evanovation-db")
-    except PackageNotFoundError:
-        return None
+        with urlopen(request, timeout=timeout) as response, target.open("xb") as output:
+            status_code = getattr(response, "status", 200)
+            if status_code != 200:
+                raise HostError(f"release download failed with HTTP {status_code}")
+            total = 0
+            while chunk := response.read(1024 * 1024):
+                total += len(chunk)
+                if total > limit:
+                    raise HostError("release download exceeds the size limit")
+                output.write(chunk)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
 
 
-def _setup_version(tool: Path) -> tuple[Path | None, str | None]:
+def _verify_checksum(archive: Path, checksum: Path) -> None:
+    if checksum.stat().st_size > 1024:
+        raise HostError("release checksum file is too large")
+    lines = checksum.read_text().splitlines()
+    if len(lines) != 1:
+        raise HostError("release checksum file is malformed")
+    match = re.fullmatch(r"([0-9a-fA-F]{64}) [ *]([^/\s]+)", lines[0])
+    if match is None or match.group(2) != archive.name:
+        raise HostError("release checksum file is malformed")
+    digest = hashlib.sha256()
+    with archive.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != match.group(1).lower():
+        raise HostError("release checksum does not match downloaded archive")
+
+
+def _extract_release(archive: Path, target: Path, required_units: set[str]) -> None:
+    if archive.stat().st_size > MAX_RELEASE_SIZE:
+        raise HostError("release archive is too large")
+    target.mkdir(mode=0o755)
+    (target / "bin").mkdir(mode=0o755)
+    (target / "units").mkdir(mode=0o755)
+    try:
+        with tarfile.open(archive, "r:gz") as bundle:
+            selected = {}
+            total = 0
+            for member in bundle.getmembers():
+                path = PurePosixPath(member.name)
+                if (
+                    member.name != str(path)
+                    or path.is_absolute()
+                    or ".." in path.parts
+                    or not member.isfile()
+                    or member.size <= 0
+                    or member.name in selected
+                ):
+                    raise HostError(f"release archive contains unsafe member: {member.name}")
+                is_executable = path.parts == ("bin", "evdb")
+                is_unit = (
+                    len(path.parts) == 2
+                    and path.parts[0] == "units"
+                    and path.name.startswith("evdb-")
+                    and path.suffix in {".service", ".timer"}
+                )
+                if not is_executable and not is_unit:
+                    raise HostError(f"release archive contains unexpected member: {member.name}")
+                expected_mode = 0o755 if is_executable else 0o644
+                if member.mode & 0o777 != expected_mode:
+                    raise HostError(f"release archive member has invalid mode: {member.name}")
+                total += member.size
+                if total > MAX_RELEASE_SIZE:
+                    raise HostError("release archive expands beyond the size limit")
+                selected[member.name] = member
+            available_units = {
+                PurePosixPath(name).name for name in selected if name.startswith("units/")
+            }
+            missing = sorted(required_units - available_units)
+            if "bin/evdb" not in selected or missing:
+                detail = "" if not missing else ": " + ", ".join(missing)
+                raise HostError("release archive is missing canonical files" + detail)
+            for name, member in selected.items():
+                source = bundle.extractfile(member)
+                if source is None:
+                    raise HostError(f"release archive member cannot be read: {name}")
+                destination = target.joinpath(*PurePosixPath(name).parts)
+                with source, destination.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+                destination.chmod(0o755 if name == "bin/evdb" else 0o644)
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
+def _install_release(
+    target: Path,
+    selected: str,
+    current_units: tuple[Path, ...],
+    *,
+    timeout: int,
+) -> None:
+    if target.exists() or target.is_symlink():
+        raise HostError(f"candidate version directory already exists: {target}")
+    asset = _release_asset()
+    archive_url, checksum_url = _release_urls(selected)
+    staging = private_dir(target.parent / f".install-{random.token_hex(8)}")
+    archive = staging / asset
+    checksum = staging / f"{asset}.sha256"
+    release = staging / "release"
+    try:
+        _download(archive_url, archive, timeout)
+        _download(checksum_url, checksum, timeout)
+        _verify_checksum(archive, checksum)
+        _extract_release(archive, release, {path.name for path in current_units})
+        executable = release / "bin/evdb"
+        _validate_executable_version(executable, selected, timeout=min(timeout, 60))
+        _candidate_units(release)
+        release.replace(target)
+    except BaseException as exc:
+        if isinstance(exc, HostError) or not isinstance(exc, Exception):
+            raise
+        raise HostError(f"release installation failed: {exc}") from exc
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _validate_executable_version(executable: Path, selected: str, *, timeout: int) -> None:
+    result = run([str(executable), "--version"], timeout=timeout, check=False)
+    if result.code != 0 or result.out.strip() != f"evdb {selected}":
+        raise HostError("release executable version does not match the selected version")
+
+
+def _setup_version(tool: Path) -> Path | None:
     if tool != Path("/opt/evdb"):
-        return None, None
+        return None
     versions = tool / "versions"
     current_path = tool / "current"
     current = _link_target(current_path)
@@ -1044,36 +1183,11 @@ def _setup_version(tool: Path) -> tuple[Path | None, str | None]:
         _validate_tool_target(current, versions)
         if running is not None and running != current:
             raise HostError("host setup is not running from the active evdb tool version")
-        return current, None
+        return current
     if running is not None:
         _validate_tool_target(running, versions)
-        return running, None
-    selected = _package_version()
-    if selected is None or not VERSION.fullmatch(selected):
-        raise HostError("installed evdb package does not have an exact semantic version")
-    target = versions / selected
-    if target.exists():
-        _validate_version_dir(target, versions, selected)
-        return target, None
-    return target, selected
-
-
-def _bootstrap_version(target: Path, selected: str, config: Config) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-    target.mkdir(mode=0o755)
-    try:
-        run(
-            ["uv", "tool", "install", f"evanovation-db=={selected}"],
-            timeout=config.host.timeouts["maintenance"],
-            env={
-                "UV_TOOL_DIR": str(target / "tools"),
-                "UV_TOOL_BIN_DIR": str(target / "bin"),
-            },
-        )
-        _validate_version_dir(target, target.parent, selected)
-    except Exception:
-        _remove_candidate(target, True)
-        raise
+        return running
+    raise HostError("install a standalone evdb release before running host setup")
 
 
 def _version_root(command: Path, versions: Path) -> Path | None:
@@ -1103,12 +1217,13 @@ def _validate_version_dir(target: Path, versions: Path, selected: str) -> None:
     if target.name != selected or target.parent.resolve() != versions.resolve():
         raise HostError(f"version directory does not match {selected}: {target}")
     executable = target / "bin/evdb"
-    if not executable.is_file() or not os.access(executable, os.X_OK):
+    if executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
         raise HostError(f"tool version has no executable evdb command: {target}")
     try:
         executable.resolve().relative_to(target.resolve())
     except ValueError as exc:
         raise HostError(f"tool executable points outside its version directory: {target}") from exc
+    _candidate_units(target)
 
 
 def _required_tool_link(path: Path, versions: Path) -> Path:
@@ -1137,18 +1252,21 @@ def _unit_files(root: Path) -> tuple[Path, ...]:
 
 
 def _candidate_units(candidate: Path) -> tuple[Path, ...]:
-    roots = {
-        path.resolve()
-        for pattern in (
-            "tools/*/lib/python*/site-packages/evanovation_db/units",
-            "lib/python*/site-packages/evanovation_db/units",
-        )
-        for path in candidate.glob(pattern)
-        if path.is_dir()
-    }
-    if len(roots) != 1:
-        raise HostError("candidate package does not contain one canonical unit directory")
-    return _unit_files(roots.pop())
+    root = candidate / "units"
+    if root.is_symlink() or not root.is_dir():
+        raise HostError("candidate release does not contain one canonical unit directory")
+    invalid = [
+        path
+        for path in root.iterdir()
+        if path.is_symlink()
+        or not path.is_file()
+        or not path.name.startswith("evdb-")
+        or path.suffix not in {".service", ".timer"}
+    ]
+    units = _unit_files(root)
+    if invalid or not units or len(units) != len(tuple(root.iterdir())):
+        raise HostError("candidate release contains invalid systemd assets")
+    return units
 
 
 def _validate_unit_sources(candidate: tuple[Path, ...], current: tuple[Path, ...]) -> None:
@@ -1156,13 +1274,13 @@ def _validate_unit_sources(candidate: tuple[Path, ...], current: tuple[Path, ...
     available = {path.name for path in candidate}
     missing = sorted(required - available)
     if missing:
-        raise HostError("candidate package is missing canonical units: " + ", ".join(missing))
+        raise HostError("candidate release is missing canonical units: " + ", ".join(missing))
     for path in candidate:
         if path.is_symlink() or not path.is_file() or not path.read_text().strip():
-            raise HostError(f"candidate package contains an invalid unit: {path.name}")
+            raise HostError(f"candidate release contains an invalid unit: {path.name}")
     result = run(["systemd-analyze", "verify", *(str(path) for path in candidate)], check=False)
     if result.code != 0:
-        raise HostError("candidate package contains incompatible systemd units")
+        raise HostError("candidate release contains incompatible systemd units")
 
 
 def _unit_changes(current: tuple[Path, ...], candidate: tuple[Path, ...]) -> tuple[str, ...]:

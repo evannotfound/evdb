@@ -18,8 +18,8 @@ jobs:
           python-version: "3.10"
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run ruff check src tests
-      - run: uv run ruff format --check src tests
+      - run: uv run ruff check src tests tools
+      - run: uv run ruff format --check src tests tools
       - run: uv run pytest tests/unit tests/config
       - name: Run local Restic integration tests when available
         run: |

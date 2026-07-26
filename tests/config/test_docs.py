@@ -45,6 +45,7 @@ def test_docs_remove_controller_and_release_commands():
 
 
 def test_docs_record_host_local_safety_contracts():
+    normalized = " ".join(TEXT.lower().split())
     for phrase in (
         "/etc/evdb/host.yml",
         "project/role",
@@ -57,23 +58,43 @@ def test_docs_record_host_local_safety_contracts():
         "automatic recovery",
         "external HTTP proxy",
         "one previous version",
-        "preserve timer state",
-        "uv build",
-        "immutable artifacts",
+        "preserves timer state",
+        "standalone release",
+        "SHA-256",
+        "artifact attestations",
         "retention project/role --dry-run",
         "separate production migration",
     ):
-        assert phrase.lower() in TEXT.lower()
+        assert " ".join(phrase.lower().split()) in normalized
 
 
-def test_docs_show_versioned_uv_bootstrap_and_no_fixture_command_override():
+def test_docs_show_public_binary_install_and_no_fixture_command_override():
     for phrase in (
-        'UV_TOOL_DIR="/opt/evdb/versions/${VERSION}/tools"',
-        'UV_TOOL_BIN_DIR="/opt/evdb/versions/${VERSION}/bin"',
-        'tool install "evanovation-db==${VERSION}"',
-        'ln -sfn "versions/${VERSION}" /opt/evdb/current',
-        "ln -sfn /opt/evdb/current/bin/evdb /usr/local/bin/evdb",
-        "/usr/local/bin/evdb host setup",
+        "releases/latest/download/install.sh",
+        "releases/download/v1.2.3/install.sh",
+        "sudo evdb host setup",
+        "sudo evdb host update 1.3.0",
+        "evdb --version",
+        "evdb_linux_arm64.tar.gz",
+        "evdb_linux_amd64.tar.gz",
     ):
         assert phrase in TEXT
+    assert "uv tool install" not in README + DOCS
+    assert "Python package registry" not in README + DOCS
     assert "--config" not in README + DOCS
+
+
+def test_readme_is_a_concise_public_entry_point():
+    for heading in (
+        "## Features",
+        "## Install",
+        "## Use",
+        "## Documentation",
+        "## Development",
+        "## License",
+    ):
+        assert heading in README
+    assert len(README.splitlines()) < 120
+    assert "projects:" not in README
+    assert "montreal-01" not in README
+    assert "MIT" in README

@@ -4,14 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "evanovation-db"
-version = "0.1.0"
-description = "Host-local database management for Evanovation"
+dynamic = ["version"]
+description = "Host-local database management for self-hosters"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6.0"]
 
 [dependency-groups]
 dev = [
+  "pyinstaller>=6.14",
   "pytest>=8.3",
   "ruff>=0.12",
 ]
@@ -24,6 +26,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 evanovation_db = ["units/*.service", "units/*.timer"]
+
+[tool.setuptools.dynamic]
+version = {attr = "evanovation_db.__version__"}
 
 [tool.pytest.ini_options]
 addopts = "-ra --import-mode=importlib"
