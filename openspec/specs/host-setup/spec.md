@@ -7,11 +7,15 @@ Define exact-version evdb installation, idempotent host setup, and recoverable h
 ## Requirements
 
 ### Requirement: Published exact-version package
-evdb SHALL be distributed as a versioned Python package installable through `uv`. Initial installation and host updates SHALL select an exact semantic version and SHALL NOT resolve an unbounded `latest` version.
+evdb SHALL be distributed as a checksummed, architecture-specific standalone release archive. Initial
+installation SHALL select and verify the exact version embedded in the downloaded archive, and host
+updates SHALL select an exact semantic version rather than an unbounded latest release. Each archive
+SHALL expose one `evdb` executable with canonical setup and systemd assets.
 
 #### Scenario: Operator installs the first host version
-- **WHEN** the operator installs `evanovation-db==1.0.0`
-- **THEN** the resulting package exposes one `evdb` executable with canonical setup and systemd assets
+- **WHEN** the public installer downloads and verifies release `1.0.0` for the host architecture
+- **THEN** the resulting version directory exposes one standalone `evdb` executable with canonical
+  setup and systemd assets
 
 ### Requirement: Idempotent host setup
 `sudo evdb host setup` SHALL check required prerequisites, create the service account and group, establish canonical directories and ownership, initialize host configuration through guided or explicit inputs, create the dedicated Docker network, generate dedicated Traefik files, install canonical systemd units, and finish with a host check. Rerunning setup SHALL converge without changing database data, credentials, timer enablement, or healthy service definitions unnecessarily.
@@ -21,11 +25,19 @@ evdb SHALL be distributed as a versioned Python package installable through `uv`
 - **THEN** the second run reports the host ready without restarting databases or replacing secrets
 
 ### Requirement: Prerequisite boundary
-Setup SHALL validate compatible Python, Docker with Compose, Restic, rclone, systemd, writable canonical filesystems, DNS routing inputs, and availability of native ports 5432 and 6379. It SHALL provide installation guidance for missing software but SHALL NOT install or upgrade unrelated host prerequisites.
+Setup SHALL validate Docker with Compose, Restic, rclone, systemd, writable canonical filesystems, DNS
+routing inputs, and availability of native ports 5432 and 6379. It SHALL NOT require a host Python
+runtime, Python package manager, or `uv`. It SHALL provide installation guidance for missing database
+tooling but SHALL NOT install or upgrade unrelated host prerequisites.
 
 #### Scenario: Port 5432 belongs to another proxy
 - **WHEN** setup detects an existing process bound to the dedicated Postgres listener
-- **THEN** setup fails before starting Traefik and directs the operator to perform an explicit routing migration
+- **THEN** setup fails before starting Traefik and directs the operator to perform an explicit routing
+  migration
+
+#### Scenario: Python is absent
+- **WHEN** a standalone evdb release runs setup on a host without Python or `uv`
+- **THEN** setup does not report either development tool as a missing prerequisite
 
 ### Requirement: Least file privilege
 Setup SHALL create a non-login service account, private state and secret directories, root-controlled source configuration, and systemd jobs that run under the service account. Docker access SHALL be documented as root-equivalent.
@@ -42,11 +54,20 @@ Managed tool versions SHALL live under `/opt/evdb/versions/<version>`, `/opt/evd
 - **THEN** database files remain at their stable paths while new command invocations use 1.1.0
 
 ### Requirement: Exact-version host update
-`evdb host update VERSION` SHALL acquire the host lock, install the exact published candidate through `uv`, run candidate read-only compatibility checks against current config, state, Compose, backup records, and units, preview compatible migrations, and require confirmation before switching.
+`evdb host update VERSION` SHALL acquire the host lock, download the exact architecture-specific
+GitHub Release archive and checksum, verify its digest, members, executable version, and systemd
+assets, and stage it as a candidate. It SHALL then run the candidate read-only against current config,
+state, Compose, backup records, and units, preview compatible migrations, and require confirmation
+before switching. It SHALL NOT resolve or install an unbounded latest release.
 
 #### Scenario: Candidate cannot read current state
-- **WHEN** the selected package does not support the installed state schema
+- **WHEN** the selected standalone release does not support the installed state schema
 - **THEN** update refuses before changing the active tool, config, units, or services
+
+#### Scenario: Candidate archive is unsafe
+- **WHEN** the selected archive has a mismatched checksum, traversal path, link, duplicate, unexpected
+  member, incomplete units, or executable version other than the selected version
+- **THEN** update removes its staging files and leaves the active and previous versions unchanged
 
 ### Requirement: Atomic tool activation and recovery
 Host update SHALL snapshot affected config and unit files, atomically switch the active tool, refresh canonical units without changing timer enablement, and run `evdb host check`. If activation or checking fails, it SHALL restore the previous tool, files, units, and loaded systemd definitions.
