@@ -48,7 +48,7 @@ VERSION = re.compile(
     re.ASCII,
 )
 TOOLS = ("docker", "restic", "rclone", "systemctl", "systemd-escape")
-RELEASES = "https://github.com/evannotfound/evanovation-db/releases"
+RELEASES = "https://github.com/evannotfound/evdb/releases"
 ARCHITECTURES = {
     "aarch64": "arm64",
     "arm64": "arm64",

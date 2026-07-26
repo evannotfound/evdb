@@ -20,14 +20,14 @@ membership is root-equivalent and must be granted deliberately.
 Install the latest public release:
 
 ```sh
-curl -fsSL https://github.com/evannotfound/evanovation-db/releases/latest/download/install.sh | sudo sh
+curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install.sh | sudo sh
 sudo evdb host setup
 ```
 
 Pin the first installation to an exact version when reproducibility matters:
 
 ```sh
-curl -fsSL https://github.com/evannotfound/evanovation-db/releases/download/v1.2.3/install.sh \
+curl -fsSL https://github.com/evannotfound/evdb/releases/download/v1.2.3/install.sh \
   | sudo sh -s -- 1.2.3
 sudo evdb host setup
 ```

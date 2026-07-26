@@ -46,7 +46,7 @@ def test_release_urls_pin_exact_tag_and_encode_build_version():
     archive, checksum = host._release_urls("1.2.3+build.1", "Linux", "aarch64")
 
     assert archive == (
-        "https://github.com/evannotfound/evanovation-db/releases/download/"
+        "https://github.com/evannotfound/evdb/releases/download/"
         "v1.2.3%2Bbuild.1/evdb_linux_arm64.tar.gz"
     )
     assert checksum == archive + ".sha256"

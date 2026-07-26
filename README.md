@@ -31,7 +31,7 @@ evdb supports Ubuntu 22.04 or newer on ARM64 and x86_64. The host also needs Doc
 Restic, rclone, systemd, DNS credentials, and free native ports `5432` and `6379`.
 
 ```sh
-curl -fsSL https://github.com/evannotfound/evanovation-db/releases/latest/download/install.sh | sudo sh
+curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install.sh | sudo sh
 sudo evdb host setup
 ```
 

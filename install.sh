@@ -3,7 +3,7 @@
 set -eu
 set -f
 
-RELEASES=${EVDB_RELEASES:-https://github.com/evannotfound/evanovation-db/releases}
+RELEASES=${EVDB_RELEASES:-https://github.com/evannotfound/evdb/releases}
 DESTDIR=${DESTDIR:-}
 ROOT="${DESTDIR}/opt/evdb"
 VERSIONS="${ROOT}/versions"
