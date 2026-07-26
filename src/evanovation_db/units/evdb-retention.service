@@ -1,0 +1,17 @@
+[Unit]
+Description=Apply evdb backup retention
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=evdb
+Group=evdb
+ExecStart=/usr/local/bin/evdb backup retention --all --yes
+TimeoutStartSec=6h
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/evdb

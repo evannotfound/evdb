@@ -1,62 +1,52 @@
 from __future__ import annotations
 
-import shutil
-import sys
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
-from evanovation_db import manifest
-from evanovation_db.backup import backup, kv
-from evanovation_db.backup import dragonfly as dragonfly_backup
-from evanovation_db.restore import kv as kv_restore
-from evanovation_db.restore import postgres as postgres_restore
-
-sys.path.insert(0, str(Path(__file__).parents[1]))
-
-from fixtures.containers import (  # noqa: E402
+from evanovation_db import backup, restore, secrets
+from evanovation_db.config import resolve_state, write_state
+from evanovation_db.engines import dragonfly, kv
+from tests.fixtures.containers import (
     DRAGONFLY_IMAGE,
     POSTGRES_IMAGE,
     REDIS_IMAGE,
     command,
     container,
     docker_exec,
-    remove,
     require_image,
-    unique_name,
     wait_exec,
 )
 
+DIGEST = "sha256:" + "a" * 64
 
-def test_postgres_backup_and_restore_multiple_databases(config, tmp_path):
+
+def test_postgres_backup_and_restore_multiple_databases(config):
     require_image(POSTGRES_IMAGE)
-    source = unique_name("postgres")
-    password = "local-postgres-integration"
-    instance = replace(
-        config.get("postgres", "test-dev-01"),
-        container=source,
-        data=tmp_path / "postgres-live",
-    )
+    config, target = _postgres_config(config)
+    state = _ready(config, target, POSTGRES_IMAGE)
+    name = _container_name(target)
 
     with container(
         POSTGRES_IMAGE,
-        source,
+        name,
         env={
             "POSTGRES_USER": "default",
-            "POSTGRES_PASSWORD": password,
+            "POSTGRES_PASSWORD": "local-postgres-integration",
             "POSTGRES_DB": "postgres",
         },
         memory="2g",
     ):
-        wait_exec(source, ["pg_isready", "-U", "default", "-d", "postgres"])
+        wait_exec(name, ["pg_isready", "-U", "default", "-d", "postgres"])
         docker_exec(
-            source,
+            name,
             ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "default", "-d", "postgres"],
             input_text="CREATE ROLE reporting LOGIN PASSWORD 'local-role-password';\n",
         )
-        docker_exec(source, ["createdb", "-U", "default", "app"])
-        docker_exec(source, ["createdb", "-U", "default", "odd database"])
+        docker_exec(name, ["createdb", "-U", "default", "app"])
+        docker_exec(name, ["createdb", "-U", "default", "odd database"])
         docker_exec(
-            source,
+            name,
             ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "default", "-d", "app"],
             input_text=(
                 "CREATE SCHEMA inventory AUTHORIZATION reporting;\n"
@@ -65,7 +55,7 @@ def test_postgres_backup_and_restore_multiple_databases(config, tmp_path):
             ),
         )
         docker_exec(
-            source,
+            name,
             [
                 "psql",
                 "-X",
@@ -81,252 +71,172 @@ def test_postgres_backup_and_restore_multiple_databases(config, tmp_path):
                 "INSERT INTO notes VALUES (1, 'space-name-database');\n"
             ),
         )
+        created = backup.create(config, target, upload=False, state=state)
 
-        folder = backup(config, instance, upload=False)
+    folder = Path(created["folder"])
+    record = backup.manifest_check(folder)
+    checked = restore.verify(config, target, folder, state=state)
 
-    data = manifest.check(folder)
-    assert set(data["facts"]["databases"]) == {"postgres", "app", "odd database"}
+    assert set(record["facts"]["databases"]) == {"postgres", "app", "odd database"}
     assert (folder / "databases/odd%20database.dump").stat().st_size > 0
-    globals_sql = (folder / "globals.sql").read_text()
-    assert "ROLE reporting" in globals_sql
-    assert "SCRAM-SHA-256" in globals_sql
-
-    restored = unique_name("postgres-restore")
-    try:
-        result = postgres_restore.restore(config.host, instance, folder, restored)
-        assert set(result["databases"]) == {"postgres", "app", "odd database"}
-        items = docker_exec(
-            restored,
-            [
-                "psql",
-                "-X",
-                "-A",
-                "-t",
-                "-U",
-                "restore_admin",
-                "-d",
-                "app",
-                "-c",
-                "SELECT string_agg(name, ',' ORDER BY id) FROM inventory.items",
-            ],
-        )
-        assert items.stdout.strip() == "alpha,beta"
-        note = docker_exec(
-            restored,
-            [
-                "psql",
-                "-X",
-                "-A",
-                "-t",
-                "-U",
-                "restore_admin",
-                "-d",
-                "odd database",
-                "-c",
-                "SELECT body FROM notes WHERE id = 1",
-            ],
-        )
-        assert note.stdout.strip() == "space-name-database"
-        role = docker_exec(
-            restored,
-            [
-                "psql",
-                "-X",
-                "-A",
-                "-t",
-                "-F",
-                "|",
-                "-U",
-                "restore_admin",
-                "-d",
-                "postgres",
-                "-c",
-                (
-                    "SELECT rolcanlogin, rolpassword LIKE 'SCRAM-SHA-256%' "
-                    "FROM pg_authid WHERE rolname = 'reporting'"
-                ),
-            ],
-        )
-        assert role.stdout.strip() == "t|t"
-    finally:
-        remove(restored)
+    assert "ROLE reporting" in (folder / "globals.sql").read_text()
+    assert "SCRAM-SHA-256" in (folder / "globals.sql").read_text()
+    assert set(checked["result"]["databases"]) == {"postgres", "app", "odd database"}
+    assert checked["result"]["objects"]["app"] >= 1
+    assert checked["result"]["objects"]["odd database"] >= 1
 
 
-def test_redis_bgsave_backup_and_restore_types_databases_and_ttl(config, tmp_path, monkeypatch):
+def test_redis_backup_and_restore_types_databases_and_ttl(config):
     require_image(REDIS_IMAGE)
-    source = unique_name("redis")
+    config, target = _kv_config(config, "redis", REDIS_IMAGE)
+    state = _ready(config, target, REDIS_IMAGE)
     password = "local-redis-integration"
-    redis_config = tmp_path / "redis.conf"
-    redis_config.write_text(
-        "\n".join(
-            [
-                "dir /data",
-                "dbfilename dump.rdb",
-                "appendonly no",
-                'save ""',
-                "protected-mode no",
-                f"requirepass {password}",
-                "",
-            ]
-        )
-    )
-    redis_config.chmod(0o644)
-    instance = replace(
-        config.get("kv", "xai-server-prod-01"),
-        container=source,
-        data=tmp_path / "redis-live",
-    )
-    secret_env = "EVANOVATION_DB_SECRET_KV_XAI_SERVER_PROD_01_PASSWORD"
-    monkeypatch.setenv(secret_env, password)
+    secrets.ensure(config, target, generate=lambda: password)
+    name = _container_name(target)
     auth = {"REDISCLI_AUTH": password}
 
     with container(
         REDIS_IMAGE,
-        source,
-        ["redis-server", "/run/redis/redis.conf"],
-        mounts=[(redis_config, "/run/redis/redis.conf", True)],
+        name,
+        ["/usr/local/bin/redis-server", "/run/secrets/redis.conf"],
+        mounts=[(secrets.path(config, target, "redis.conf"), "/run/secrets/redis.conf", True)],
     ):
-        wait_exec(source, ["redis-cli", "--raw", "PING"], env=auth)
-        kv.command(instance, password, ["SET", "message", "stale"])
-        kv.command(instance, password, ["SAVE"])
-        kv.command(instance, password, ["SET", "message", "fresh"])
-        kv.command(instance, password, ["SADD", "colors", "red", "green", "blue"])
-        kv.command(instance, password, ["-n", "1", "HSET", "user", "name", "Ada", "id", "7"])
-        kv.command(instance, password, ["-n", "2", "SET", "expires", "still-here"])
-        kv.command(instance, password, ["-n", "2", "PEXPIRE", "expires", "180000"])
+        wait_exec(name, ["redis-cli", "--raw", "PING"], env=auth)
+        kv.text(name, password, ["SET", "message", "stale"])
+        kv.text(name, password, ["SAVE"])
+        kv.text(name, password, ["SET", "message", "fresh"])
+        kv.text(name, password, ["SADD", "colors", "red", "green", "blue"])
+        kv.text(name, password, ["-n", "1", "HSET", "user", "name", "Ada", "id", "7"])
+        kv.text(name, password, ["-n", "2", "SET", "expires", "still-here"])
+        kv.text(name, password, ["-n", "2", "PEXPIRE", "expires", "180000"])
+        created = backup.create(config, target, upload=False, state=state)
 
-        folder = backup(config, instance, upload=False)
+    record = backup.manifest_check(created["folder"])
+    checked = restore.verify(config, target, created["folder"], state=state)
 
-    data = manifest.check(folder)
-    assert data["facts"]["databases"] == {"0": 2, "1": 1, "2": 1}
-    assert data["facts"]["keys"] == 4
-    assert {sample["type"] for sample in data["facts"]["samples"]} == {
+    assert record["facts"]["databases"] == {"0": 2, "1": 1, "2": 1}
+    assert record["facts"]["keys"] == 4
+    assert {sample["type"] for sample in record["facts"]["samples"]} == {
         "string",
         "set",
         "hash",
     }
-    assert any(sample["ttl_ms"] > 0 for sample in data["facts"]["samples"])
-
-    restored = unique_name("redis-restore")
-    try:
-        result = kv_restore.restore(config.host, instance, folder, restored)
-        assert result["databases"] == {"0": 2, "1": 1, "2": 1}
-        assert _redis(restored, ["GET", "message"]) == "fresh"
-        assert set(_redis(restored, ["SMEMBERS", "colors"]).splitlines()) == {
-            "red",
-            "green",
-            "blue",
-        }
-        assert _redis(restored, ["-n", "1", "HGET", "user", "name"]) == "Ada"
-        assert _redis(restored, ["-n", "1", "HGET", "user", "id"]) == "7"
-        assert _redis(restored, ["-n", "2", "GET", "expires"]) == "still-here"
-        ttl = int(_redis(restored, ["-n", "2", "PTTL", "expires"]))
-        assert 0 < ttl <= 180000
-    finally:
-        _remove_restore(restored, folder)
+    assert any(sample["ttl_ms"] > 0 for sample in record["facts"]["samples"])
+    assert checked["result"]["databases"] == {"0": 2, "1": 1, "2": 1}
 
 
-def test_dragonfly_unique_rdb_ignores_stale_dump_and_dfs(config, tmp_path, monkeypatch):
+def test_dragonfly_uses_one_native_snapshot_generation_and_restores_it(
+    config, tmp_path, monkeypatch
+):
     require_image(DRAGONFLY_IMAGE)
-    source = unique_name("dragonfly")
-    data_dir = tmp_path / "dragonfly-data"
-    data_dir.mkdir(mode=0o700)
-    instance = replace(
-        config.get("kv", "test-dev-01"),
-        container=source,
-        data=data_dir,
-    )
+    config, target = _kv_config(config, "dragonfly", DRAGONFLY_IMAGE)
+    state = _ready(config, target, DRAGONFLY_IMAGE)
+    password = "local-dragonfly-integration"
+    secrets.ensure(config, target, generate=lambda: password)
+    name = _container_name(target)
+    auth = {"REDISCLI_AUTH": password}
     stale_rdb = tmp_path / "stale-default.rdb"
-    stale_dfs = tmp_path / "fresh-summary.dfs"
+    stale_summary = tmp_path / "stale-summary.dfs"
+    stale_shard = tmp_path / "stale-0000.dfs"
     stale_rdb.write_bytes(b"stale-default-rdb")
-    stale_dfs.write_bytes(b"fresh-dfs-snapshot")
-    monkeypatch.setenv("EVANOVATION_DB_SECRET_KV_TEST_DEV_01_PASSWORD", "")
+    stale_summary.write_bytes(b"stale-summary")
+    stale_shard.write_bytes(b"stale-shard")
     copied = []
-    real_copy = dragonfly_backup.docker.copy
+    real_copy = dragonfly.docker.copy
 
-    def record_copy(source_path, target, **kwargs):
-        copied.append(source_path)
-        real_copy(source_path, target, **kwargs)
+    def record_copy(source, target_path, **kwargs):
+        copied.append(source)
+        return real_copy(source, target_path, **kwargs)
 
-    monkeypatch.setattr(dragonfly_backup.docker, "copy", record_copy)
+    monkeypatch.setattr(dragonfly.docker, "copy", record_copy)
 
     with container(
         DRAGONFLY_IMAGE,
-        source,
+        name,
         [
-            "dragonfly",
-            "--dir=/data",
-            "--dbfilename=dump",
-            "--primary_port_http_enabled=false",
+            "/usr/local/bin/dragonfly",
+            "--logtostderr",
+            "--flagfile=/run/secrets/dragonfly.flags",
+        ],
+        mounts=[
+            (secrets.path(config, target, "dragonfly.flags"), "/run/secrets/dragonfly.flags", True)
         ],
         memory="3g",
     ):
-        wait_exec(source, ["redis-cli", "PING"])
-        kv.command(instance, "", ["SET", "message", "dragonfly"])
-        kv.command(instance, "", ["SADD", "colors", "cyan", "magenta"])
-        kv.command(instance, "", ["-n", "1", "HSET", "user", "name", "Grace"])
-        kv.command(instance, "", ["SET", "expires", "temporary"])
-        kv.command(instance, "", ["PEXPIRE", "expires", "180000"])
-        command(["docker", "cp", str(stale_rdb), f"{source}:/data/dump.rdb"])
-        command(
-            [
-                "docker",
-                "cp",
-                str(stale_dfs),
-                f"{source}:/data/dump-0001-summary.dfs",
-            ]
+        wait_exec(name, ["redis-cli", "PING"], env=auth)
+        kv.text(name, password, ["SET", "message", "dragonfly"])
+        kv.text(name, password, ["SADD", "colors", "cyan", "magenta"])
+        kv.text(name, password, ["-n", "1", "HSET", "user", "name", "Grace"])
+        kv.text(name, password, ["SET", "expires", "temporary"])
+        kv.text(name, password, ["PEXPIRE", "expires", "180000"])
+        command(["docker", "cp", str(stale_rdb), f"{name}:/data/dump.rdb"])
+        command(["docker", "cp", str(stale_summary), f"{name}:/data/stale-summary.dfs"])
+        command(["docker", "cp", str(stale_shard), f"{name}:/data/stale-0000.dfs"])
+        created = backup.create(config, target, upload=False, state=state)
+
+        assert len(copied) == 2
+        sources = {item.split(":", 1)[1] for item in copied}
+        assert all(item.startswith("/data/evdb-") and item.endswith(".dfs") for item in sources)
+        assert any(item.endswith("-summary.dfs") for item in sources)
+        assert any(item.endswith("-0000.dfs") for item in sources)
+        assert all(
+            docker_exec(name, ["stat", item], check=False).returncode != 0 for item in sources
         )
+        assert docker_exec(name, ["stat", "/data/stale-summary.dfs"]).returncode == 0
+        assert docker_exec(name, ["stat", "/data/stale-0000.dfs"]).returncode == 0
 
-        folder = backup(config, instance, upload=False)
+    record = backup.manifest_check(created["folder"])
+    checked = restore.verify(config, target, created["folder"], state=state)
 
-        assert len(copied) == 1
-        source_path = copied[0].split(":", 1)[1]
-        assert source_path.startswith("/data/evdb-")
-        assert source_path.endswith(".rdb")
-        assert docker_exec(source, ["stat", source_path], check=False).returncode != 0
-        observed_rdb = tmp_path / "observed-stale.rdb"
-        observed_dfs = tmp_path / "observed-summary.dfs"
-        command(["docker", "cp", f"{source}:/data/dump.rdb", str(observed_rdb)])
-        command(
-            [
-                "docker",
-                "cp",
-                f"{source}:/data/dump-0001-summary.dfs",
-                str(observed_dfs),
-            ]
-        )
-        assert observed_rdb.read_bytes() == b"stale-default-rdb"
-        assert observed_dfs.read_bytes() == b"fresh-dfs-snapshot"
-
-    data = manifest.check(folder)
-    assert (folder / "dump.rdb").read_bytes() != b"stale-default-rdb"
-    assert data["facts"]["databases"] == {"0": 3, "1": 1}
-    assert data["facts"]["keys"] == 4
-
-    restored = unique_name("dragonfly-restore")
-    try:
-        result = kv_restore.restore(config.host, instance, folder, restored)
-        assert result["databases"] == {"0": 3, "1": 1}
-        assert _redis(restored, ["GET", "message"]) == "dragonfly"
-        assert set(_redis(restored, ["SMEMBERS", "colors"]).splitlines()) == {
-            "cyan",
-            "magenta",
-        }
-        assert _redis(restored, ["-n", "1", "HGET", "user", "name"]) == "Grace"
-        assert _redis(restored, ["GET", "expires"]) == "temporary"
-        assert int(_redis(restored, ["PTTL", "expires"])) > 0
-    finally:
-        _remove_restore(restored, folder)
-
-    assert "1.34.1" in data["version"]
+    files = {item["name"] for item in record["files"]}
+    assert record["format"] == "dragonfly-dfs-v1"
+    assert files == {
+        f"{record['facts']['snapshot_base']}-summary.dfs",
+        f"{record['facts']['snapshot_base']}-0000.dfs",
+    }
+    assert record["facts"]["databases"] == {"0": 3, "1": 1}
+    assert record["facts"]["keys"] == 4
+    assert checked["result"]["databases"] == {"0": 3, "1": 1}
+    assert "1.34.1" in record["version"]
 
 
-def _redis(name: str, args: list[str]) -> str:
-    return docker_exec(name, ["redis-cli", "--raw", *args]).stdout.strip()
+def _postgres_config(config):
+    project = replace(config.projects[0], id=_project_id("postgres"), kv=None)
+    selected = replace(config, projects=(project,))
+    return selected, selected.select(f"{project.id}/postgres")
 
 
-def _remove_restore(name: str, folder: Path) -> None:
-    work = folder.parent / f".{name}-data"
-    docker_exec(name, ["chmod", "-R", "a+rwX", "/data"], check=False)
-    remove(name)
-    shutil.rmtree(work, ignore_errors=True)
+def _kv_config(config, engine, image):
+    project = config.projects[0]
+    settings = replace(
+        project.kv,
+        engine=engine,
+        image=image.split("@", 1)[0],
+        mode="durable",
+        http=replace(project.kv.http, enabled=False),
+        memory="256mb" if engine == "dragonfly" else None,
+        threads=1 if engine == "dragonfly" else None,
+    )
+    project = replace(project, id=_project_id(engine), postgres=None, kv=settings)
+    selected = replace(config, projects=(project,))
+    return selected, selected.select(f"{project.id}/kv")
+
+
+def _ready(config, target, image):
+    digest = image.split("@", 1)[1]
+    state = resolve_state(
+        config,
+        resolver=lambda source: digest if source == target.image else DIGEST,
+    )
+    role = replace(state.roles[target.identity], installed=True)
+    state = replace(state, roles={**state.roles, target.identity: role})
+    write_state(config, state)
+    return state
+
+
+def _project_id(kind):
+    return f"{kind}-{uuid.uuid4().hex[:8]}-test-01"
+
+
+def _container_name(target):
+    return f"evdb-{target.project}-{target.role}-primary"

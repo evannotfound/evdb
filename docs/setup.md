@@ -1,81 +1,87 @@
-# Controller setup
+# Host setup and updates
 
-## Requirements
+## Prerequisites
 
-The operator controller needs:
+The database host needs a compatible Python, Docker with Compose, Restic, rclone, systemd, writable
+canonical filesystems, DNS-01 routing inputs, and free native ports 5432 and 6379. Setup reports
+missing prerequisites but does not install or upgrade unrelated host software. Docker group access
+is root-equivalent and must be granted deliberately.
 
-- A long-lived repository checkout, Python 3.10 or newer, and `uv`.
-- OpenSSH with batch authentication to the `host.ssh` destination.
-- Ansible Core 2.17 through 2.20 on `PATH` for first install and protocol upgrades.
-- Docker CLI on `PATH`; plan and apply use `docker manifest inspect` to resolve changed image
-  tags for Linux/amd64. They do not start or change local containers.
-- 1Password CLI on `PATH`, authenticated through the desktop app or a service account with
-  `write_items` for the complete create/apply workflow.
-
-The managed host needs `/usr/bin/python3`, Docker with Compose, Restic, rclone, and passwordless
-non-interactive sudo for the controller's fixed remote runtime command. SSH and sudo access are
-operational prerequisites; `evdb` does not provision controller authentication.
-
-## Development environment
+Install one exact package version into a candidate version directory and run setup through the
+stable executable:
 
 ```sh
-uv sync --locked
-uv run evdb --config tests/fixtures/config/minimal validate
-uv run pytest tests/unit/test_controller.py tests/config/test_make.py
+VERSION=1.2.3
+UV="$(command -v uv)"
+sudo install -d -m 0755 \
+  "/opt/evdb/versions/${VERSION}/tools" \
+  "/opt/evdb/versions/${VERSION}/bin"
+sudo env \
+  UV_TOOL_DIR="/opt/evdb/versions/${VERSION}/tools" \
+  UV_TOOL_BIN_DIR="/opt/evdb/versions/${VERSION}/bin" \
+  "${UV}" tool install "evanovation-db==${VERSION}"
+sudo ln -sfn "versions/${VERSION}" /opt/evdb/current
+sudo ln -sfn /opt/evdb/current/bin/evdb /usr/local/bin/evdb
+sudo /usr/local/bin/evdb host setup
+/usr/local/bin/evdb host check
 ```
 
-Repository commands use `uv run evdb`. Developer-only Compose, Ansible, systemd, and full test
-checks remain available through `make check` and its component targets.
+`UV_TOOL_DIR` stores the isolated tool environment and metadata under that version. The separate
+`UV_TOOL_BIN_DIR` places its linked `evdb` executable at
+`/opt/evdb/versions/<version>/bin/evdb`. The exact `==${VERSION}` requirement prevents an
+unbounded package resolution. `/usr/local/bin/evdb` always resolves through `current`, so operators
+and units do not depend on a version-specific command path.
 
-## Installed command
-
-The controller's Ansible assets live in this checkout, so install the command in editable mode
-from a stable path:
+For explicit non-interactive setup, provide every required value and `--yes`:
 
 ```sh
-uv tool install --editable --with "PyYAML>=6.0" .
+sudo evdb host setup \
+  --host-id example-01 \
+  --domain storage.example.com \
+  --data-root /srv/databases \
+  --acme-email operations@example.com \
+  --dns-provider cloudflare \
+  --postgres-repo rclone:remote:example-01/postgres \
+  --kv-repo rclone:remote:example-01/kv \
+  --dns-env-file /root/evdb-dns.env \
+  --rclone-config /root/rclone.conf \
+  --yes
 ```
 
-Ensure `ansible-playbook` is installed separately on `PATH`, then select one host explicitly:
+Setup creates a non-login `evdb` account, canonical config, state, data and tool directories,
+private host files, the dedicated Docker network and native Traefik definition, and packaged
+systemd units. It is idempotent. Repeated setup does not replace database credentials or mutable
+rclone OAuth state, restart healthy databases, or change enabled timers.
+
+## Versioned tool layout
+
+```text
+/opt/evdb/versions/<version>/
+/opt/evdb/current -> versions/<version>
+/opt/evdb/previous -> versions/<previous-version>
+/usr/local/bin/evdb -> /opt/evdb/current/bin/evdb
+```
+
+Configuration, generated Compose, secrets, machine-owned state, backups, and data remain outside
+tool versions. Update requires an exact semantic version:
 
 ```sh
-export EVANOVATION_DB_CONFIG=/path/to/evanovation-db/config/my-host
-evdb validate
-evdb status
+sudo evdb host update 1.3.0
 ```
 
-Alternatively, pass `--config /path/to/config/my-host` before the subcommand. The value may be
-the host directory or its `host.yml`. `evdb` has no implicit production config.
+The candidate reads current config, state, Compose, backup records, and packaged units before the
+switch. It previews compatible file migrations, snapshots affected config and unit files,
+activates atomically, refreshes units, and runs `evdb host check`. Failure restores the active tool,
+files, and loaded units. Update retains one previous version and must preserve timer state.
 
-## First apply
+A package update does not regenerate database Compose, change image digests, restart databases,
+restore data, or perform an engine migration. A candidate unable to read the installed contracts is
+rejected before activation.
 
-Create `config/<host>/host.yml` as described in [configuration.md](configuration.md). A first
-apply resolves the desired lock in memory and attempts the fixed SSH runtime. If the runtime is
-absent or incompatible, the controller displays the host and asks permission to install or
-update only that internal runtime. No database project is started by this bootstrap step.
+## Development boundary
 
-After bootstrap, the controller uses the bootstrap runtime to replan and asks separately before
-applying the production plan. Confirmed apply writes `host.lock.json`, resolves deployment secrets
-locally, and sends staged runtime, release, Compose, and protected inputs through the versioned
-remote operation. It does not run Ansible again. `--yes` accepts both confirmations and must be
-used deliberately.
-
-The remote protocol uses `BatchMode=yes`, a bounded connect timeout, a fixed `sudo -n` command,
-and validated JSON on stdin/stdout. Secret values never appear in SSH arguments. Protocol
-version mismatch is one of the two explicit bootstrap conditions, along with a missing runtime.
-SSH failures, malformed responses, invalid active config, and remote operation failures do not
-trigger Ansible and fail closed.
-
-## Boundaries
-
-Normal remote operations and systemd jobs read code and generated JSON from the active
-`/opt/evanovation-db/current` release; they do not read source YAML on the host. The stable
-bootstrap code reads only the always-refreshed normalized
-`/opt/evanovation-db/host-runtime/runtime`, never preserved legacy JSON under `/etc`. Bootstrap
-atomically refreshes that runtime and removes stale instance JSON without replacing active unit
-files. Protected files remain outside releases under `/etc/evanovation-db/secrets` and
-`/var/lib/evanovation-db/rclone`.
-
-Bootstrap and release activation preserve existing timer state. Timer enablement or disablement is
-a separate production migration. The external HTTP proxy remains outside this repository, along
-with certificates, public ports 80/443, and route changes.
+Repository checks use `tests/fixtures/config` and temporary `/etc`, `/var/lib`, `/opt`, data, and
+Restic roots. They do not run setup, package activation, systemd changes, or production commands.
+Initial production conversion and credential import are a separate production migration.
+Operator Make targets do not accept alternate configuration paths; fixture configuration is loaded
+only by tests that inject temporary canonical paths.

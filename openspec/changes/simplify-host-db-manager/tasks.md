@@ -1,70 +1,70 @@
 ## 1. Contract and Test Foundations
 
-- [ ] 1.1 Add project-first host config fixtures with Postgres-only, KV-only, and combined project roles
-- [ ] 1.2 Add invalid fixtures for duplicate roles, missing environment suffixes, engine/setting mismatches, unsafe paths, image majors, and secret-bearing source
-- [ ] 1.3 Add canonical path fixtures rooted entirely in temporary `/etc`, `/var/lib`, `/opt`, and data directories
+- [x] 1.1 Add project-first host config fixtures with Postgres-only, KV-only, and combined project roles
+- [x] 1.2 Add invalid fixtures for duplicate roles, missing environment suffixes, engine/setting mismatches, unsafe paths, image majors, and secret-bearing source
+- [x] 1.3 Add canonical path fixtures rooted entirely in temporary `/etc`, `/var/lib`, `/opt`, and data directories
 - [ ] 1.4 Add CLI parser contract tests for every grouped interactive and non-interactive command
 - [ ] 1.5 Add disposable host helpers that never target `montreal-01`, production Restic remotes, real DNS, cron, or systemd
 - [ ] 1.6 Update package metadata to expose one `evdb` command and declare required runtime dependencies and package assets
 
 ## 2. Project-First Configuration
 
-- [ ] 2.1 Replace database-list source models with host, project, Postgres-role, and KV-role models
-- [ ] 2.2 Implement `<project>/postgres` and `<project>/kv` identity parsing and ambiguity handling
-- [ ] 2.3 Enforce one Postgres and one KV role per project and the required dev/test/prod suffix
-- [ ] 2.4 Default new KV roles to Dragonfly and persist the concrete engine explicitly
-- [ ] 2.5 Move primary and sidecar image sources into each database role with immutable digest validation
-- [ ] 2.6 Preserve concise defaults for PgBouncer, durability, HTTP, pool sizing, Dragonfly memory and threads, and connection limits
-- [ ] 2.7 Implement typed role-specific override validation without accepting raw deployment fields
-- [ ] 2.8 Implement canonical `/etc/evdb`, `/var/lib/evdb`, `/opt/evdb`, and project-first data path derivation
-- [ ] 2.9 Implement private machine state for resolved digests, allocated HTTP ports, schema versions, and operation results
-- [ ] 2.10 Implement atomic host YAML updates with one `host.previous.yml` and secret-free activity records
-- [ ] 2.11 Reject controller-owned databases lists, separate engine files, checked-in locks, migration fields, and release runtime input
-- [ ] 2.12 Add round-trip and collision tests for project config, machine state, defaults, explicit images, and stable ports
+- [x] 2.1 Replace database-list source models with host, project, Postgres-role, and KV-role models
+- [x] 2.2 Implement `<project>/postgres` and `<project>/kv` identity parsing and ambiguity handling
+- [x] 2.3 Enforce one Postgres and one KV role per project and the required dev/test/prod suffix
+- [x] 2.4 Default new KV roles to Dragonfly and persist the concrete engine explicitly
+- [x] 2.5 Move primary and sidecar image sources into each database role with immutable digest validation
+- [x] 2.6 Preserve concise defaults for PgBouncer, durability, HTTP, pool sizing, Dragonfly memory and threads, and connection limits
+- [x] 2.7 Implement typed role-specific override validation without accepting raw deployment fields
+- [x] 2.8 Implement canonical `/etc/evdb`, `/var/lib/evdb`, `/opt/evdb`, and project-first data path derivation
+- [x] 2.9 Implement private machine state for resolved digests, allocated HTTP ports, schema versions, and operation results
+- [x] 2.10 Implement atomic host YAML updates with one `host.previous.yml` and secret-free activity records
+- [x] 2.11 Reject controller-owned databases lists, separate engine files, checked-in locks, migration fields, and release runtime input
+- [x] 2.12 Add round-trip and collision tests for project config, machine state, defaults, explicit images, and stable ports
 
 ## 3. Direct Module Organization
 
 - [ ] 3.1 Establish direct `cli`, `interactive`, `database`, `compose`, `backup`, `restore`, `status`, `secrets`, and `images` module APIs
-- [ ] 3.2 Create concrete `engines/postgres.py`, `engines/redis.py`, `engines/dragonfly.py`, and shared Redis-protocol `engines/kv.py`
+- [x] 3.2 Create concrete `engines/postgres.py`, `engines/redis.py`, `engines/dragonfly.py`, and shared Redis-protocol `engines/kv.py`
 - [ ] 3.3 Move Postgres health, backup, and restore behavior into the Postgres engine module with parity tests
 - [ ] 3.4 Move Redis health, backup, and restore behavior into the Redis engine module with parity tests
 - [ ] 3.5 Move Dragonfly health, backup, and restore behavior into the Dragonfly engine module with parity tests
-- [ ] 3.6 Keep subprocess execution, file writes, locking, Docker helpers, redaction, and structured logging as small shared modules
+- [x] 3.6 Keep subprocess execution, file writes, locking, Docker helpers, redaction, and structured logging as small shared modules
 - [ ] 3.7 Remove engine dispatch through generic controller, lifecycle, deployment, or promotion abstractions
 
 ## 4. Generated Compose and Native Routing
 
-- [ ] 4.1 Implement canonical Python-dictionary rendering and canonical JSON service hashes
-- [ ] 4.2 Write readable per-role `compose.yaml` files with deterministic content and no Jinja templates or symlinks
-- [ ] 4.3 Generate distinct `evdb-<project>-postgres` and `evdb-<project>-kv` Compose projects
-- [ ] 4.4 Remove secret-bearing `.env` values from Compose and mount only private host secret files
-- [ ] 4.5 Generate unique service names, network aliases, SNI routers, and backends for every project role
-- [ ] 4.6 Generate Postgres with optional PgBouncer and route native traffic to the correct backend
-- [ ] 4.7 Generate Dragonfly or Redis KV services with durable/cache settings and optional HTTP sidecar
-- [ ] 4.8 Generate dedicated `evdb-traefik` Compose with pinned image, ports 5432/6379, Docker provider, and concrete healthcheck
-- [ ] 4.9 Add ACME DNS-01 resolver configuration, private provider credential input, and mode-0600 persistent `acme.json`
-- [ ] 4.10 Validate every candidate YAML with `docker compose config --quiet` before installation
-- [ ] 4.11 Add tests proving Postgres and KV from one project remain separate Docker Compose projects
+- [x] 4.1 Implement canonical Python-dictionary rendering and canonical JSON service hashes
+- [x] 4.2 Write readable per-role `compose.yaml` files with deterministic content and no Jinja templates or symlinks
+- [x] 4.3 Generate distinct `evdb-<project>-postgres` and `evdb-<project>-kv` Compose projects
+- [x] 4.4 Remove secret-bearing `.env` values from Compose and mount only private host secret files
+- [x] 4.5 Generate unique service names, network aliases, SNI routers, and backends for every project role
+- [x] 4.6 Generate Postgres with optional PgBouncer and route native traffic to the correct backend
+- [x] 4.7 Generate Dragonfly or Redis KV services with durable/cache settings and optional HTTP sidecar
+- [x] 4.8 Generate dedicated `evdb-traefik` Compose with pinned image, ports 5432/6379, Docker provider, and concrete healthcheck
+- [x] 4.9 Add ACME DNS-01 resolver configuration, private provider credential input, and mode-0600 persistent `acme.json`
+- [x] 4.10 Validate every candidate YAML with `docker compose config --quiet` before installation
+- [x] 4.11 Add tests proving Postgres and KV from one project remain separate Docker Compose projects
 - [ ] 4.12 Add disposable routing tests for multiple Postgres and KV roles over shared native ports
 - [ ] 4.13 Add setup validation that refuses occupied native ports or an unsafe existing evdb network
 
 ## 5. Database Operations and Settings Recovery
 
-- [ ] 5.1 Implement idempotent database add for Postgres and default or explicit KV engines
-- [ ] 5.2 Stage candidate config, state, secret, and Compose files in private transaction paths
-- [ ] 5.3 Implement per-database image resolution and reject mutable latest or invalid image references
-- [ ] 5.4 Implement complete change previews with old/new settings, affected services, outage, and safety-backup effect
-- [ ] 5.5 Implement direct start, stop, restart, bounded logs, and engine-native health operations
-- [ ] 5.6 Require host and project-role locks around conflicting add, configure, lifecycle, backup, and restore work
+- [x] 5.1 Implement idempotent database add for Postgres and default or explicit KV engines
+- [x] 5.2 Stage candidate config, state, secret, and Compose files in private transaction paths
+- [x] 5.3 Implement per-database image resolution and reject mutable latest or invalid image references
+- [x] 5.4 Implement complete change previews with old/new settings, affected services, outage, and safety-backup effect
+- [x] 5.5 Implement direct start, stop, restart, bounded logs, and engine-native health operations
+- [x] 5.6 Require host and project-role locks around conflicting add, configure, lifecycle, backup, and restore work
 - [ ] 5.7 Create and upload a safety backup before durable primary-container recreation
-- [ ] 5.8 Atomically install a confirmed settings transaction and perform at most one Compose restart
-- [ ] 5.9 Restore prior source, state, generated files, and same-engine service definitions automatically after candidate failure
-- [ ] 5.10 Verify prior health after settings recovery and preserve diagnostic transaction paths when recovery fails
-- [ ] 5.11 Block PostgreSQL, Redis, and Dragonfly major changes before service stop
-- [ ] 5.12 Block Redis/Dragonfly implementation changes as unsupported migrations
-- [ ] 5.13 Record bounded secret-free settings activity without retaining deployment releases
-- [ ] 5.14 Add interrupted creation, unhealthy candidate, recovered prior service, and failed recovery tests
-- [ ] 5.15 Detect manually omitted installed roles, preserve every service and persistent asset, and block mutation pending a future retirement workflow
+- [x] 5.8 Atomically install a confirmed settings transaction and perform at most one Compose restart
+- [x] 5.9 Restore prior source, state, generated files, and same-engine service definitions automatically after candidate failure
+- [x] 5.10 Verify prior health after settings recovery and preserve diagnostic transaction paths when recovery fails
+- [x] 5.11 Block PostgreSQL, Redis, and Dragonfly major changes before service stop
+- [x] 5.12 Block Redis/Dragonfly implementation changes as unsupported migrations
+- [x] 5.13 Record bounded secret-free settings activity without retaining deployment releases
+- [x] 5.14 Add interrupted creation, unhealthy candidate, recovered prior service, and failed recovery tests
+- [x] 5.15 Detect manually omitted installed roles, preserve every service and persistent asset, and block mutation pending a future retirement workflow
 
 ## 6. Guided and Scriptable CLI
 
@@ -97,7 +97,7 @@
 - [ ] 8.2 Change local backup paths, locks, records, and status to host/project/role identity
 - [ ] 8.3 Record concrete engine, image, version, format, purpose, facts, files, hashes, and upload result in `backup.json`
 - [ ] 8.4 Change Restic tags and retention grouping to stable host/project/role identity
-- [ ] 8.5 Preserve checked Postgres dumps and globals, Dragonfly named RDB saves, and Redis confirmed BGSAVE behavior
+- [x] 8.5 Preserve checked Postgres dumps and globals and Redis confirmed BGSAVE behavior, and use complete native Dragonfly DFS generations
 - [ ] 8.6 Implement `backup create`, `backup list`, and `backup test` with guided backup-time selection
 - [ ] 8.7 Preserve two uploaded local backups, all unuploaded backups, free-space checks, and independent operation results
 - [ ] 8.8 Preserve repository format v1, repository locks, weekly forget, monthly prune, and rotating checks

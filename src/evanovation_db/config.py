@@ -1,27 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from .errors import ConfigError
-from .files import write_json, write_text
-from .run import run
+from .files import write_bytes, write_json
+from .images import image_major, locked_image, source_digest, validate_source
+from .images import state as resolve_image
 
-ENGINES = {"postgres", "redis", "dragonfly"}
-KV_ENGINES = {"redis", "dragonfly"}
-IMAGE_KEYS = {"postgres", "pgbouncer", "redis", "dragonfly", "http", "traefik"}
-LOCK_VERSION = 1
-LOCK_OS = "linux"
-LOCK_ARCH = "amd64"
-
-CONFIG_DIR = Path("/etc/evanovation-db")
-STATE_DIR = Path("/var/lib/evanovation-db")
+CONFIG_DIR = Path("/etc/evdb")
+STATE_DIR = Path("/var/lib/evdb")
+TOOL_DIR = Path("/opt/evdb")
 BACKUP_DIR = STATE_DIR / "backups"
 LOCK_DIR = STATE_DIR / "locks"
+STATE_VERSION = 1
 DEFAULT_RETENTION = {"daily": 7, "weekly": 4, "monthly": 12, "data_parts": 12}
 DEFAULT_TIMEOUTS = {
     "command": 300,
@@ -33,550 +32,604 @@ DEFAULT_TIMEOUTS = {
 DEFAULT_HTTP_START = 13379
 DEFAULT_HTTP_END = 13478
 DEFAULT_HTTP_CONNECTIONS = 20
+DEFAULT_IMAGES = {
+    "postgres": "postgres:16",
+    "pgbouncer": "edoburu/pgbouncer:v1.25.1-p0",
+    "redis": "redis:7.2.5",
+    "dragonfly": "docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1",
+    "http": (
+        "hiett/serverless-redis-http@"
+        "sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150"
+    ),
+    "traefik": "traefik:v3.7.8",
+}
 
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _ENV = re.compile(r"-(dev|test|prod)-[0-9]+$")
-_MEMORY = re.compile(r"[1-9][0-9]*(?:kb|mb|gb)")
-_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-_SSH = re.compile(r"[A-Za-z0-9_.@:-]+")
 _DOMAIN = re.compile(
-    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
 )
+_EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+_MEMORY = re.compile(r"[1-9][0-9]*(?:kb|mb|gb)")
+_SECRET_WORDS = ("password", "token", "secret", "credential")
 
 
 @dataclass(frozen=True)
-class DatabaseSource:
-    name: str
-    type: str
-    mode: str = "durable"
-    pooler: bool | None = None
-    max_clients: int | None = None
-    pool_size: int | None = None
-    reserve_size: int | None = None
-    memory: str | None = None
-    threads: int | None = None
-    http: bool | None = None
+class Paths:
+    config: Path = CONFIG_DIR
+    state: Path = STATE_DIR
+    tool: Path = TOOL_DIR
 
     @property
-    def selector(self) -> str:
-        return f"{self.type}/{self.name}"
+    def source(self) -> Path:
+        return self.config / "host.yml"
+
+    @property
+    def previous(self) -> Path:
+        return self.config / "host.previous.yml"
+
+    @property
+    def projects(self) -> Path:
+        return self.config / "projects"
+
+    @property
+    def traefik(self) -> Path:
+        return self.config / "traefik"
+
+    @property
+    def secrets(self) -> Path:
+        return self.config / "secrets"
+
+    @property
+    def machine_state(self) -> Path:
+        return self.state / "state" / "host.json"
+
+    @property
+    def backups(self) -> Path:
+        return self.state / "backups"
+
+    @property
+    def restores(self) -> Path:
+        return self.state / "restores"
+
+    @property
+    def locks(self) -> Path:
+        return self.state / "locks"
+
+    @property
+    def rclone(self) -> Path:
+        return self.state / "rclone"
+
+    @property
+    def activity(self) -> Path:
+        return self.state / "activity.jsonl"
+
+    def role_config(self, project: str, role: str) -> Path:
+        return self.projects / project / role
+
+    def compose(self, project: str, role: str) -> Path:
+        return self.role_config(project, role) / "compose.yaml"
+
+    def role_secrets(self, project: str, role: str) -> Path:
+        return self.secrets / project / role
+
+    def role_backups(self, project: str, role: str) -> Path:
+        return self.backups / project / role
+
+    def role_lock(self, project: str, role: str) -> Path:
+        return self.locks / project / f"{role}.lock"
 
 
 @dataclass(frozen=True)
-class HostSource:
-    id: str
-    ssh: str
-    domain: str
-    data_root: Path
-    images: dict[str, str]
+class BackupSettings:
     repos: dict[str, str]
-    vault: str
-    system_item: str
-    databases: tuple[DatabaseSource, ...]
     retention: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_RETENTION))
     min_free_gb: int = 5
-    backup_max_age_hours: int = 26
-    restore_max_age_days: int = 30
-    http_port_start: int = DEFAULT_HTTP_START
-    http_port_end: int = DEFAULT_HTTP_END
+    max_age_hours: int = 26
+    test_max_age_days: int = 30
+
+
+@dataclass(frozen=True)
+class Routing:
+    acme_email: str
+    dns_provider: str
+    traefik_image: str = DEFAULT_IMAGES["traefik"]
 
 
 @dataclass(frozen=True)
 class Host:
     id: str
-    ssh: str
     domain: str
     data_root: Path
-    config_dir: Path
-    state_dir: Path
-    backup_dir: Path
-    lock_dir: Path
-    repos: dict[str, str]
-    retention: dict[str, int]
-    images: dict[str, str]
-    resources: dict[str, str]
-    secrets: dict[str, str]
-    min_free_gb: int = 5
-    backup_max_age_hours: int = 26
-    restore_max_age_days: int = 30
+    backup: BackupSettings
+    routing: Routing
     http_port_start: int = DEFAULT_HTTP_START
     http_port_end: int = DEFAULT_HTTP_END
     timeouts: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_TIMEOUTS))
-    runtime: bool = False
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Host:
-        try:
-            return cls(
-                id=_runtime_string(data, "id", "host"),
-                ssh=_runtime_string(data, "ssh", "host"),
-                domain=_runtime_string(data, "domain", "host"),
-                data_root=Path(_runtime_string(data, "data_root", "host")),
-                config_dir=Path(_runtime_string(data, "config_dir", "host")),
-                state_dir=Path(_runtime_string(data, "state_dir", "host")),
-                backup_dir=Path(_runtime_string(data, "backup_dir", "host")),
-                lock_dir=Path(_runtime_string(data, "lock_dir", "host")),
-                repos=_string_dict(data["repos"], "host.repos"),
-                retention=_int_dict(data["retention"], "host.retention"),
-                images=_string_dict(data["images"], "host.images"),
-                resources=_string_dict(data.get("resources", {}), "host.resources"),
-                secrets=_string_dict(data["secrets"], "host.secrets"),
-                min_free_gb=_runtime_int(data, "min_free_gb", "host"),
-                backup_max_age_hours=_runtime_int(data, "backup_max_age_hours", "host"),
-                restore_max_age_days=_runtime_int(data, "restore_max_age_days", "host"),
-                http_port_start=_runtime_int(data, "http_port_start", "host"),
-                http_port_end=_runtime_int(data, "http_port_end", "host"),
-                timeouts=_int_dict(data["timeouts"], "host.timeouts"),
-                runtime=data.get("runtime") is True,
-            )
-        except KeyError as exc:
-            raise ConfigError(f"invalid runtime host: missing {exc.args[0]}") from exc
 
 
 @dataclass(frozen=True)
-class Instance:
-    id: str
-    env: str
+class PgBouncer:
+    enabled: bool = True
+    image: str = DEFAULT_IMAGES["pgbouncer"]
+    max_clients: int = 100
+    pool_size: int = 20
+    reserve_size: int = 5
+
+
+@dataclass(frozen=True)
+class HTTP:
+    enabled: bool = True
+    image: str = DEFAULT_IMAGES["http"]
+    connections: int = DEFAULT_HTTP_CONNECTIONS
+    domain: str | None = None
+
+
+@dataclass(frozen=True)
+class Postgres:
+    image: str
+    pgbouncer: PgBouncer = field(default_factory=PgBouncer)
+    user: str = "default"
+    database: str = "postgres"
+
+
+@dataclass(frozen=True)
+class KV:
     engine: str
     image: str
-    port: int
-    container: str
+    mode: str = "durable"
+    http: HTTP = field(default_factory=HTTP)
+    memory: str | None = None
+    threads: int | None = None
+
+
+@dataclass(frozen=True)
+class Project:
+    id: str
+    postgres: Postgres | None = None
+    kv: KV | None = None
+
+
+@dataclass(frozen=True)
+class Database:
     project: str
-    data: Path
-    domain: str
-    durable: bool
-    backup: dict[str, Any]
-    resources: dict[str, str]
-    secrets: dict[str, str]
-    settings: dict[str, Any] = field(default_factory=dict)
-    http: dict[str, Any] | None = None
+    role: str
+    settings: Postgres | KV
+    host: Host
+    paths: Paths
 
     @property
-    def group(self) -> str:
-        return "postgres" if self.engine == "postgres" else "kv"
+    def identity(self) -> str:
+        return f"{self.project}/{self.role}"
 
     @property
-    def selector(self) -> str:
-        return f"{self.engine}/{self.id}"
+    def engine(self) -> str:
+        return "postgres" if self.role == "postgres" else self.settings.engine
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Instance:
-        name = data.get("id", "unknown") if isinstance(data, dict) else "unknown"
-        if not isinstance(data, dict):
-            raise ConfigError("invalid runtime instance: expected an object")
-        migration = {"current", "target"}.intersection(data)
-        if migration:
-            field_name = sorted(migration)[0]
-            raise ConfigError(f"invalid runtime instance {name}: migration-only field {field_name}")
-        try:
-            http = data.get("http")
-            if http is not None and not isinstance(http, dict):
-                raise ConfigError(f"invalid runtime instance {name}: http must be an object")
-            settings = data.get("settings", {})
-            backup = data["backup"]
-            if not isinstance(settings, dict) or not isinstance(backup, dict):
-                raise ConfigError(f"invalid runtime instance {name}: invalid settings or backup")
-            durable = data["durable"]
-            if not isinstance(durable, bool):
-                raise ConfigError(f"invalid runtime instance {name}: durable must be a boolean")
-            return cls(
-                id=_runtime_string(data, "id", f"instance {name}"),
-                env=_runtime_string(data, "env", f"instance {name}"),
-                engine=_runtime_string(data, "engine", f"instance {name}"),
-                image=_runtime_string(data, "image", f"instance {name}"),
-                port=_runtime_int(data, "port", f"instance {name}"),
-                container=_runtime_string(data, "container", f"instance {name}"),
-                project=_runtime_string(data, "project", f"instance {name}"),
-                data=Path(_runtime_string(data, "data", f"instance {name}")),
-                domain=_runtime_string(data, "domain", f"instance {name}"),
-                durable=durable,
-                backup=dict(backup),
-                resources=_string_dict(data.get("resources", {}), f"instance {name}.resources"),
-                secrets=_string_dict(data["secrets"], f"instance {name}.secrets"),
-                settings=dict(settings),
-                http=dict(http) if http is not None else None,
-            )
-        except KeyError as exc:
-            raise ConfigError(f"invalid runtime instance {name}: missing {exc.args[0]}") from exc
+    @property
+    def image(self) -> str:
+        return self.settings.image
+
+    @property
+    def durable(self) -> bool:
+        return self.role == "postgres" or self.settings.mode == "durable"
+
+    @property
+    def compose_project(self) -> str:
+        return f"evdb-{self.project}-{self.role}"
+
+    @property
+    def data(self) -> Path:
+        return self.host.data_root / self.project / self.role / "data"
+
+    @property
+    def compose(self) -> Path:
+        return self.paths.compose(self.project, self.role)
+
+    @property
+    def domain(self) -> str:
+        return f"{self.project}.{self.role}-{self.host.id}.{self.host.domain}"
+
+    @property
+    def port(self) -> int:
+        return 5432 if self.role == "postgres" else 6379
 
 
 @dataclass(frozen=True)
 class Config:
     host: Host
-    instances: tuple[Instance, ...]
+    projects: tuple[Project, ...]
+    paths: Paths = field(default_factory=Paths)
 
-    def select(self, selector: str) -> Instance:
+    @property
+    def databases(self) -> tuple[Database, ...]:
+        result = []
+        for project in self.projects:
+            if project.postgres is not None:
+                result.append(
+                    Database(project.id, "postgres", project.postgres, self.host, self.paths)
+                )
+            if project.kv is not None:
+                result.append(Database(project.id, "kv", project.kv, self.host, self.paths))
+        return tuple(result)
+
+    def select(self, selector: str) -> Database:
         if "/" in selector:
-            engine, name = selector.split("/", 1)
-            if engine not in ENGINES or not name:
+            project, role = selector.split("/", 1)
+            if role not in {"postgres", "kv"} or not project:
                 raise ConfigError(f"invalid database selector: {selector}")
-            matches = [item for item in self.instances if item.engine == engine and item.id == name]
+            matches = [item for item in self.databases if item.identity == selector]
         else:
-            matches = [item for item in self.instances if item.id == selector]
+            matches = [item for item in self.databases if item.project == selector]
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
-            choices = ", ".join(sorted(item.selector for item in matches))
+            choices = ", ".join(item.identity for item in matches)
             raise ConfigError(f"ambiguous database {selector}; use one of: {choices}")
         raise ConfigError(f"unknown database: {selector}")
 
-    def get(self, group: str, name: str) -> Instance:
-        if group in ENGINES:
-            return self.select(f"{group}/{name}")
-        if group != "kv":
-            raise ConfigError(f"unknown instance: {group}/{name}")
-        matches = [item for item in self.instances if item.group == group and item.id == name]
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            choices = ", ".join(sorted(item.selector for item in matches))
-            raise ConfigError(f"ambiguous database {name}; use one of: {choices}")
-        raise ConfigError(f"unknown instance: {group}/{name}")
-
 
 @dataclass(frozen=True)
-class ImageLock:
+class ImageState:
     source: str
     digest: str
+    major: int | None
+
+    @property
+    def image(self) -> str:
+        return locked_image(self.source, self.digest)
 
 
 @dataclass(frozen=True)
-class HostLock:
+class RoleState:
+    engine: str
+    images: dict[str, ImageState] = field(default_factory=dict)
+    http_port: int | None = None
+    compose_hash: str | None = None
+    installed: bool = False
+    operations: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MachineState:
     version: int
     host: str
-    os: str
-    architecture: str
-    images: dict[str, ImageLock]
-    http_ports: dict[str, int]
+    images: dict[str, ImageState]
+    roles: dict[str, RoleState]
+    tool_version: str | None = None
 
     @classmethod
-    def empty(cls, host: str) -> HostLock:
-        return cls(LOCK_VERSION, host, LOCK_OS, LOCK_ARCH, {}, {})
-
-    @classmethod
-    def from_dict(cls, data: Any) -> HostLock:
-        if not isinstance(data, dict):
-            raise ConfigError("invalid host lock: expected an object")
-        if _has_secret(data):
-            raise ConfigError("invalid host lock: secret data is not allowed")
-        _only(data, {"version", "host", "platform", "images", "http_ports"}, "host lock")
-        version = data.get("version")
-        if type(version) is not int or version != LOCK_VERSION:
-            raise ConfigError(f"invalid host lock: unsupported version {version!r}")
-        host = _required_string(data, "host", "host lock")
-        platform = _mapping(data.get("platform"), "host lock.platform")
-        _only(platform, {"os", "architecture"}, "host lock.platform")
-        os_name = _required_string(platform, "os", "host lock.platform")
-        architecture = _required_string(platform, "architecture", "host lock.platform")
-        if (os_name, architecture) != (LOCK_OS, LOCK_ARCH):
-            raise ConfigError(f"invalid host lock: platform must be {LOCK_OS}/{LOCK_ARCH}")
-
-        image_data = _mapping(data.get("images"), "host lock.images")
-        if set(image_data) != IMAGE_KEYS:
-            raise ConfigError("invalid host lock: image entries are incomplete")
-        images: dict[str, ImageLock] = {}
-        for name, raw in image_data.items():
-            if name not in IMAGE_KEYS:
-                raise ConfigError(f"invalid host lock: unknown image {name}")
-            item = _mapping(raw, f"host lock.images.{name}")
-            _only(item, {"source", "digest"}, f"host lock.images.{name}")
-            source = _required_string(item, "source", f"host lock.images.{name}")
-            digest = _required_string(item, "digest", f"host lock.images.{name}")
-            if not _DIGEST.fullmatch(digest):
-                raise ConfigError(f"invalid host lock: invalid digest for image {name}")
-            source_digest = _source_image_digest(source, f"host lock.images.{name}.source")
-            if source_digest is not None and source_digest != digest:
-                raise ConfigError(f"invalid host lock: source digest differs for image {name}")
-            images[name] = ImageLock(source, digest)
-
-        port_data = _mapping(data.get("http_ports"), "host lock.http_ports")
-        ports: dict[str, int] = {}
-        used: dict[int, str] = {}
-        for selector, port in port_data.items():
-            _lock_selector(selector)
-            if type(port) is not int or not 1024 <= port <= 65535:
-                raise ConfigError(f"invalid host lock: invalid HTTP port for {selector}")
-            if port in used:
-                raise ConfigError(
-                    f"invalid host lock: duplicate HTTP port for {selector} and {used[port]}"
-                )
-            used[port] = selector
-            ports[selector] = port
-        return cls(version, host, os_name, architecture, images, ports)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "version": self.version,
-            "host": self.host,
-            "platform": {"os": self.os, "architecture": self.architecture},
-            "images": {
-                name: {"source": item.source, "digest": item.digest}
-                for name, item in sorted(self.images.items())
-            },
-            "http_ports": dict(sorted(self.http_ports.items())),
-        }
+    def empty(cls, host: str) -> MachineState:
+        return cls(STATE_VERSION, host, {}, {})
 
 
-def load_source(path: str | Path) -> HostSource:
-    source_path = _source_path(Path(path))
-    root = source_path.parent
-    old = [name for name in ("postgres.yml", "kv.yml") if (root / name).exists()]
+def load(path: str | Path = CONFIG_DIR / "host.yml", *, paths: Paths | None = None) -> Config:
+    source = source_path(path)
+    root = source.parent
+    old = [name for name in ("postgres.yml", "kv.yml", "host.lock.json") if (root / name).exists()]
     if old:
-        raise ConfigError("old source layout is not supported; move all databases into host.yml")
-    data = _read_yaml(source_path)
-    source = _mapping(data, "source")
-    if "instances" in source:
-        raise ConfigError("old source field instances is not supported; use databases")
-    _only(source, {"host", "databases"}, "source")
-    host_data = _mapping(source.get("host"), "host")
-    databases_data = source.get("databases")
-    if not isinstance(databases_data, list):
-        raise ConfigError("databases must be a list")
-    databases = tuple(_database(item, index) for index, item in enumerate(databases_data))
-    result = _host(host_data, databases)
-    _validate_sources(result)
-    return result
-
-
-def load_lock(path: str | Path, source: HostSource | None = None) -> HostLock:
-    lock_path = Path(path)
-    if not lock_path.is_file():
-        raise ConfigError(f"missing generated host lock: {lock_path.name}")
-    try:
-        data = json.loads(lock_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"invalid generated host lock: {lock_path.name}") from exc
-    lock = HostLock.from_dict(data)
-    if source is not None and lock.host != source.id:
-        raise ConfigError(f"host lock is for {lock.host}, not configured host {source.id}")
-    return lock
-
-
-def write_lock(path: str | Path, lock: HostLock) -> None:
-    HostLock.from_dict(lock.as_dict())
-    write_json(path, lock.as_dict(), mode=0o644)
-
-
-def resolve_image_digest(
-    image: str,
-    *,
-    os_name: str = LOCK_OS,
-    architecture: str = LOCK_ARCH,
-    timeout: int = 120,
-) -> str:
-    result = run(
-        ["docker", "manifest", "inspect", "--verbose", image],
-        timeout=timeout,
-    )
-    try:
-        data = json.loads(result.out)
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"image {image}: docker returned invalid manifest JSON") from exc
-    matches = []
-    for item in _manifest_items(data):
-        descriptor = item.get("Descriptor") if isinstance(item.get("Descriptor"), dict) else {}
-        platform = item.get("Platform") or descriptor.get("platform") or item.get("platform")
-        if not isinstance(platform, dict):
-            continue
-        if platform.get("os") != os_name or platform.get("architecture") != architecture:
-            continue
-        digest = item.get("Digest") or descriptor.get("digest") or item.get("digest")
-        if isinstance(digest, str) and _DIGEST.fullmatch(digest):
-            matches.append(digest)
-    unique = sorted(set(matches))
-    if len(unique) != 1:
-        raise ConfigError(
-            f"image {image}: expected one {os_name}/{architecture} manifest, found {len(unique)}"
-        )
-    return unique[0]
-
-
-def resolve_lock(
-    source: HostSource,
-    current: HostLock | None = None,
-    *,
-    resolver: Callable[..., str] = resolve_image_digest,
-) -> HostLock:
-    lock = current or HostLock.empty(source.id)
-    if lock.host != source.id:
-        raise ConfigError(f"host lock is for {lock.host}, not configured host {source.id}")
-    if (lock.version, lock.os, lock.architecture) != (LOCK_VERSION, LOCK_OS, LOCK_ARCH):
-        raise ConfigError("host lock version or platform is incompatible")
-
-    images: dict[str, ImageLock] = {}
-    for name in sorted(IMAGE_KEYS):
-        image = source.images[name]
-        existing = lock.images.get(name)
-        if existing is not None and existing.source == image:
-            images[name] = existing
-            continue
-        digest = _source_image_digest(image, f"host.images.{name}")
-        if digest is None:
-            digest = resolver(image, os_name=LOCK_OS, architecture=LOCK_ARCH)
-        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
-            raise ConfigError(f"image {name}: resolver returned an invalid digest")
-        images[name] = ImageLock(image, digest)
-
-    enabled = {
-        item.selector
-        for item in source.databases
-        if item.type in KV_ENGINES and item.http is not False
-    }
-    outside = {
-        selector: port
-        for selector, port in lock.http_ports.items()
-        if selector in enabled and not source.http_port_start <= port <= source.http_port_end
-    }
-    if outside:
-        selectors = ", ".join(sorted(outside))
-        raise ConfigError(
-            f"locked HTTP ports fall outside the configured range for {selectors}; "
-            "expand the range instead of reallocating surviving databases"
-        )
-    ports = {selector: port for selector, port in lock.http_ports.items() if selector in enabled}
-    used = set(ports.values())
-    free = (
-        port for port in range(source.http_port_start, source.http_port_end + 1) if port not in used
-    )
-    for selector in sorted(enabled - ports.keys()):
-        try:
-            port = next(free)
-        except StopIteration as exc:
-            raise ConfigError("no free HTTP ports remain in the configured range") from exc
-        ports[selector] = port
-        used.add(port)
-    return HostLock(LOCK_VERSION, source.id, LOCK_OS, LOCK_ARCH, images, ports)
-
-
-def normalize(source: HostSource, lock: HostLock) -> Config:
-    errors = _lock_errors(source, lock)
-    if errors:
-        raise ConfigError("config lock failed:\n- " + "\n- ".join(errors))
-    images = {
-        name: _locked_image(source.images[name], lock.images[name].digest)
-        for name in sorted(IMAGE_KEYS)
-    }
-    vault = source.vault
-    system = source.system_item
-    host = Host(
-        id=source.id,
-        ssh=source.ssh,
-        domain=source.domain,
-        data_root=source.data_root,
-        config_dir=CONFIG_DIR,
-        state_dir=STATE_DIR,
-        backup_dir=BACKUP_DIR,
-        lock_dir=LOCK_DIR,
-        repos=dict(source.repos),
-        retention=dict(source.retention),
-        images=images,
-        resources={"traefik": "unlimited"},
-        secrets={
-            "restic_password": f"op://{vault}/{system}/restic-password",
-            "rclone_config": f"op://{vault}/{system}/rclone-config",
-        },
-        min_free_gb=source.min_free_gb,
-        backup_max_age_hours=source.backup_max_age_hours,
-        restore_max_age_days=source.restore_max_age_days,
-        http_port_start=source.http_port_start,
-        http_port_end=source.http_port_end,
-    )
-    instances = tuple(_normalize_database(source, item, lock, images) for item in source.databases)
-    config = Config(host, instances)
+        raise ConfigError(f"old source layout is not supported: {old[0]}")
+    data = _read_yaml(source)
+    if _has_secret(data):
+        raise ConfigError("source configuration must not contain secrets or secret references")
+    config = _config(_mapping(data, "source"), paths or Paths())
     require_valid(config)
     return config
 
 
-def load(path: str | Path) -> Config:
-    root = Path(path)
-    if root.is_dir() and (root / "host.json").is_file() and not (root / "host.yml").exists():
-        return _load_runtime(root)
-    source_path = _source_path(root)
-    source = load_source(source_path)
-    lock = load_lock(source_path.parent / "host.lock.json", source)
-    return normalize(source, lock)
-
-
 def source_path(path: str | Path) -> Path:
-    return _source_path(Path(path))
+    value = Path(path)
+    if value.is_dir():
+        value = value / "host.yml"
+    if not value.is_file():
+        raise ConfigError(f"missing source config file: {value.name}")
+    if value.suffix not in {".yml", ".yaml"}:
+        raise ConfigError("source config must be YAML")
+    return value
 
 
-def add_database(path: str | Path, engine: str, name: str) -> bool:
-    target = source_path(path)
-    source = load_source(target)
-    item = _database({"name": name, "type": engine}, len(source.databases))
-    if any(current.selector == item.selector for current in source.databases):
-        return False
-    updated = replace(source, databases=(*source.databases, item))
-    _validate_sources(updated)
+def dump(config: Config) -> str:
+    return yaml.safe_dump(as_dict(config), sort_keys=False)
 
-    data = _mapping(_read_yaml(target), "source")
-    databases = data.get("databases")
-    if not isinstance(databases, list):
-        raise ConfigError("databases must be a list")
-    databases.append({"name": name, "type": engine})
-    write_text(target, _dump_yaml(data), mode=0o644)
-    return True
+
+def as_dict(config: Config) -> dict[str, Any]:
+    host = config.host
+    data: dict[str, Any] = {
+        "host": {
+            "id": host.id,
+            "domain": host.domain,
+            "data_root": str(host.data_root),
+            "backup": {
+                "repos": dict(host.backup.repos),
+                "retention": dict(host.backup.retention),
+                "min_free_gb": host.backup.min_free_gb,
+                "max_age_hours": host.backup.max_age_hours,
+                "test_max_age_days": host.backup.test_max_age_days,
+            },
+            "routing": {
+                "acme_email": host.routing.acme_email,
+                "dns_provider": host.routing.dns_provider,
+                "traefik_image": host.routing.traefik_image,
+            },
+            "http_ports": {"start": host.http_port_start, "end": host.http_port_end},
+        },
+        "projects": {},
+    }
+    for project in config.projects:
+        item: dict[str, Any] = {}
+        if project.postgres is not None:
+            postgres = project.postgres
+            item["postgres"] = {
+                "image": postgres.image,
+                "pgbouncer": {
+                    "enabled": postgres.pgbouncer.enabled,
+                    "image": postgres.pgbouncer.image,
+                    "max_clients": postgres.pgbouncer.max_clients,
+                    "pool_size": postgres.pgbouncer.pool_size,
+                    "reserve_size": postgres.pgbouncer.reserve_size,
+                },
+            }
+        if project.kv is not None:
+            kv = project.kv
+            kv_data: dict[str, Any] = {
+                "engine": kv.engine,
+                "image": kv.image,
+                "mode": kv.mode,
+                "http": {
+                    "enabled": kv.http.enabled,
+                    "image": kv.http.image,
+                    "connections": kv.http.connections,
+                },
+            }
+            if kv.http.domain is not None:
+                kv_data["http"]["domain"] = kv.http.domain
+            if kv.engine == "dragonfly":
+                kv_data["memory"] = kv.memory or "256mb"
+                kv_data["threads"] = kv.threads or 1
+            item["kv"] = kv_data
+        data["projects"][project.id] = item
+    return data
+
+
+def write_config(
+    config: Config,
+    *,
+    command: str,
+    database: Database | None = None,
+    changed: tuple[str, ...] = (),
+    result: str = "success",
+    recovery: str | None = None,
+) -> None:
+    require_valid(config)
+    target = config.paths.source
+    if target.exists():
+        write_bytes(config.paths.previous, target.read_bytes(), mode=0o640)
+    write_bytes(target, dump(config).encode(), mode=0o640)
+    append_activity(
+        config,
+        command=command,
+        database=database,
+        changed=changed,
+        result=result,
+        recovery=recovery,
+    )
+
+
+def append_activity(
+    config: Config,
+    *,
+    command: str,
+    database: Database | None = None,
+    changed: tuple[str, ...] = (),
+    result: str,
+    recovery: str | None = None,
+) -> None:
+    record = {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "host": config.host.id,
+        "project": database.project if database else None,
+        "role": database.role if database else None,
+        "engine": database.engine if database else None,
+        "command": command,
+        "changed": sorted(set(changed)),
+        "result": result,
+        "recovery": recovery,
+    }
+    if _has_secret(record):
+        raise ConfigError("activity record contains a secret")
+    path = config.paths.activity
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (json.dumps(record, sort_keys=True, default=str) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def load_state(config: Config) -> MachineState:
+    path = config.paths.machine_state
+    if not path.exists():
+        return MachineState.empty(config.host.id)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError("invalid machine state") from exc
+    if _has_secret(data):
+        raise ConfigError("machine state must not contain secrets")
+    state = _machine_state(data)
+    if state.host != config.host.id:
+        raise ConfigError(f"machine state is for {state.host}, not {config.host.id}")
+    return state
+
+
+def write_state(config: Config, state: MachineState) -> None:
+    if state.host != config.host.id or state.version != STATE_VERSION:
+        raise ConfigError("incompatible machine state")
+    data = state_dict(state)
+    if _has_secret(data):
+        raise ConfigError("machine state must not contain secrets")
+    write_json(config.paths.machine_state, data, mode=0o600)
+
+
+def resolve_state(
+    config: Config, current: MachineState | None = None, *, resolver=None
+) -> MachineState:
+    state = current or MachineState.empty(config.host.id)
+    if state.version != STATE_VERSION or state.host != config.host.id:
+        raise ConfigError("incompatible machine state")
+
+    resolve = (
+        (lambda source: resolve_image(source))
+        if resolver is None
+        else (lambda source: resolve_image(source, resolver))
+    )
+    images = dict(state.images)
+    source = config.host.routing.traefik_image
+    if "traefik" not in images or images["traefik"].source != source:
+        images["traefik"] = resolve(source)
+
+    roles = dict(state.roles)
+    enabled_http = {
+        item.identity
+        for item in config.databases
+        if item.role == "kv" and item.settings.http.enabled
+    }
+    used = {role.http_port for role in roles.values() if role.http_port is not None}
+    configured = {item.identity for item in config.databases}
+    outside = {
+        identity
+        for identity in configured
+        if identity in roles
+        and roles[identity].http_port is not None
+        and not config.host.http_port_start
+        <= roles[identity].http_port
+        <= config.host.http_port_end
+    }
+    if outside:
+        names = ", ".join(sorted(outside))
+        raise ConfigError(
+            f"HTTP ports fall outside the configured range for {names}; "
+            "expand the range instead of reallocating"
+        )
+    available = (
+        port
+        for port in range(config.host.http_port_start, config.host.http_port_end + 1)
+        if port not in used
+    )
+    for database in config.databases:
+        existing = roles.get(database.identity)
+        if existing is not None and existing.installed and existing.engine != database.engine:
+            raise ConfigError(
+                f"{database.identity}: changing {existing.engine} to {database.engine} "
+                "requires an explicit migration"
+            )
+        role_images = dict(existing.images) if existing else {}
+        sources = {"primary": database.image}
+        if database.role == "postgres" and database.settings.pgbouncer.enabled:
+            sources["pgbouncer"] = database.settings.pgbouncer.image
+        if database.role == "kv" and database.settings.http.enabled:
+            sources["http"] = database.settings.http.image
+        role_images = {
+            name: (
+                role_images[name]
+                if name in role_images and role_images[name].source == image
+                else resolve(image)
+            )
+            for name, image in sources.items()
+        }
+        port = existing.http_port if database.role == "kv" and existing is not None else None
+        if database.identity in enabled_http and port is None:
+            try:
+                port = next(available)
+            except StopIteration as exc:
+                raise ConfigError("no free HTTP ports remain in the configured range") from exc
+            used.add(port)
+        roles[database.identity] = RoleState(
+            database.engine,
+            role_images,
+            port,
+            existing.compose_hash if existing else None,
+            existing.installed if existing else False,
+            dict(existing.operations) if existing else {},
+        )
+    return MachineState(state.version, state.host, images, roles, state.tool_version)
+
+
+def state_dict(state: MachineState) -> dict[str, Any]:
+    return {
+        "version": state.version,
+        "host": state.host,
+        "tool_version": state.tool_version,
+        "images": {name: _image_state_dict(item) for name, item in sorted(state.images.items())},
+        "roles": {
+            name: {
+                "engine": role.engine,
+                "images": {
+                    key: _image_state_dict(value) for key, value in sorted(role.images.items())
+                },
+                "http_port": role.http_port,
+                "compose_hash": role.compose_hash,
+                "installed": role.installed,
+                "operations": role.operations,
+            }
+            for name, role in sorted(state.roles.items())
+        },
+    }
+
+
+def with_role(config: Config, project_id: str, role: str, settings: Postgres | KV) -> Config:
+    if role not in {"postgres", "kv"}:
+        raise ConfigError(f"unsupported role: {role}")
+    projects = list(config.projects)
+    for index, project in enumerate(projects):
+        if project.id != project_id:
+            continue
+        current = getattr(project, role)
+        if current is not None and current == settings:
+            return config
+        if current is not None:
+            raise ConfigError(f"database already exists: {project_id}/{role}")
+        projects[index] = replace(project, **{role: settings})
+        break
+    else:
+        _validate_project_id(project_id)
+        projects.append(Project(project_id, **{role: settings}))
+    updated = replace(config, projects=tuple(sorted(projects, key=lambda item: item.id)))
+    require_valid(updated)
+    return updated
+
+
+def replace_role(config: Config, database: Database, settings: Postgres | KV) -> Config:
+    projects = []
+    for project in config.projects:
+        if project.id == database.project:
+            project = replace(project, **{database.role: settings})
+        projects.append(project)
+    updated = replace(config, projects=tuple(projects))
+    require_valid(updated)
+    return updated
 
 
 def validate(config: Config) -> list[str]:
     errors: list[str] = []
-    seen: dict[str, dict[Any, str]] = {
-        "identity": {},
-        "container": {},
-        "project": {},
-        "domain": {},
-        "http port": {},
-        "http domain": {},
-    }
-    for instance in config.instances:
-        _unique(
-            errors,
-            seen["identity"],
-            (instance.engine, instance.id),
-            instance.selector,
-            "typed identity",
-        )
-        _unique(errors, seen["container"], instance.container, instance.selector, "container")
-        _unique(
-            errors,
-            seen["project"],
-            (instance.group, instance.project),
-            instance.selector,
-            "project",
-        )
-        _unique(
-            errors,
-            seen["domain"],
-            instance.domain.lower(),
-            instance.selector,
-            "domain",
-        )
-        if instance.engine not in ENGINES:
-            errors.append(f"{instance.id}: unsupported database type {instance.engine}")
-        if not _NAME.fullmatch(instance.id):
-            errors.append(f"{instance.id}: unsafe database name")
-        _check_locked_image(errors, instance.selector, instance.image)
-        if not instance.data.is_absolute():
-            errors.append(f"{instance.selector}: data path must be absolute")
-        if instance.durable != bool(instance.backup.get("enabled")):
-            errors.append(f"{instance.selector}: backup setting does not match durability")
-        _check_refs(errors, instance.selector, instance.secrets, config.host)
-        if instance.engine in KV_ENGINES:
-            if instance.http is None:
-                errors.append(f"{instance.selector}: HTTP settings are required")
-            else:
-                _check_http(errors, seen, instance, config.host)
-        elif instance.http is not None:
-            errors.append(f"{instance.selector}: HTTP settings are only valid for KV")
-
-    if set(config.host.images) != IMAGE_KEYS:
-        errors.append(
-            "host: images must define postgres, pgbouncer, redis, dragonfly, http, traefik"
-        )
-    for name, image in config.host.images.items():
-        _check_locked_image(errors, f"host image {name}", image)
-    _check_refs(errors, "host", config.host.secrets, config.host)
+    seen_domains: dict[str, str] = {}
+    for database in config.databases:
+        if not _ENV.search(database.project):
+            errors.append(f"{database.project}: project must end in -dev-N, -test-N, or -prod-N")
+        if len(database.compose_project) > 63:
+            errors.append(f"{database.identity}: derived Compose project is too long")
+        if len(database.domain) > 253 or not _DOMAIN.fullmatch(database.domain):
+            errors.append(f"{database.identity}: derived domain is invalid")
+        previous = seen_domains.get(database.domain)
+        if previous:
+            errors.append(f"{database.identity}: domain collides with {previous}")
+        seen_domains[database.domain] = database.identity
+        if not database.data.is_absolute() or database.data == Path("/"):
+            errors.append(f"{database.identity}: data path is unsafe")
+        if database.role == "kv" and database.settings.engine not in {"redis", "dragonfly"}:
+            errors.append(f"{database.identity}: unsupported KV engine")
     return errors
 
 
@@ -586,485 +639,255 @@ def require_valid(config: Config) -> None:
         raise ConfigError("config failed:\n- " + "\n- ".join(errors))
 
 
-def render(source: str | Path, output: str | Path) -> Config:
-    config = load(source)
-    render_runtime(config, output)
-    return config
+def _config(data: dict[str, Any], paths: Paths) -> Config:
+    if "databases" in data or "instances" in data:
+        raise ConfigError("old source schema is not supported; use projects and roles")
+    _only(data, {"host", "projects"}, "source")
+    host = _host(_mapping(data.get("host"), "host"))
+    raw_projects = _mapping(data.get("projects"), "projects")
+    projects = []
+    for project_id, raw in raw_projects.items():
+        _validate_project_id(project_id)
+        item = _mapping(raw, f"projects.{project_id}")
+        _only(item, {"postgres", "kv"}, f"projects.{project_id}")
+        postgres = _postgres(item["postgres"], project_id) if "postgres" in item else None
+        kv = _kv(item["kv"], project_id) if "kv" in item else None
+        projects.append(Project(project_id, postgres, kv))
+    return Config(host, tuple(sorted(projects, key=lambda item: item.id)), paths)
 
 
-def runtime_data(config: Config) -> dict[str, Any]:
-    return {
-        "host": _host_dict(config.host, runtime=True),
-        "instances": [
-            _instance_dict(item, config.host, runtime=True)
-            for item in sorted(config.instances, key=lambda current: current.selector)
-        ],
-    }
-
-
-def from_runtime(data: Any) -> Config:
-    wrapper = _mapping(data, "runtime config")
-    _only(wrapper, {"host", "instances"}, "runtime config")
-    host = Host.from_dict(_mapping(wrapper.get("host"), "runtime config.host"))
-    instances_data = wrapper.get("instances")
-    if not isinstance(instances_data, list):
-        raise ConfigError("runtime config.instances must be a list")
-    instances = tuple(Instance.from_dict(item) for item in instances_data)
-    config = Config(host, instances)
-    require_valid(config)
-    return config
-
-
-def render_runtime(config: Config, output: str | Path) -> None:
-    root = Path(output)
-    instance_dir = root / "instances"
-    instance_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    wanted = {f"{item.group}-{item.id}.json" for item in config.instances}
-    for stale in instance_dir.glob("*.json"):
-        if stale.name not in wanted:
-            stale.unlink()
-    data = runtime_data(config)
-    write_json(root / "host.json", {"host": data["host"]}, mode=0o600)
-    for item in data["instances"]:
-        instance = Instance.from_dict(item)
-        write_json(
-            instance_dir / f"{instance.group}-{instance.id}.json",
-            {"instance": item},
-            mode=0o600,
-        )
-
-
-def _host(data: dict[str, Any], databases: tuple[DatabaseSource, ...]) -> HostSource:
-    _only(
-        data,
-        {
-            "id",
-            "ssh",
-            "domain",
-            "data_root",
-            "images",
-            "backup",
-            "one_password",
-            "http_ports",
-        },
-        "host",
-    )
+def _host(data: dict[str, Any]) -> Host:
+    _only(data, {"id", "domain", "data_root", "backup", "routing", "http_ports"}, "host")
     host_id = _required_string(data, "id", "host")
     if not _NAME.fullmatch(host_id):
         raise ConfigError("host.id must be a safe lowercase name")
-    ssh = _required_string(data, "ssh", "host")
-    if not _SSH.fullmatch(ssh):
-        raise ConfigError("host.ssh contains unsupported characters")
     domain = _required_string(data, "domain", "host").lower()
     if not _DOMAIN.fullmatch(domain):
         raise ConfigError("host.domain must be a valid lowercase domain")
     data_root = Path(_required_string(data, "data_root", "host"))
-    if not data_root.is_absolute():
-        raise ConfigError("host.data_root must be an absolute path")
-
-    image_data = _mapping(data.get("images"), "host.images")
-    if set(image_data) != IMAGE_KEYS:
-        raise ConfigError(
-            "host.images must define postgres, pgbouncer, redis, dragonfly, http, and traefik"
-        )
-    images = {}
-    for name in sorted(IMAGE_KEYS):
-        image = _required_string(image_data, name, "host.images")
-        _source_image_digest(image, f"host.images.{name}")
-        if name in ENGINES and image_major(image) is None:
-            raise ConfigError(
-                f"host.images.{name} tag must start with a positive engine major version"
-            )
-        images[name] = image
-
-    backup = _mapping(data.get("backup"), "host.backup")
+    if not data_root.is_absolute() or data_root == Path("/"):
+        raise ConfigError("host.data_root must be a safe absolute path")
+    backup_data = _mapping(data.get("backup"), "host.backup")
     _only(
-        backup,
-        {"repos", "retention", "min_free_gb", "max_age_hours", "restore_max_age_days"},
+        backup_data,
+        {"repos", "retention", "min_free_gb", "max_age_hours", "test_max_age_days"},
         "host.backup",
     )
-    repos = _string_dict(backup.get("repos"), "host.backup.repos")
-    if set(repos) != {"postgres", "kv"} or any(not value for value in repos.values()):
+    repos = _string_dict(backup_data.get("repos"), "host.backup.repos")
+    if set(repos) != {"postgres", "kv"} or not all(repos.values()):
         raise ConfigError("host.backup.repos must define non-empty postgres and kv repositories")
-    retention_data = backup.get("retention", {})
-    retention_map = _mapping(retention_data, "host.backup.retention")
-    _only(retention_map, set(DEFAULT_RETENTION), "host.backup.retention")
     retention = dict(DEFAULT_RETENTION)
-    for name, value in retention_map.items():
+    raw_retention = _mapping(backup_data.get("retention", {}), "host.backup.retention")
+    _only(raw_retention, set(DEFAULT_RETENTION), "host.backup.retention")
+    for name, value in raw_retention.items():
         retention[name] = _positive_int(value, f"host.backup.retention.{name}")
-
-    one_password = _mapping(data.get("one_password"), "host.one_password")
-    _only(one_password, {"vault", "system_item"}, "host.one_password")
-    vault = _op_segment(one_password, "vault")
-    system_item = _op_segment(one_password, "system_item")
-
-    port_data = _mapping(data.get("http_ports", {}), "host.http_ports")
-    _only(port_data, {"start", "end"}, "host.http_ports")
-    start = _positive_int(port_data.get("start", DEFAULT_HTTP_START), "host.http_ports.start")
-    end = _positive_int(port_data.get("end", DEFAULT_HTTP_END), "host.http_ports.end")
+    backup = BackupSettings(
+        repos,
+        retention,
+        _nonnegative_int(backup_data.get("min_free_gb", 5), "host.backup.min_free_gb"),
+        _positive_int(backup_data.get("max_age_hours", 26), "host.backup.max_age_hours"),
+        _positive_int(backup_data.get("test_max_age_days", 30), "host.backup.test_max_age_days"),
+    )
+    routing_data = _mapping(data.get("routing"), "host.routing")
+    _only(routing_data, {"acme_email", "dns_provider", "traefik_image"}, "host.routing")
+    email = _required_string(routing_data, "acme_email", "host.routing")
+    if not _EMAIL.fullmatch(email):
+        raise ConfigError("host.routing.acme_email must be a valid email")
+    provider = _required_string(routing_data, "dns_provider", "host.routing")
+    if not _NAME.fullmatch(provider):
+        raise ConfigError("host.routing.dns_provider must be a safe name")
+    traefik_image = routing_data.get("traefik_image", DEFAULT_IMAGES["traefik"])
+    validate_source(traefik_image, "host.routing.traefik_image")
+    ports = _mapping(data.get("http_ports", {}), "host.http_ports")
+    _only(ports, {"start", "end"}, "host.http_ports")
+    start = _positive_int(ports.get("start", DEFAULT_HTTP_START), "host.http_ports.start")
+    end = _positive_int(ports.get("end", DEFAULT_HTTP_END), "host.http_ports.end")
     if start < 1024 or end > 65535 or start > end:
-        raise ConfigError("host.http_ports must be an ordered unprivileged port range")
-
-    return HostSource(
-        id=host_id,
-        ssh=ssh,
-        domain=domain,
-        data_root=data_root,
-        images=images,
-        repos=repos,
-        vault=vault,
-        system_item=system_item,
-        databases=databases,
-        retention=retention,
-        min_free_gb=_positive_int(backup.get("min_free_gb", 5), "host.backup.min_free_gb"),
-        backup_max_age_hours=_positive_int(
-            backup.get("max_age_hours", 26), "host.backup.max_age_hours"
-        ),
-        restore_max_age_days=_positive_int(
-            backup.get("restore_max_age_days", 30), "host.backup.restore_max_age_days"
-        ),
-        http_port_start=start,
-        http_port_end=end,
+        raise ConfigError("host.http_ports must be an ordered unprivileged range")
+    return Host(
+        host_id,
+        domain,
+        data_root,
+        backup,
+        Routing(email, provider, traefik_image),
+        start,
+        end,
     )
 
 
-def _database(data: Any, index: int) -> DatabaseSource:
-    item = _mapping(data, f"databases[{index}]")
-    migration = {
-        "id",
-        "env",
-        "engine",
-        "container",
-        "project",
-        "data",
-        "domain",
-        "durable",
-        "current",
-        "target",
-        "backup",
-        "resources",
-        "secrets",
-        "settings",
-    }.intersection(item)
-    if migration:
-        name = item.get("name", f"index {index}")
-        field_name = sorted(migration)[0]
-        raise ConfigError(
-            f"database {name}: migration-only field {field_name}; use the concise name/type schema"
-        )
-    allowed = {
-        "name",
-        "type",
-        "mode",
-        "pooler",
-        "max_clients",
-        "pool_size",
-        "reserve_size",
-        "memory",
-        "threads",
-        "http",
-    }
-    _only(item, allowed, f"databases[{index}]")
-    name = _required_string(item, "name", f"databases[{index}]")
-    if not _NAME.fullmatch(name):
-        raise ConfigError(f"database {name}: name must be a safe lowercase identifier")
-    if _ENV.search(name) is None:
-        raise ConfigError(f"database {name}: name must end in -dev-N, -test-N, or -prod-N")
-    engine = _required_string(item, "type", f"database {name}")
-    if engine not in ENGINES:
-        raise ConfigError(f"database {name}: unsupported type {engine}")
-    mode = item.get("mode", "durable")
+def _postgres(value: Any, project: str) -> Postgres:
+    data = _mapping(value, f"projects.{project}.postgres")
+    _only(data, {"image", "pgbouncer"}, f"projects.{project}.postgres")
+    image = _engine_image(data, "image", "postgres", f"projects.{project}.postgres")
+    pool_data = data.get("pgbouncer", {})
+    if isinstance(pool_data, bool):
+        pool_data = {"enabled": pool_data}
+    pool = _mapping(pool_data, f"projects.{project}.postgres.pgbouncer")
+    _only(
+        pool,
+        {"enabled", "image", "max_clients", "pool_size", "reserve_size"},
+        f"projects.{project}.postgres.pgbouncer",
+    )
+    enabled = _bool(pool.get("enabled", True), f"projects.{project}.postgres.pgbouncer.enabled")
+    sidecar = pool.get("image", DEFAULT_IMAGES["pgbouncer"])
+    validate_source(sidecar, f"projects.{project}.postgres.pgbouncer.image")
+    return Postgres(
+        image,
+        PgBouncer(
+            enabled,
+            sidecar,
+            _positive_int(pool.get("max_clients", 100), "pgbouncer.max_clients"),
+            _positive_int(pool.get("pool_size", 20), "pgbouncer.pool_size"),
+            _positive_int(pool.get("reserve_size", 5), "pgbouncer.reserve_size"),
+        ),
+    )
+
+
+def _kv(value: Any, project: str) -> KV:
+    data = _mapping(value, f"projects.{project}.kv")
+    _only(data, {"engine", "image", "mode", "http", "memory", "threads"}, f"projects.{project}.kv")
+    engine = _required_string(data, "engine", f"projects.{project}.kv")
+    if engine not in {"redis", "dragonfly"}:
+        raise ConfigError(f"projects.{project}.kv.engine must be redis or dragonfly")
+    image = _engine_image(data, "image", engine, f"projects.{project}.kv")
+    mode = data.get("mode", "durable")
     if mode not in {"durable", "cache"}:
-        raise ConfigError(f"database {name}: mode must be durable or cache")
-    if engine == "postgres" and mode != "durable":
-        raise ConfigError(f"database {name}: cache mode is only valid for KV")
-
-    pool_fields = {"pooler", "max_clients", "pool_size", "reserve_size"}.intersection(item)
-    if engine != "postgres" and pool_fields:
-        raise ConfigError(f"database {name}: pool settings are only valid for postgres")
-    dragonfly_fields = {"memory", "threads"}.intersection(item)
-    if engine != "dragonfly" and dragonfly_fields:
-        raise ConfigError(f"database {name}: memory and threads are only valid for dragonfly")
-    if engine == "postgres" and "http" in item:
-        raise ConfigError(f"database {name}: HTTP is only valid for KV")
-
-    pooler = _optional_bool(item, "pooler", f"database {name}")
-    http = _optional_bool(item, "http", f"database {name}")
-    memory = item.get("memory")
+        raise ConfigError(f"projects.{project}.kv.mode must be durable or cache")
+    memory = data.get("memory")
+    threads = data.get("threads")
+    if engine != "dragonfly" and (memory is not None or threads is not None):
+        raise ConfigError(f"projects.{project}.kv: memory and threads require dragonfly")
     if memory is not None and (not isinstance(memory, str) or not _MEMORY.fullmatch(memory)):
-        raise ConfigError(f"database {name}: memory must be a positive kb, mb, or gb value")
-    return DatabaseSource(
-        name=name,
-        type=engine,
-        mode=mode,
-        pooler=pooler,
-        max_clients=_optional_positive_int(item, "max_clients", f"database {name}"),
-        pool_size=_optional_positive_int(item, "pool_size", f"database {name}"),
-        reserve_size=_optional_positive_int(item, "reserve_size", f"database {name}"),
-        memory=memory,
-        threads=_optional_positive_int(item, "threads", f"database {name}"),
-        http=http,
+        raise ConfigError(f"projects.{project}.kv.memory must be a positive kb, mb, or gb value")
+    if threads is not None:
+        threads = _positive_int(threads, f"projects.{project}.kv.threads")
+    http_data = data.get("http", {})
+    if isinstance(http_data, bool):
+        http_data = {"enabled": http_data}
+    http = _mapping(http_data, f"projects.{project}.kv.http")
+    _only(http, {"enabled", "image", "connections", "domain"}, f"projects.{project}.kv.http")
+    enabled = _bool(http.get("enabled", True), f"projects.{project}.kv.http.enabled")
+    http_image = http.get("image", DEFAULT_IMAGES["http"])
+    validate_source(http_image, f"projects.{project}.kv.http.image")
+    domain = http.get("domain")
+    if domain is not None and (not isinstance(domain, str) or not _DOMAIN.fullmatch(domain)):
+        raise ConfigError(f"projects.{project}.kv.http.domain must be a valid domain")
+    return KV(
+        engine,
+        image,
+        mode,
+        HTTP(
+            enabled,
+            http_image,
+            _positive_int(http.get("connections", DEFAULT_HTTP_CONNECTIONS), "http.connections"),
+            domain,
+        ),
+        memory or ("256mb" if engine == "dragonfly" else None),
+        threads or (1 if engine == "dragonfly" else None),
     )
 
 
-def _validate_sources(source: HostSource) -> None:
-    seen_identity: set[tuple[str, str]] = set()
-    seen_container: dict[str, str] = {}
-    seen_project: dict[tuple[str, str], str] = {}
-    seen_domain: dict[str, str] = {}
-    for item in source.databases:
-        identity = (item.type, item.name)
-        if identity in seen_identity:
-            raise ConfigError(f"database {item.selector}: duplicate typed identity")
-        seen_identity.add(identity)
-        group = "postgres" if item.type == "postgres" else "kv"
-        container = f"{item.name}-{'postgres' if group == 'postgres' else 'redis'}-1"
-        project = (group, item.name)
-        domain = f"{item.name}.{group}-{source.id}.{source.domain}"
-        for value, seen, label in (
-            (container, seen_container, "container"),
-            (project, seen_project, "project"),
-            (domain, seen_domain, "domain"),
-        ):
-            if value in seen:
-                raise ConfigError(
-                    f"database {item.selector}: derived {label} collides with {seen[value]}"
-                )
-            seen[value] = item.selector
+def _engine_image(data: dict[str, Any], key: str, engine: str, name: str) -> str:
+    image = _required_string(data, key, name)
+    validate_source(image, f"{name}.{key}")
+    if image_major(image) is None:
+        raise ConfigError(f"{name}.{key} tag must start with a positive {engine} major version")
+    return image
 
 
-def _normalize_database(
-    source: HostSource,
-    item: DatabaseSource,
-    lock: HostLock,
-    images: dict[str, str],
-) -> Instance:
-    group = "postgres" if item.type == "postgres" else "kv"
-    env_match = _ENV.search(item.name)
-    assert env_match is not None
-    enabled_http = item.type in KV_ENGINES and item.http is not False
-    durable = item.mode == "durable"
-    if item.type == "postgres":
-        pooler = item.pooler is not False
-        settings: dict[str, Any] = {
-            "user": "default",
-            "database": "postgres",
-            "pgbouncer": pooler,
-            "max_clients": item.max_clients or 100,
-            "pool_size": item.pool_size or 20,
-            "reserve_size": item.reserve_size or 5,
-        }
-        resources = {"database": "unlimited"}
-        if pooler:
-            resources["pgbouncer"] = "unlimited"
-        http = None
-    else:
-        if item.type == "dragonfly":
-            settings = {
-                "threads": item.threads or 1,
-                "maxmemory": item.memory or "256mb",
-                "cache": item.mode == "cache",
-            }
-        else:
-            settings = {"cache": True} if item.mode == "cache" else {}
-        resources = {"database": "unlimited"}
-        if enabled_http:
-            resources["http"] = "unlimited"
-        http = {
-            "enabled": enabled_http,
-            "port": lock.http_ports.get(item.selector),
-            "domain": f"{item.name}.kv-{source.id}.{source.domain}",
-            "image": images["http"],
-            "max_connections": DEFAULT_HTTP_CONNECTIONS,
-        }
-        if enabled_http:
-            http["token"] = f"op://{source.vault}/{item.name}-kv/http-token"
-    suffix = "postgres" if group == "postgres" else "redis"
-    return Instance(
-        id=item.name,
-        env=env_match.group(1),
-        engine=item.type,
-        image=images[item.type],
-        port=5432 if item.type == "postgres" else 6379,
-        container=f"{item.name}-{suffix}-1",
-        project=item.name,
-        data=source.data_root / group / item.name / "data",
-        domain=f"{item.name}.{group}-{source.id}.{source.domain}",
-        durable=durable,
-        backup={"enabled": durable},
-        resources=resources,
-        secrets={"password": f"op://{source.vault}/{item.name}-{group}/password"},
-        settings=settings,
-        http=http,
-    )
-
-
-def _lock_errors(source: HostSource, lock: HostLock) -> list[str]:
-    errors = []
-    if lock.host != source.id:
-        errors.append(f"lock host {lock.host} does not match {source.id}")
-    if (lock.version, lock.os, lock.architecture) != (LOCK_VERSION, LOCK_OS, LOCK_ARCH):
-        errors.append("lock version or platform is incompatible")
-    if set(lock.images) != IMAGE_KEYS:
-        errors.append("lock images are incomplete")
-    else:
-        for name in sorted(IMAGE_KEYS):
-            if lock.images[name].source != source.images[name]:
-                errors.append(f"image {name} source changed; refresh host.lock.json")
-            source_digest = _source_image_digest(source.images[name], f"host.images.{name}")
-            if source_digest is not None and lock.images[name].digest != source_digest:
-                errors.append(f"image {name} digest changed; refresh host.lock.json")
-    expected = {
-        item.selector
-        for item in source.databases
-        if item.type in KV_ENGINES and item.http is not False
+def _machine_state(value: Any) -> MachineState:
+    data = _mapping(value, "machine state")
+    _only(data, {"version", "host", "tool_version", "images", "roles"}, "machine state")
+    version = data.get("version")
+    if version != STATE_VERSION:
+        raise ConfigError(f"unsupported machine state version: {version!r}")
+    host = _required_string(data, "host", "machine state")
+    images = {
+        name: _image_state(item, f"machine state.images.{name}")
+        for name, item in _mapping(data.get("images", {}), "machine state.images").items()
     }
-    missing = expected - lock.http_ports.keys()
-    stale = lock.http_ports.keys() - expected
-    if missing:
-        errors.append("missing HTTP ports for " + ", ".join(sorted(missing)))
-    if stale:
-        errors.append("stale HTTP ports for " + ", ".join(sorted(stale)))
-    for selector, port in lock.http_ports.items():
-        if not source.http_port_start <= port <= source.http_port_end:
-            errors.append(f"HTTP port for {selector} is outside the configured range")
-    return errors
+    roles = {}
+    for identity, raw in _mapping(data.get("roles", {}), "machine state.roles").items():
+        role = _mapping(raw, f"machine state.roles.{identity}")
+        _only(
+            role,
+            {"engine", "images", "http_port", "compose_hash", "installed", "operations"},
+            f"machine state.roles.{identity}",
+        )
+        selector = _selector(identity)
+        engine = _required_string(role, "engine", f"machine state.roles.{identity}")
+        if (selector[1] == "postgres" and engine != "postgres") or (
+            selector[1] == "kv" and engine not in {"redis", "dragonfly"}
+        ):
+            raise ConfigError(f"machine state role engine does not match {identity}")
+        port = role.get("http_port")
+        if port is not None and (type(port) is not int or not 1024 <= port <= 65535):
+            raise ConfigError(f"machine state has invalid HTTP port for {identity}")
+        operations = _mapping(
+            role.get("operations", {}), f"machine state.roles.{identity}.operations"
+        )
+        roles[identity] = RoleState(
+            engine,
+            {
+                name: _image_state(item, f"machine state.roles.{identity}.images.{name}")
+                for name, item in _mapping(
+                    role.get("images", {}), f"machine state.roles.{identity}.images"
+                ).items()
+            },
+            port,
+            _optional_string(role.get("compose_hash"), f"machine state {identity} compose_hash"),
+            _bool(role.get("installed", False), f"machine state {identity} installed"),
+            dict(operations),
+        )
+    tool_version = _optional_string(data.get("tool_version"), "machine state.tool_version")
+    return MachineState(version, host, images, roles, tool_version)
 
 
-def _load_runtime(root: Path) -> Config:
-    try:
-        host_data = json.loads((root / "host.json").read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigError("invalid runtime host.json") from exc
-    host_wrapper = _mapping(host_data, "runtime host")
-    _only(host_wrapper, {"host"}, "runtime host")
-    host = Host.from_dict(_mapping(host_wrapper.get("host"), "runtime host.host"))
-    instance_dir = root / "instances"
-    if not instance_dir.is_dir():
-        raise ConfigError("missing runtime instances directory")
-    instances = []
-    for path in sorted(instance_dir.glob("*.json")):
-        try:
-            raw = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ConfigError(f"invalid runtime instance file: {path.name}") from exc
-        wrapper = _mapping(raw, f"runtime {path.name}")
-        _only(wrapper, {"instance"}, f"runtime {path.name}")
-        instances.append(Instance.from_dict(_mapping(wrapper.get("instance"), path.name)))
-    config = Config(host, tuple(sorted(instances, key=lambda item: item.selector)))
-    require_valid(config)
-    return config
+def _image_state(value: Any, name: str) -> ImageState:
+    data = _mapping(value, name)
+    _only(data, {"source", "digest", "major"}, name)
+    source = _required_string(data, "source", name)
+    validate_source(source, f"{name}.source")
+    digest = _required_string(data, "digest", name)
+    if source_digest(f"image@{digest}", f"{name}.digest") != digest:
+        raise ConfigError(f"{name}.digest is invalid")
+    major = data.get("major")
+    if major is not None and (type(major) is not int or major < 1):
+        raise ConfigError(f"{name}.major must be a positive integer or null")
+    return ImageState(source, digest, major)
 
 
-def _host_dict(host: Host, *, runtime: bool = False) -> dict[str, Any]:
-    data = dict(vars(host))
-    for key in ("data_root", "config_dir", "state_dir", "backup_dir", "lock_dir"):
-        data[key] = str(data[key])
-    if runtime:
-        data["runtime"] = True
-        data["secrets"] = {
-            "restic_password": str(host.config_dir / "secrets/restic_password"),
-            "rclone_config": str(host.state_dir / "rclone/rclone.conf"),
-        }
-    return data
+def _image_state_dict(value: ImageState) -> dict[str, Any]:
+    return {"source": value.source, "digest": value.digest, "major": value.major}
 
 
-def _instance_dict(
-    instance: Instance, host: Host | None = None, *, runtime: bool = False
-) -> dict[str, Any]:
-    data = dict(vars(instance))
-    data["data"] = str(instance.data)
-    if runtime:
-        assert host is not None
-        secret_dir = host.config_dir / "secrets"
-        data["secrets"] = {"password": str(secret_dir / f"{instance.group}-{instance.id}.password")}
-        if instance.http is not None:
-            data["http"] = dict(instance.http)
-            if instance.http.get("enabled"):
-                data["http"]["token"] = str(secret_dir / f"kv-{instance.id}-http.token")
-            else:
-                data["http"].pop("token", None)
-    return data
+class _UniqueLoader(yaml.SafeLoader):
+    pass
 
 
-def _manifest_items(data: Any) -> list[dict[str, Any]]:
-    if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
-    if not isinstance(data, dict):
-        return []
-    manifests = data.get("manifests")
-    if isinstance(manifests, list):
-        return [item for item in manifests if isinstance(item, dict)]
-    return [data]
+def _construct_mapping(loader: _UniqueLoader, node: yaml.MappingNode, deep: bool = False) -> dict:
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in result:
+            raise ConfigError(f"duplicate YAML key: {key}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
 
 
-def _locked_image(source: str, digest: str) -> str:
-    return f"{source.rsplit('@', 1)[0]}@{digest}"
-
-
-def _source_image_digest(image: str, name: str) -> str | None:
-    if any(character.isspace() for character in image):
-        raise ConfigError(f"{name} must use an explicit non-latest tag or sha256 digest")
-    base = image
-    digest = None
-    if "@" in image:
-        if image.count("@") != 1:
-            raise ConfigError(f"{name} must use a valid sha256 digest reference")
-        base, digest = image.rsplit("@", 1)
-        if not base or not _DIGEST.fullmatch(digest):
-            raise ConfigError(f"{name} must use a valid sha256 digest reference")
-    leaf = base.rsplit("/", 1)[-1]
-    tag = leaf.rsplit(":", 1)[1] if ":" in leaf else None
-    if tag is not None and tag.lower() == "latest":
-        raise ConfigError(f"{name} must not use the latest tag")
-    if digest is None and not tag:
-        raise ConfigError(f"{name} must use an explicit non-latest tag or sha256 digest")
-    return digest
-
-
-def image_major(image: str) -> int | None:
-    source = image.split("@", 1)[0]
-    leaf = source.rsplit("/", 1)[-1]
-    if ":" not in leaf:
-        return None
-    tag = leaf.rsplit(":", 1)[1]
-    match = re.match(r"v?([0-9]+)(?:[._-]|$)", tag)
-    if match is None:
-        return None
-    major = int(match.group(1))
-    return major if major > 0 else None
-
-
-def _source_path(path: Path) -> Path:
-    if path.is_dir():
-        source = path / "host.yml"
-        if not source.is_file():
-            raise ConfigError("missing source config file: host.yml")
-        return source
-    if not path.is_file():
-        raise ConfigError(f"missing source config file: {path.name}")
-    if path.suffix not in {".yml", ".yaml"}:
-        raise ConfigError("source config must be YAML")
-    return path
+_UniqueLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping,
+)
 
 
 def _read_yaml(path: Path) -> Any:
     try:
-        import yaml
-    except ImportError as exc:
-        raise ConfigError("PyYAML is required to read source config") from exc
-    try:
-        return yaml.safe_load(path.read_text())
+        return yaml.load(path.read_text(), Loader=_UniqueLoader)
+    except ConfigError:
+        raise
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError(f"invalid source YAML: {path.name}") from exc
-
-
-def _dump_yaml(data: Any) -> str:
-    try:
-        import yaml
-    except ImportError as exc:
-        raise ConfigError("PyYAML is required to write source config") from exc
-    return yaml.safe_dump(data, sort_keys=False)
 
 
 def _mapping(value: Any, name: str) -> dict[str, Any]:
@@ -1086,14 +909,9 @@ def _required_string(data: dict[str, Any], key: str, name: str) -> str:
     return value
 
 
-def _runtime_string(data: dict[str, Any], key: str, name: str) -> str:
-    return _required_string(data, key, name)
-
-
-def _runtime_int(data: dict[str, Any], key: str, name: str) -> int:
-    value = data.get(key)
-    if type(value) is not int:
-        raise ConfigError(f"{name}.{key} must be an integer")
+def _optional_string(value: Any, name: str) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise ConfigError(f"{name} must be a string or null")
     return value
 
 
@@ -1103,18 +921,15 @@ def _positive_int(value: Any, name: str) -> int:
     return value
 
 
-def _optional_positive_int(data: dict[str, Any], key: str, name: str) -> int | None:
-    if key not in data:
-        return None
-    return _positive_int(data[key], f"{name}.{key}")
+def _nonnegative_int(value: Any, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ConfigError(f"{name} must be a non-negative integer")
+    return value
 
 
-def _optional_bool(data: dict[str, Any], key: str, name: str) -> bool | None:
-    if key not in data:
-        return None
-    value = data[key]
+def _bool(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
-        raise ConfigError(f"{name}.{key} must be a boolean")
+        raise ConfigError(f"{name} must be a boolean")
     return value
 
 
@@ -1125,101 +940,33 @@ def _string_dict(value: Any, name: str) -> dict[str, str]:
     return dict(data)
 
 
-def _int_dict(value: Any, name: str) -> dict[str, int]:
-    data = _mapping(value, name)
-    if not all(type(item) is int for item in data.values()):
-        raise ConfigError(f"{name} values must be integers")
-    return dict(data)
+def _validate_project_id(value: str) -> None:
+    if not isinstance(value, str) or not _NAME.fullmatch(value):
+        raise ConfigError(f"project {value}: must be a safe lowercase name")
+    if not _ENV.search(value):
+        raise ConfigError(f"project {value}: must end in -dev-N, -test-N, or -prod-N")
 
 
-def _op_segment(data: dict[str, Any], key: str) -> str:
-    value = _required_string(data, key, "host.one_password")
-    if "/" in value or "\n" in value or value.startswith("op://"):
-        raise ConfigError(f"host.one_password.{key} must be an item name, not a secret reference")
-    return value
-
-
-def _lock_selector(selector: str) -> None:
-    if not isinstance(selector, str) or "/" not in selector:
-        raise ConfigError("invalid host lock: malformed HTTP selector")
-    engine, name = selector.split("/", 1)
-    if engine not in KV_ENGINES or not _NAME.fullmatch(name):
-        raise ConfigError(f"invalid host lock: malformed HTTP selector {selector}")
+def _selector(value: str) -> tuple[str, str]:
+    if not isinstance(value, str) or value.count("/") != 1:
+        raise ConfigError(f"invalid database selector: {value}")
+    project, role = value.split("/", 1)
+    _validate_project_id(project)
+    if role not in {"postgres", "kv"}:
+        raise ConfigError(f"invalid database selector: {value}")
+    return project, role
 
 
 def _has_secret(value: Any) -> bool:
     if isinstance(value, dict):
         for key, item in value.items():
-            lowered = str(key).lower()
-            if any(word in lowered for word in ("password", "token", "secret")):
+            if any(word in str(key).lower() for word in _SECRET_WORDS):
                 return True
             if _has_secret(item):
                 return True
-    elif isinstance(value, list):
+    elif isinstance(value, (list, tuple)):
         return any(_has_secret(item) for item in value)
     elif isinstance(value, str):
-        return value.startswith("op://")
+        lowered = value.lower()
+        return lowered.startswith("op://") or "-----begin private key-----" in lowered
     return False
-
-
-def _unique(errors: list[str], seen: dict[Any, str], value: Any, name: str, label: str) -> None:
-    if value in seen:
-        errors.append(f"{name}: duplicate {label} with {seen[value]}")
-    else:
-        seen[value] = name
-
-
-def _check_locked_image(errors: list[str], name: str, image: str) -> None:
-    if "@" not in image or not _DIGEST.fullmatch(image.rsplit("@", 1)[-1]):
-        errors.append(f"{name}: image must use a locked sha256 digest")
-
-
-def _check_refs(errors: list[str], name: str, refs: dict[str, Any], host: Host) -> None:
-    for key, value in refs.items():
-        if host.runtime and _runtime_secret(host, value):
-            continue
-        if not host.runtime and isinstance(value, str) and value.startswith("op://"):
-            continue
-        if host.runtime:
-            errors.append(f"{name}: {key} must be a protected runtime path")
-        else:
-            errors.append(f"{name}: {key} must be an op:// reference")
-
-
-def _runtime_secret(host: Host, value: Any) -> bool:
-    if not isinstance(value, str) or not Path(value).is_absolute():
-        return False
-    path = Path(value)
-    roots = (host.config_dir / "secrets", host.state_dir / "rclone")
-    return any(path == root or root in path.parents for root in roots)
-
-
-def _check_http(
-    errors: list[str], seen: dict[str, dict[Any, str]], instance: Instance, host: Host
-) -> None:
-    assert instance.http is not None
-    http = instance.http
-    enabled = http.get("enabled")
-    if not isinstance(enabled, bool):
-        errors.append(f"{instance.selector}: HTTP enabled must be a boolean")
-        return
-    if not enabled:
-        if http.get("port") is not None:
-            errors.append(f"{instance.selector}: disabled HTTP must not allocate a port")
-        return
-    port = http.get("port")
-    if type(port) is not int or not host.http_port_start <= port <= host.http_port_end:
-        errors.append(f"{instance.selector}: invalid HTTP loopback port")
-    else:
-        _unique(errors, seen["http port"], port, instance.selector, "HTTP port")
-    domain = http.get("domain")
-    if not isinstance(domain, str) or not domain:
-        errors.append(f"{instance.selector}: invalid HTTP domain")
-    else:
-        _unique(errors, seen["http domain"], domain.lower(), instance.selector, "HTTP domain")
-        if domain.lower() != instance.domain.lower():
-            errors.append(f"{instance.selector}: HTTP domain must match the KV domain")
-    _check_locked_image(errors, f"{instance.selector} HTTP", str(http.get("image", "")))
-    _check_refs(errors, f"{instance.selector} HTTP", {"token": http.get("token")}, host)
-    if type(http.get("max_connections")) is not int or http["max_connections"] < 1:
-        errors.append(f"{instance.selector}: HTTP max_connections must be positive")

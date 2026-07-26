@@ -1,54 +1,39 @@
-# 1Password and secret output
+# Host-owned credentials
 
-## Controller authentication
+## Private files
 
-The complete controller workflow requires 1Password CLI authenticated through either:
+Credentials are generated and read on the authoritative host. Source YAML, machine-owned state,
+generated Compose, backup records, status, activity, logs, and errors remain secret-free.
 
-- A desktop-authenticated account that can read and write the configured vault.
-- A service account with `write_items` for that vault.
+Database files live under `/etc/evdb/secrets/<project>/<role>` with mode `0600`. Postgres receives a
+password file and PgBouncer users file. Redis receives a private configuration containing its
+password. Dragonfly receives private flags. HTTP-enabled KV receives a token and environment file.
+Restic and DNS provider credentials are separate private host files. Mutable rclone configuration
+under `/var/lib/evdb/rclone` is seeded only when absent so refreshed OAuth state survives setup and
+tool updates.
 
-1Password Connect supports the controller's `op read` credential path, so read-only credential
-resolution such as `evdb show` can use it. Connect cannot create or edit items. `evdb create` and
-any credential-creation path preflight write access and reject Connect-only authentication before
-changing source or the remote host. Use desktop authentication or a write-capable service account
-for normal operator work.
+Credential values never belong in command arguments. Subprocess errors and bounded logs redact
+known password, token, environment, and URL values.
 
-The host config stores only vault and system item names. Database item names are derived as
-`<name>-postgres` for Postgres and `<name>-kv` for Redis or Dragonfly. Every item has a concealed
-`password`; HTTP-enabled KV items also have a concealed `http-token`. The system item supplies
-concealed `restic-password` and `rclone-config` fields.
+## Deliberate terminal output
 
-Create is idempotent. Existing concealed values are reused and never rotated. Missing fields are
-generated and passed to `op item create` or `op item edit` through a JSON stdin template, never
-through process arguments.
+```sh
+evdb database info app-prod-01/postgres
+evdb database info app-prod-01/kv
+```
 
-## Deliberate show output
+`database info` deliberately prints complete credentials only to a terminal. Postgres includes a
+percent-encoded `postgresql://` URL with TLS requirements. KV includes a percent-encoded
+`rediss://` URL and, when HTTP is enabled, its intended HTTPS endpoint and current token. Missing
+or unsafe files cause the command to fail without partial credential output. The command has no
+JSON mode.
 
-**`evdb show <database>` always prints complete current credentials to the terminal on every
-successful run.** Postgres output includes a complete percent-encoded `postgresql://` URL. Redis
-and Dragonfly output includes a complete `rediss://` URL and, when HTTP is enabled, the current
-HTTP token. Treat terminal output, scrollback, recordings, and transcripts accordingly.
+All machine-readable output, especially `evdb status --json`, excludes passwords, tokens,
+credential-bearing URLs, secret paths with content, and DNS provider values.
 
-`show` obtains non-secret deployment facts over SSH, validates the complete response, then reads
-credentials directly from local 1Password. Credential values are never requested from the host or
-sent over SSH by `show`. If any required field is unavailable, it exits nonzero without printing a
-partial URL, endpoint, or token.
+## Deferred recovery policy
 
-No other command output displays credentials. Source YAML, generated locks, normalized runtime
-JSON, release files and manifests, state, backup and release histories, structured logs, errors,
-SSH arguments, and remote protocol output remain credential-free. Protected runtime files needed
-by services are separate from releases and are never normal command output.
-
-## Protected host files
-
-Confirmed apply resolves deployment values locally and transfers protected content through stdin
-with redaction. The host writes mode `0600` service files under `/etc/evanovation-db/secrets` and
-the mutable rclone config under `/var/lib/evanovation-db/rclone`.
-
-Postgres receives a password file through `POSTGRES_PASSWORD_FILE`; PgBouncer uses a private users
-file. Redis reads a private config with `requirepass`. Dragonfly reads a private flag file. HTTP
-sidecars use a private environment file. The rclone config is seeded only when absent so refreshed
-OAuth state survives apply.
-
-Never put resolved values in Git, source or lock files, tests, tickets, Compose JSON, release
-directories, or command arguments.
+Credential import for an existing host, rotation, external export or escrow, and total-host-loss
+password recovery are not general evdb workflows. They require separate operational design and the
+approved production migration. Local setup never treats checked-in references or development
+fixtures as production credentials.

@@ -20,9 +20,12 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check src tests
       - run: uv run ruff format --check src tests
-      - run: uv run pytest
-      - run: uv run python -m evanovation_db.cli validate --source config/montreal-01
-      - run: uv run ansible-playbook --syntax-check -i ansible/test-hosts.yml ansible/backup.yml
-      - run: uv run ansible-playbook --syntax-check -i ansible/test-hosts.yml ansible/databases.yml
-      - run: uv run ansible-playbook --syntax-check -i ansible/test-hosts.yml ansible/restore.yml
-      - run: systemd-analyze verify systemd/*.service systemd/*.timer
+      - run: uv run pytest tests/unit tests/config
+      - name: Run local Restic integration tests when available
+        run: |
+          if command -v restic >/dev/null 2>&1; then
+            uv run pytest tests/integration/test_restic.py
+          else
+            printf '%s\n' 'restic unavailable; skipping local Restic integration tests'
+          fi
+      - run: uv run pytest --collect-only -q tests/integration

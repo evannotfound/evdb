@@ -5,25 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "evanovation-db"
 version = "0.1.0"
-description = "Database backup, restore, and deployment tools for Evanovation"
+description = "Host-local database management for Evanovation"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["PyYAML>=6.0"]
 
 [dependency-groups]
 dev = [
-  "ansible-core>=2.17,<2.21",
   "pytest>=8.3",
-  "PyYAML>=6.0",
   "ruff>=0.12",
 ]
 
 [project.scripts]
-evdb = "evanovation_db.controller:main"
-evanovation-db = "evanovation_db.cli:main"
+evdb = "evanovation_db.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+evanovation_db = ["units/*.service", "units/*.timer"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --import-mode=importlib"

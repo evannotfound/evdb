@@ -1,381 +1,408 @@
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+import json
+from dataclasses import replace
+from datetime import datetime, timezone
 
-from evanovation_db import deployment, status
-from evanovation_db.config import Config, load_lock
-from evanovation_db.errors import CommandError
+from evanovation_db import compose, secrets, status
+from evanovation_db.config import resolve_state, write_state
 from evanovation_db.run import Result
 
-
-def test_assessment_reports_healthy_stale_stopped_drifted_and_pending(config):
-    current = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    selected = _selected(config, "postgres", "redis", "dragonfly")
-    active = _manifest(config, selected)
-    observed = _observed(config, active, selected, current)
-
-    healthy = status.assess(config, active, observed, now=current)
-
-    assert healthy["version"] == status.VERSION
-    assert healthy["healthy"] is True
-    assert {row["state"] for row in healthy["databases"]} == {"healthy"}
-
-    stale = _copy_observed(observed)
-    stale["databases"][0]["upload"]["time"] = (
-        current - timedelta(hours=config.host.backup_max_age_hours + 1)
-    ).isoformat()
-    assert _row(status.assess(config, active, stale, now=current), selected[0])["state"] == "stale"
-
-    stopped = _copy_observed(observed)
-    stopped["databases"][0]["container"].update({"state": "exited", "running": False})
-    stopped["databases"][0]["engine_check"] = {"ok": None, "error": None}
-    stopped_row = _row(status.assess(config, active, stopped, now=current), selected[0])
-    assert stopped_row["state"] == "stopped"
-
-    drifted = _copy_observed(observed)
-    drifted["databases"][0]["container"]["image"] = "postgres:manual@sha256:" + "f" * 64
-    row = _row(status.assess(config, active, drifted, now=current), selected[0])
-    assert row["state"] == "drifted"
-    assert row["deployment"]["state"] == "drifted"
-
-    wanted = _copy_manifest(active)
-    wanted["databases"][selected[0].selector]["config_hash"] = "pending"
-    row = _row(status.assess(config, wanted, observed, now=current), selected[0])
-    assert row["state"] == "pending"
-    assert row["healthy"] is True
-
-    planned = _copy_observed(observed)
-    wanted = _copy_manifest(active)
-    wanted_image = "postgres:17@sha256:" + "e" * 64
-    wanted["databases"][selected[0].selector]["image"] = wanted_image
-    planned["databases"][0]["container"]["image"] = wanted_image
-    row = _row(status.assess(config, wanted, planned, now=current), selected[0])
-    assert row["state"] == "pending"
-    assert row["deployment"]["state"] == "pending"
+DIGEST = "sha256:" + "a" * 64
 
 
-def test_operation_failure_does_not_replace_recent_success_facts(config):
-    current = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    selected = _selected(config, "postgres")
-    active = _manifest(config, selected)
-    observed = _observed(config, active, selected, current)
-    observed["databases"][0]["errors"] = {
-        "backup": {
-            "command": "backup",
-            "step": "upload",
-            "time": current.isoformat(),
-            "message": "upload failed",
+def _healthy(config, monkeypatch):
+    now = datetime.now(timezone.utc).isoformat()
+    state = resolve_state(config, resolver=lambda source: DIGEST)
+    roles = {}
+    services = {}
+    for target in config.databases:
+        operations = {
+            "backup": {"ok": True, "time": now},
+            "upload": {"ok": True, "time": now, "snapshot": "snapshot"},
+            "backup_test": {"ok": True, "time": now},
         }
-    }
-
-    row = status.assess(config, active, observed, now=current)["databases"][0]
-
-    assert row["state"] == "failed"
-    assert row["backup"]["state"] == "fresh"
-    assert row["backup"]["snapshot"] == "snapshot-test"
-    assert row["restore"]["state"] == "fresh"
-    assert row["errors"]["backup"]["message"] == "upload failed"
-
-
-def test_pending_new_database_is_not_stale_only_because_it_has_no_history(config):
-    current = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    instance = config.get("postgres", "test-dev-01")
-    wanted = _manifest(config, (instance,))
-    active = {**wanted, "databases": {}}
-    observed = _observed(config, active, (), current)
-
-    row = status.assess(config, wanted, observed, now=current)["databases"][0]
-
-    assert row["state"] == "pending"
-    assert row["backup"]["state"] == "n/a"
-    assert row["restore"]["state"] == "n/a"
-
-
-def test_host_low_disk_and_timer_state_are_unhealthy(config):
-    current = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    selected = _selected(config, "postgres")
-    active = _manifest(config, selected)
-    observed = _observed(config, active, selected, current)
-    observed["host"]["disks"]["backup"] = {
-        "free_gb": 1.0,
-        "minimum_gb": 5,
-        "ok": False,
-        "error": None,
-    }
-    observed["host"]["timers"] = {
-        "ok": False,
-        "required": [
-            {
-                "name": "evanovation-db-status.timer",
-                "active": False,
-                "enabled": True,
-                "ok": False,
-                "state": "inactive/enabled",
-            }
-        ],
-        "error": None,
-    }
-
-    result = status.assess(config, active, observed, now=current)
-    rendered = status.render(result)
-
-    assert result["healthy"] is False
-    assert "backup disk has 1.0 GiB free" in rendered
-    assert "timer evanovation-db-status.timer is inactive/enabled" in rendered
-
-
-def test_remote_checks_each_engine_and_continues_after_one_timeout(config, monkeypatch):
-    selected = _selected(config, "postgres", "redis", "dragonfly")
-    current = Config(config.host, selected)
-    active = _manifest(current, selected)
-    calls = []
-
-    monkeypatch.setattr(status, "_release", lambda value: (active["id"], active, True, None))
+        roles[target.identity] = replace(
+            state.roles[target.identity], installed=True, operations=operations
+        )
+    state = replace(state, roles=roles)
+    write_state(config, state)
+    for target in config.databases:
+        data = compose.database(config, target, state)
+        compose.write(target.compose, data)
+        services.update(compose.expected_services(data, target))
+    traefik = compose.traefik(config, state)
+    compose.write(config.paths.traefik / "compose.yaml", traefik)
+    traefik_service = traefik["services"]["traefik"]
+    acme = config.paths.traefik / "acme/acme.json"
+    acme.parent.mkdir(parents=True)
+    acme.write_text("{}\n")
+    acme.chmod(0o600)
     monkeypatch.setattr(
         status,
-        "_disk",
-        lambda path, minimum: {"free_gb": 10.0, "minimum_gb": minimum, "ok": True, "error": None},
-    )
-    monkeypatch.setattr(
-        status,
-        "_timers",
-        lambda value: {"ok": True, "required": [], "error": None},
-    )
-    monkeypatch.setattr(
-        status.deployment,
-        "infrastructure_state",
-        lambda value, manifest: _infrastructure(manifest),
+        "run",
+        lambda args, **kwargs: _run(args),
     )
 
-    def container(value, instance, *, timeout):
-        calls.append(("docker", instance.engine, timeout))
-        if instance.engine == "postgres":
-            raise CommandError("command timed out after 10s")
-        return _container(instance.image)
-
-    def engine(value, instance, *, timeout):
-        calls.append(("engine", instance.engine, timeout))
-        return True
-
-    monkeypatch.setattr(status.details, "container", container)
-    monkeypatch.setattr(status.deployment, "engine_healthy", engine)
-    monkeypatch.setattr(
-        status.deployment,
-        "database_state",
-        lambda value, database: {
-            "services": {
-                name: {
-                    "running": True,
-                    "healthy": True if service["health"] == "docker" else None,
-                    "image": service["image"],
-                    "service_hash": database["service_hash"],
-                }
-                for name, service in database["services"].items()
-            }
-        },
-    )
-
-    result = status.remote(current)
-
-    assert len(result["databases"]) == 3
-    assert result["databases"][0]["error"] == "command timed out after 10s"
-    assert {item[1] for item in calls if item[0] == "engine"} == {"redis", "dragonfly"}
-
-
-def test_required_timer_check_parses_active_and_enabled_independently(config, monkeypatch):
-    current = Config(config.host, _selected(config, "postgres"))
-
-    def fake_run(args, **kwargs):
-        names = [item for item in args if item.endswith(".timer")]
-        blocks = []
-        for index, name in enumerate(names):
-            blocks.append(
-                f"Id={name}\nActiveState={'inactive' if index == 0 else 'active'}\n"
-                "UnitFileState=enabled\n"
-            )
-        return Result(tuple(args), 0, "\n".join(blocks), "")
-
-    monkeypatch.setattr(status, "run", fake_run)
-
-    result = status._timers(current)
-
-    assert result["ok"] is False
-    assert any(item["name"].startswith("evanovation-db-backup@") for item in result["required"])
-    assert result["required"][0]["active"] is False
-    assert result["required"][0]["enabled"] is True
-
-
-def test_unreachable_status_is_versioned_and_secret_free(config):
-    result = status.unreachable(
-        config, CommandError("connection refused"), selector="postgres/test-dev-01"
-    )
-
-    assert result["version"] == status.VERSION
-    assert result["healthy"] is False
-    assert result["host"]["ssh"] == {"reachable": False, "error": "connection refused"}
-    assert result["databases"][0]["state"] == "failed"
-    assert "op://" not in str(result)
-
-
-def test_status_reports_retained_prior_data_without_marking_it_unhealthy(config):
-    current = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    selected = _selected(config, "redis")
-    active = _manifest(config, selected)
-    observed = _observed(config, active, selected, current)
-    retained = str(selected[0].data.with_name("data.retained-restore"))
-    observed["databases"][0]["retained"] = [retained]
-
-    result = status.assess(config, active, observed, now=current)
-
-    assert result["healthy"] is True
-    assert result["databases"][0]["retained_data"] == [retained]
-    assert f"RETAINED: {retained}" in status.render(result)
-
-
-def test_status_reports_same_image_with_wrong_or_missing_contract_hash_as_drift(config):
-    current = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    selected = _selected(config, "postgres")
-    active = _manifest(config, selected)
-    observed = _observed(config, active, selected, current)
-
-    observed["databases"][0]["container"]["service_hash"] = None
-    row = status.assess(config, active, observed, now=current)["databases"][0]
-    assert row["state"] == "drifted"
-    assert "service contract" in row["details"][0]
-
-    observed = _observed(config, active, selected, current)
-    observed["infrastructure"]["traefik"]["service_hash"] = "wrong"
-    result = status.assess(config, active, observed, now=current)
-    assert result["host"]["infrastructure"]["state"] == "drifted"
-    assert result["healthy"] is False
-
-
-def test_status_blocks_unhealthy_http_and_wrong_pgbouncer_contract(config):
-    current = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    selected = _selected(config, "postgres", "redis")
-    active = _manifest(config, selected)
-    observed = _observed(config, active, selected, current)
-
-    postgres = observed["databases"][0]
-    pooler = next(
-        name
-        for name, item in active["databases"][selected[0].selector]["services"].items()
-        if item["health"] == "docker"
-    )
-    postgres["services"][pooler]["service_hash"] = "wrong"
-    redis = observed["databases"][1]
-    http = next(
-        name
-        for name, item in active["databases"][selected[1].selector]["services"].items()
-        if item["health"] == "docker"
-    )
-    redis["services"][http]["healthy"] = False
-
-    result = status.assess(config, active, observed, now=current)
-
-    postgres_row = _row(result, selected[0])
-    redis_row = _row(result, selected[1])
-    assert postgres_row["deployment"]["state"] == "drifted"
-    assert any("sidecar" in detail for detail in postgres_row["details"])
-    assert redis_row["state"] == "failed"
-    assert redis_row["deployment"]["state"] == "drifted"
-
-
-def _selected(config, *engines):
-    return tuple(
-        next(item for item in config.instances if item.engine == engine) for engine in engines
-    )
-
-
-def _manifest(config, instances):
-    root = Path(__file__).parents[2]
-    lock = load_lock(root / "config/montreal-01/host.lock.json")
-    return deployment.build(Config(config.host, tuple(instances)), lock, "a" * 64).manifest
-
-
-def _observed(config, manifest, instances, current):
-    return {
-        "version": status.VERSION,
-        "host": {
-            "id": config.host.id,
-            "active_release": manifest["id"],
-            "release_consistent": True,
-            "release_error": None,
-            "disks": {
-                name: {"free_gb": 20.0, "minimum_gb": 5, "ok": True, "error": None}
-                for name in ("data", "backup")
-            },
-            "timers": {"ok": True, "required": [], "error": None},
-        },
-        "manifest": manifest,
-        "infrastructure": _infrastructure(manifest),
-        "databases": [
-            _facts(item, current, manifest["databases"][item.selector]) for item in instances
-        ],
-    }
-
-
-def _facts(instance, current, manifest):
-    return {
-        "selector": instance.selector,
-        "engine": instance.engine,
-        "durable": instance.durable,
-        "container": _container(instance.image, manifest["service_hash"]),
-        "services": {
-            name: {
+    def docker_state(name, **kwargs):
+        if name == compose.TRAEFIK_CONTAINER:
+            return {
                 "running": True,
-                "healthy": True if service["health"] == "docker" else None,
-                "image": service["image"],
-                "service_hash": manifest["service_hash"],
+                "healthy": True,
+                "image": traefik_service["image"],
+                "labels": traefik_service["labels"],
             }
-            for name, service in manifest["services"].items()
-        },
-        "engine_check": {"ok": True, "error": None},
-        "retained": [],
-        "backup": {"time": current.isoformat()} if instance.durable else None,
-        "upload": {"ok": True, "time": current.isoformat(), "snapshot": "snapshot-test"}
-        if instance.durable
-        else None,
-        "restore": {"ok": True, "time": current.isoformat(), "backup": "backup-test"}
-        if instance.durable
-        else None,
-        "errors": {},
-        "error": None,
-    }
-
-
-def _container(image, service_hash="service-contract"):
-    return {
-        "state": "running",
-        "running": True,
-        "health": "healthy",
-        "image": image,
-        "image_id": "sha256:" + "1" * 64,
-        "service_hash": service_hash,
-    }
-
-
-def _infrastructure(manifest):
-    traefik = manifest["infrastructure"]["traefik"]
-    return {
-        "network": {"exists": True},
-        "traefik": {
+        expected = next(item for item in services.values() if item["container"] == name)
+        return {
             "running": True,
             "healthy": True,
-            "image": traefik["image"],
-            "service_hash": traefik["service_hash"],
+            "image": expected["image"],
+            "labels": {compose.CONTRACT_LABEL: expected["contract"]},
+        }
+
+    monkeypatch.setattr(status.docker, "state", docker_state)
+    monkeypatch.setattr(status.postgres, "health", lambda *args, **kwargs: True)
+    monkeypatch.setattr(status.redis, "health", lambda *args, **kwargs: True)
+    monkeypatch.setattr(status.dragonfly, "health", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        status.secrets,
+        "credentials",
+        lambda *args, **kwargs: secrets.Credentials("private", "token"),
+    )
+    return state
+
+
+def _run(args):
+    if args[:3] == ["docker", "network", "inspect"]:
+        return Result(
+            tuple(args),
+            0,
+            json.dumps([{"Labels": {compose.NETWORK_LABEL: "true"}}]),
+            "",
+        )
+    if args[:3] == ["ss", "-H", "-ltn"]:
+        text = "LISTEN 0 10 0.0.0.0:5432 0.0.0.0:*\nLISTEN 0 10 0.0.0.0:6379 0.0.0.0:*\n"
+        return Result(tuple(args), 0, text, "")
+    if args[:2] == ["systemctl", "show"]:
+        text = "\n\n".join(
+            f"Id={name}\nLoadState=loaded\nUnitFileState=enabled\nActiveState=active"
+            for name in args[2:-1]
+        )
+        return Result(tuple(args), 0, text + "\n", "")
+    return Result(tuple(args), 0, "", "")
+
+
+def test_status_document_is_versioned_keyed_and_secret_free(config, monkeypatch):
+    _healthy(config, monkeypatch)
+
+    value = status.collect(config)
+    parsed = json.loads(status.dumps(value))
+
+    assert value["healthy"]
+    assert parsed["version"] == status.VERSION
+    assert set(parsed) == {"version", "healthy", "host", "databases", "errors"}
+    assert set(parsed["databases"]) == {item.identity for item in config.databases}
+    assert parsed["databases"]["app-test-01/kv"]["engine"] == "redis"
+    text = json.dumps(parsed).lower()
+    assert "private" not in text and "token" not in text and "password" not in text
+
+
+def test_human_status_is_project_role_focused(config, monkeypatch):
+    _healthy(config, monkeypatch)
+    text = status.render(status.collect(config))
+
+    assert "app-test-01/postgres" in text
+    assert "app-test-01/kv" in text
+    assert "release" not in text.lower()
+    assert "desired" not in text.lower()
+
+
+def test_human_status_includes_recovery_summaries_and_current_failure(config, monkeypatch):
+    state = _healthy(config, monkeypatch)
+    target = config.select("app-test-01/postgres")
+    role = state.roles[target.identity]
+    operations = {
+        **role.operations,
+        "backup": {
+            "ok": True,
+            "backup": "local-20260726",
+            "time": "2026-07-26T01:00:00+00:00",
+        },
+        "upload": {
+            "ok": True,
+            "snapshot": "snapshot-abcd",
+            "time": "2026-07-26T01:05:00+00:00",
+        },
+        "backup_test": {
+            "ok": True,
+            "backup": "local-20260726",
+            "time": "2026-07-26T02:00:00+00:00",
+        },
+        "errors": {
+            "backup": {
+                "time": "2026-07-26T03:00:00+00:00",
+                "message": "upload retry failed",
+            }
         },
     }
+    write_state(
+        config,
+        replace(
+            state,
+            roles={**state.roles, target.identity: replace(role, operations=operations)},
+        ),
+    )
+
+    text = status.render(status.collect(config, target))
+
+    assert "LOCAL" in text and "UPLOAD" in text and "TEST" in text and "ERROR" in text
+    assert "local-20260726" in text
+    assert "snapshot-abcd" in text
+    assert "ok:local-2026~" in text
+    assert "upload retry failed" in text
 
 
-def _copy_observed(value):
-    import copy
+def test_one_engine_failure_does_not_hide_other_database(config, monkeypatch):
+    _healthy(config, monkeypatch)
+    monkeypatch.setattr(status.redis, "health", lambda *args, **kwargs: False)
 
-    return copy.deepcopy(value)
+    value = status.collect(config)
+
+    assert not value["healthy"]
+    assert value["databases"]["app-test-01/kv"]["health"] == "unhealthy"
+    assert value["databases"]["app-test-01/postgres"]["health"] == "healthy"
 
 
-def _copy_manifest(value):
-    return _copy_observed(value)
+def test_generated_compose_drift_is_reported_without_rewrite(config, monkeypatch):
+    _healthy(config, monkeypatch)
+    target = config.select("app-test-01/postgres")
+    target.compose.write_text(target.compose.read_text() + "# changed\n")
+    before = target.compose.read_bytes()
+
+    value = status.collect(config, target)
+
+    assert not value["healthy"]
+    assert any(item["code"] == "generated_changed" for item in value["errors"])
+    assert target.compose.read_bytes() == before
 
 
-def _row(result, instance):
-    return next(item for item in result["databases"] if item["selector"] == instance.selector)
+def test_stale_backup_and_latest_failure_are_separate(config, monkeypatch):
+    state = _healthy(config, monkeypatch)
+    target = config.select("app-test-01/postgres")
+    role = state.roles[target.identity]
+    operations = {
+        **role.operations,
+        "upload": {"ok": True, "time": "2020-01-01T00:00:00+00:00"},
+        "backup_test": {"ok": True, "time": "2020-01-01T00:00:00+00:00"},
+        "errors": {"backup": {"time": "2026-01-01T00:00:00+00:00", "message": "upload failed"}},
+    }
+    state = replace(
+        state,
+        roles={**state.roles, target.identity: replace(role, operations=operations)},
+    )
+    write_state(config, state)
+
+    value = status.collect(config, target)
+    codes = {item["code"] for item in value["errors"]}
+
+    assert {"backup_stale", "backup_test_stale", "operation_failed"}.issubset(codes)
+
+
+def test_failed_backup_test_is_operation_failure_and_stale(config, monkeypatch):
+    state = _healthy(config, monkeypatch)
+    target = config.select("app-test-01/postgres")
+    role = state.roles[target.identity]
+    operations = {
+        **role.operations,
+        "backup_test": {
+            "ok": False,
+            "time": datetime.now(timezone.utc).isoformat(),
+            "error": "verification failed " + "x" * 800,
+        },
+    }
+    write_state(
+        config,
+        replace(
+            state,
+            roles={**state.roles, target.identity: replace(role, operations=operations)},
+        ),
+    )
+
+    value = status.collect(config, target)
+    codes = [item["code"] for item in value["errors"]]
+    item = value["databases"][target.identity]
+
+    assert "backup_test_stale" in codes
+    assert codes.count("operation_failed") == 1
+    assert item["error"].startswith("verification failed")
+    assert len(item["error"]) == 500
+
+
+def test_transaction_residue_marks_host_unhealthy(config, monkeypatch):
+    _healthy(config, monkeypatch)
+    transaction = config.paths.state / "transactions/incomplete"
+    transaction.mkdir(parents=True)
+    (transaction / "transaction.json").write_text("{}\n")
+
+    value = status.collect(config)
+
+    assert not value["host"]["healthy"]
+    assert value["host"]["transaction"] == str(transaction)
+
+
+def test_error_messages_are_bounded(config, monkeypatch):
+    _healthy(config, monkeypatch)
+    monkeypatch.setattr(
+        status,
+        "_database",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("x" * 1000)),
+    )
+
+    value = status.collect(config)
+
+    assert all(len(item["message"]) <= 500 for item in value["errors"])
+
+
+def test_source_and_resolved_image_mismatch_is_reported(config, monkeypatch):
+    state = _healthy(config, monkeypatch)
+    target = config.select("app-test-01/kv")
+    role = state.roles[target.identity]
+    primary = replace(role.images["primary"], source="redis:7.2.4")
+    state = replace(
+        state,
+        roles={
+            **state.roles,
+            target.identity: replace(role, images={**role.images, "primary": primary}),
+        },
+    )
+    write_state(config, state)
+
+    value = status.collect(config, target)
+
+    assert not value["healthy"]
+    assert not value["databases"][target.identity]["configuration_match"]
+    assert any(item["code"] == "image_source_mismatch" for item in value["errors"])
+
+
+def test_orphan_installed_role_marks_host_unhealthy(config, monkeypatch):
+    state = _healthy(config, monkeypatch)
+    orphan = replace(state.roles["app-test-01/kv"], installed=True)
+    state = replace(state, roles={**state.roles, "old-prod-01/kv": orphan})
+    write_state(config, state)
+
+    value = status.collect(config)
+
+    assert not value["host"]["healthy"]
+    assert value["host"]["configuration"]["orphans"] == ["old-prod-01/kv"]
+    assert any(item["code"] == "orphan_installed" for item in value["errors"])
+
+
+def test_uninstalled_role_is_not_reported_running(config, monkeypatch):
+    state = _healthy(config, monkeypatch)
+    target = config.select("app-test-01/postgres")
+    state = replace(
+        state,
+        roles={
+            **state.roles,
+            target.identity: replace(state.roles[target.identity], installed=False),
+        },
+    )
+    write_state(config, state)
+
+    item = status.collect(config, target)["databases"][target.identity]
+
+    assert not item["running"]
+    assert item["health"] == "not installed"
+
+
+def test_network_ownership_and_traefik_contract_drift_are_reported(config, monkeypatch):
+    _healthy(config, monkeypatch)
+
+    def unowned_network(args, **kwargs):
+        if args[:3] == ["docker", "network", "inspect"]:
+            return Result(tuple(args), 0, json.dumps([{"Labels": {}}]), "")
+        return _run(args)
+
+    monkeypatch.setattr(status, "run", unowned_network)
+    live_state = status.docker.state
+
+    def drifted_proxy(name, **kwargs):
+        value = live_state(name, **kwargs)
+        if name == compose.TRAEFIK_CONTAINER:
+            return {**value, "labels": {compose.CONTRACT_LABEL: "changed"}}
+        return value
+
+    monkeypatch.setattr(status.docker, "state", drifted_proxy)
+
+    value = status.collect(config)
+    codes = {item["code"] for item in value["errors"]}
+
+    assert {"network_unowned", "traefik_contract_changed"}.issubset(codes)
+    assert not value["host"]["infrastructure"]["network_owned"]
+    assert not value["host"]["infrastructure"]["traefik_contract_match"]
+
+
+def test_status_reports_each_durable_database_timer(config, monkeypatch):
+    _healthy(config, monkeypatch)
+    target = config.select("app-test-01/postgres")
+    inactive = status._backup_timer(target.identity)
+
+    def timer_state(args, **kwargs):
+        if args[:2] != ["systemctl", "show"]:
+            return _run(args)
+        text = "\n\n".join(
+            f"Id={name}\nLoadState=loaded\nUnitFileState=enabled\n"
+            f"ActiveState={'inactive' if name == inactive else 'active'}"
+            for name in args[2:-1]
+        )
+        return Result(tuple(args), 0, text + "\n", "")
+
+    monkeypatch.setattr(status, "run", timer_state)
+
+    value = status.collect(config)
+
+    timer = value["host"]["timers"]["databases"][target.identity]
+    assert timer["unit"] == inactive
+    assert not timer["active"]
+    assert any(
+        item["code"] == "timer_inactive" and item["scope"] == target.identity
+        for item in value["errors"]
+    )
+
+
+def test_status_operation_summaries_redact_generic_credentials(config, monkeypatch):
+    state = _healthy(config, monkeypatch)
+    target = config.select("app-test-01/kv")
+    role = state.roles[target.identity]
+    operations = {
+        **role.operations,
+        "backup": {
+            "ok": False,
+            "message": "rediss://default:hunter2@example.com/0 token=private",
+        },
+    }
+    state = replace(
+        state,
+        roles={**state.roles, target.identity: replace(role, operations=operations)},
+    )
+    write_state(config, state)
+
+    text = status.dumps(status.collect(config, target))
+
+    assert "hunter2" not in text
+    assert "private" not in text
+    assert "<redacted>" in text
+
+
+def test_host_assessment_failure_still_reports_each_database(config, monkeypatch):
+    _healthy(config, monkeypatch)
+    monkeypatch.setattr(
+        status,
+        "free_gb",
+        lambda path: (_ for _ in ()).throw(OSError("disk facts unavailable")),
+    )
+
+    value = status.collect(config)
+
+    assert not value["healthy"]
+    assert set(value["databases"]) == {item.identity for item in config.databases}
+    assert all(item["health"] == "healthy" for item in value["databases"].values())
+    assert any(item["code"] == "host_assessment_failed" for item in value["errors"])

@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly evdb repository prune
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+RandomizedDelaySec=12h
+
+[Install]
+WantedBy=timers.target

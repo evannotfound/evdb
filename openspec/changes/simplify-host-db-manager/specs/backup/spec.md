@@ -9,6 +9,17 @@ Before a durable database settings transaction recreates the primary container o
 
 ## MODIFIED Requirements
 
+### Requirement: Checked Dragonfly backup
+Dragonfly backup SHALL call `SAVE DF` with a unique basename for every run, require the command to finish successfully, and capture exactly one complete native snapshot generation containing its summary and every numbered shard. It SHALL copy, size, and hash every generated DFS file and remove only the source files created by that run. It SHALL reject missing summaries, missing shards, mixed generations, unsafe names, and unlisted files.
+
+#### Scenario: Old Dragonfly snapshots exist
+- **WHEN** the data directory contains old RDB or DFS files
+- **THEN** backup captures only the newly named native DFS generation and leaves every old file unchanged
+
+#### Scenario: Native snapshot shard is missing
+- **WHEN** a `SAVE DF` result has no summary or has an incomplete numbered shard set
+- **THEN** backup fails without publishing a completed backup folder
+
 ### Requirement: Independent backup operation state
 The system SHALL back up one project/role at a time and SHALL store latest local completion, latest successful upload, latest successful verification, per-backup verification records, safety-backup purpose, and current errors independently. A failed operation for one project/role SHALL NOT overwrite earlier success or prevent operations for other databases. Conflicting work for the same project/role or Restic repository SHALL remain locked.
 

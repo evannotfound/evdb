@@ -5,12 +5,8 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from .errors import LockError
-
-if TYPE_CHECKING:
-    from .config import Host, Instance
 
 
 @contextmanager
@@ -44,16 +40,16 @@ def lock(path: str | Path, *, timeout: float = 0, shared: bool = False) -> Itera
 
 @contextmanager
 def operation(
-    host: Host,
-    instance: Instance | None = None,
+    config,
+    database=None,
     *,
     write: bool = False,
     timeout: float = 0,
 ) -> Iterator[None]:
-    with lock(host.lock_dir / "host.lock", timeout=timeout, shared=not write):
-        if instance is None:
+    with lock(config.paths.locks / "host.lock", timeout=timeout, shared=not write):
+        if database is None:
             yield
             return
-        path = host.lock_dir / f"{instance.group}-{instance.id}.lock"
+        path = config.paths.role_lock(database.project, database.role)
         with lock(path, timeout=timeout):
             yield

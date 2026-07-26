@@ -42,11 +42,15 @@ Redis restore SHALL select a compatible immutable Redis image digest from instal
 - **THEN** restore verification fails before live data changes
 
 ### Requirement: Dragonfly restore verification
-Dragonfly restore SHALL select a compatible immutable Dragonfly image digest from installed machine state and backup metadata, start from the saved RDB, require it to load successfully, and compare key count, key types, selected value hashes, and TTL behavior with the backup record.
+Dragonfly restore SHALL select a compatible immutable Dragonfly image digest from installed machine state and backup metadata, require one complete native DFS generation with exactly one summary and every numbered shard, start from that generation, require it to load successfully, and compare key count, key types, selected value hashes, and TTL behavior with the backup record.
 
-#### Scenario: Dragonfly cannot load its RDB
-- **WHEN** the verification Dragonfly container rejects the backup file
+#### Scenario: Dragonfly cannot load its native snapshot
+- **WHEN** the verification Dragonfly container rejects the recorded DFS generation
 - **THEN** restore verification fails even if file integrity checks passed
+
+#### Scenario: Dragonfly snapshot shard is missing
+- **WHEN** the recorded DFS generation lacks its summary or any numbered shard
+- **THEN** restore verification fails before live data changes
 
 ### Requirement: Isolated candidate verification
 Before live mutation, restore SHALL run the selected backup in a private temporary container and same-filesystem data directory with no Traefik labels, public ports, live data mounts, or shared service identity. It SHALL run manifest, engine, and content verification and SHALL mark only a successful in-process candidate eligible for replacement.

@@ -1,37 +1,31 @@
-# Database and HTTP routing
+# Native and HTTP routing
 
-## Native database ports
+## Dedicated native Traefik
 
-Traefik is the only Compose service that publishes host ports 5432 and 6379. Postgres,
-PgBouncer, Redis, and Dragonfly remain internal on the external `traefik-net` network.
-Every database container has an instance-specific name.
+evdb owns one `evdb-traefik` Compose project and one dedicated external Docker network. It is the
+only evdb service that publishes native host ports 5432 and 6379. Postgres, PgBouncer, Redis,
+Dragonfly, and HTTP sidecars use unique project/role service names and network aliases.
 
-The shared network and Traefik are release infrastructure. Apply inspects `traefik-net`, creates it
-when absent, applies and health-checks Traefik before affected databases, and restores the prior
-Traefik definition if a candidate release fails. Primary database and Traefik containers carry a
-generated service-contract hash label; plan and status treat a missing or wrong label as drift even
-when the image is unchanged.
+Each database contributes a TLS `HostSNI` router for its derived domain. Postgres routes to
+PgBouncer when enabled and otherwise to Postgres. KV routes to its selected Redis-compatible
+engine. One project may have both roles because Compose project names remain distinct:
+`evdb-<project>-postgres` and `evdb-<project>-kv`.
 
-Traefik reads labels from the matching backend container. TLS `HostSNI` routes send
-`<name>.postgres-<host>.<domain>:5432` to that database's PgBouncer or Postgres container and
-send `<name>.kv-<host>.<domain>:6379` to that database's Redis or Dragonfly container. Shared
-aliases such as `redis` are not used across projects.
+Native Traefik uses a pinned image, concrete Docker healthcheck, and ACME DNS-01 resolver. The
+provider credential is a private host file, and persistent `acme.json` is mode `0600`. Dedicated
+Traefik does not bind ports 80 or 443. Host setup refuses occupied native ports or an existing
+network it cannot prove evdb owns.
 
-## Serverless HTTP
+## KV HTTP sidecars
 
-HTTP is enabled by default for Redis and Dragonfly. Generated Compose adds the locked
-`serverless-redis-http` image with `SRH_MODE=env` and a 20-connection default. Its private
-environment file contains the token and a database-specific backend connection. Container port
-80 publishes only as `127.0.0.1:<generated-port>:80`; it has no Traefik labels.
+HTTP defaults on for KV. Its pinned `serverless-redis-http` sidecar reads token and connection data
+from a private mode-`0600` environment file and binds only
+`127.0.0.1:<machine-assigned-port>:80`. The stable port is machine-owned state. A sidecar connects
+through the unique matching KV service identity, so another project cannot claim its backend.
 
-Per-database `http: false` removes the sidecar. Stable loopback ports are allocated and retained
-in tool-owned `host.lock.json`; operators do not set or edit them. The derived domain and locked
-port form an integration contract for the external proxy owner. Apply does not cause a public
-route change.
+## External HTTP boundary
 
-## External HTTP proxy
-
-An external system owns ports 80 and 443, certificates, public hostnames, and forwarding to
-the loopback sidecars. This repository has no proxy credentials, API client, image pin,
-route plan, certificate setting, or generated proxy file. External route changes are
-coordinated separately during the production move.
+The external HTTP proxy owns public ports 80 and 443, HTTPS certificates, and forwarding to the
+loopback sidecars. evdb records the intended public domain and local endpoint but does not inspect,
+authenticate to, configure, or restart that proxy. Public route and certificate changes belong to
+their owner and to a separate production migration.

@@ -1,48 +1,31 @@
-# Draft production move
+# Production migration boundary
 
-This is a plan for a separate OpenSpec change. Do not execute it while building this system.
+Production conversion is a separate OpenSpec change. Do not execute production migration while
+implementing or testing the host-local manager.
 
-## Required route changes
+That change must inventory every live project, concrete engine, image, Compose identity, data path,
+native domain, HTTP endpoint, credential file, timer, cron entry, Restic repository, and external
+proxy route. It must resolve project/role naming collisions and compare all live facts with the
+proposed host source before mutation.
 
-| Instance | Current HTTP route | Target HTTP route | Action |
-| --- | --- | --- | --- |
-| `oai-co-prod-02` | none | `oai-co-prod-02.kv-montreal-01.storage.evanovation.com` | create |
-| `redefine-version-prod-01` | `redefine-version-prod-01.kv-na01.storage.evanovation.com` | `redefine-version-prod-01.kv-montreal-01.storage.evanovation.com` | update |
-| `stock-selector-prod-01` | `stock-selector-prod-01.kv-na01.storage.evanovation.com` | `stock-selector-prod-01.kv-montreal-01.storage.evanovation.com` | update |
+The migration requires reviewed recovery points and explicit ownership boundaries:
 
-The other eight public routes are expected to remain unchanged. This is informational input
-for the external proxy owner; `evanovation-db` does not inspect or apply these changes.
+1. Confirm a fresh checked backup, exact Restic snapshot, and recent isolated backup test for every
+   durable role.
+2. Record current Compose, data, listener, DNS, external HTTP route, credential, and schedule state.
+3. Define the dedicated native Traefik cutover without taking ports from an existing listener.
+4. Define credential import without writing secrets to Git, command arguments, logs, or migration
+   artifacts.
+5. Stage one role at a time, preserving concrete engine, major version, data, and public contracts.
+6. Prove native SNI and loopback HTTP isolation before moving another role.
+7. Enable packaged timers only after backup, status, and restore checks pass.
+8. Keep prior files, schedules, routes, and every migration safety backup until observation and
+   rollback windows close.
 
-## Preflight
+The production rollback must restore prior service definitions, routing ownership, and schedule
+state without moving or deleting database data. The external HTTP proxy owner handles its own
+route, certificate, and DNS recovery. Repository format upgrades, prune, engine migration, secret
+rotation, and old-file deletion do not belong in the cutover.
 
-1. Create and approve a new `move-prod` change.
-2. Re-read all 25 running containers, images, paths, Compose projects, domains, and ports.
-3. Compare live facts with source config and stop on any engine or data-path difference.
-4. Confirm fresh local backups, Restic snapshots, and successful restore checks for every
-   durable instance.
-5. Approve exact database, HTTP, and Traefik image digests.
-6. Have the external proxy owner confirm its route and certificate plan separately.
-7. Refresh 1Password references and rclone bootstrap escrow without exposing values.
-8. Capture current symlink, Compose files, timer and cron state, and DNS for rollback.
-   Review the Ansible diff separately from the external proxy plan.
-
-## Staged move
-
-1. Install the versioned app, JSON config, secrets, Compose files, and disabled units.
-2. Validate config from the staged release before changing `current`.
-3. Move one non-critical instance per engine, preserving engine, project, data path, and
-   container identity. Prove native TLS/SNI isolation against a second instance.
-4. Prove each HTTP sidecar is loopback-only, authenticated, and connected to its own backend.
-5. Have the external proxy owner apply and verify its three route changes independently;
-   leave legacy names available until DNS and clients are confirmed.
-6. Migrate remaining instances in approved batches. Replace cron and enable timers only
-   after backup, upload, status, and restore checks pass.
-7. Observe at least one complete backup cycle before retiring old files or routes.
-
-## Rollback
-
-Disable the new timers, restore the prior `current` symlink, and restore prior Compose
-ownership without moving data. The external proxy owner handles its own rollback and legacy
-DNS if needed. Keep every backup created before or during the move. Do not
-upgrade Restic format, prune repositories, rotate secrets, or delete old Compose files as
-part of rollback.
+Repository development and CI must not load, validate, or invoke commands against the production
+configuration. They use disposable temporary paths and local test repositories only.

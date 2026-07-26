@@ -1,0 +1,19 @@
+host:
+  id: test-01
+  domain: storage.example.com
+  data_root: /srv/databases
+  backup:
+    repos:
+      postgres: /tmp/test-postgres-repo
+      kv: /tmp/test-kv-repo
+  routing:
+    acme_email: ops@example.com
+    dns_provider: testdns
+projects:
+  app-dev-01:
+    kv:
+      engine: dragonfly
+      image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1
+      http:
+        enabled: true
+        image: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150

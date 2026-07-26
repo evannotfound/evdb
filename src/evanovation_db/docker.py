@@ -13,6 +13,28 @@ def inspect(name: str, *, timeout: int = 30) -> dict:
     return json.loads(result.out)[0]
 
 
+def state(name: str, *, timeout: int = 30, health: bool = False) -> dict:
+    result = run(["docker", "inspect", name], timeout=timeout, check=False)
+    value = {"running": False, "healthy": False if health else None, "image": None, "labels": {}}
+    if result.code != 0:
+        return value
+    try:
+        item = json.loads(result.out)[0]
+        current = item.get("State", {})
+        config = item.get("Config", {})
+        health_data = current.get("Health", {})
+        value.update(
+            running=current.get("Running") is True,
+            image=config.get("Image"),
+            labels=config.get("Labels") or {},
+        )
+        if health:
+            value["healthy"] = value["running"] and health_data.get("Status") == "healthy"
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+        pass
+    return value
+
+
 def exec(
     container: str,
     args: Sequence[str],

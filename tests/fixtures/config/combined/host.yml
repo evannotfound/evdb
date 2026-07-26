@@ -1,0 +1,25 @@
+host:
+  id: test-01
+  domain: storage.example.com
+  data_root: /srv/databases
+  backup:
+    repos:
+      postgres: /tmp/test-postgres-repo
+      kv: /tmp/test-kv-repo
+  routing:
+    acme_email: ops@example.com
+    dns_provider: testdns
+projects:
+  app-test-01:
+    postgres:
+      image: postgres:16
+      pgbouncer:
+        enabled: false
+        image: edoburu/pgbouncer:v1.25.1-p0
+    kv:
+      engine: redis
+      image: redis:7.2.5
+      mode: cache
+      http:
+        enabled: true
+        image: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150

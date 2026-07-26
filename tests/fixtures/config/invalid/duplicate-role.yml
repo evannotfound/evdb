@@ -1,0 +1,13 @@
+host:
+  id: test-01
+  domain: storage.example.com
+  data_root: /srv/databases
+  backup:
+    repos: {postgres: /tmp/pg, kv: /tmp/kv}
+  routing:
+    acme_email: ops@example.com
+    dns_provider: testdns
+projects:
+  app-prod-01:
+    postgres: {image: "postgres:16"}
+    postgres: {image: "postgres:17"}

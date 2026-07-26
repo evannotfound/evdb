@@ -1,7 +1,0 @@
----
-- name: Validate direct normalized Traefik image
-  ansible.builtin.assert:
-    that:
-      - evdb_host.images.traefik is string
-      - "'@sha256:' in evdb_host.images.traefik"
-    fail_msg: evdb_config.host.images.traefik must be a locked image

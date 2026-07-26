@@ -1,502 +1,309 @@
 import json
-from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-import yaml
 
-from evanovation_db import config as config_module
 from evanovation_db.config import (
-    BACKUP_DIR,
-    CONFIG_DIR,
     DEFAULT_HTTP_END,
     DEFAULT_HTTP_START,
     DEFAULT_RETENTION,
     DEFAULT_TIMEOUTS,
-    LOCK_DIR,
-    STATE_DIR,
     ConfigError,
-    DatabaseSource,
-    ImageLock,
+    ImageState,
+    MachineState,
+    RoleState,
+    as_dict,
+    dump,
     load,
-    load_lock,
-    load_source,
-    normalize,
-    render,
-    resolve_image_digest,
-    resolve_lock,
-    write_lock,
+    load_state,
+    replace_role,
+    resolve_state,
+    state_dict,
+    with_role,
+    write_config,
+    write_state,
 )
-from evanovation_db.run import Result
+from evanovation_db.images import image_major, locked_image, validate_source
 
 ROOT = Path(__file__).parents[2]
 FIXTURES = ROOT / "tests/fixtures/config"
 DIGEST = "sha256:" + "a" * 64
 
 
-def test_minimal_source_applies_all_defaults():
-    config = load(FIXTURES / "minimal")
+def test_project_first_fixtures_cover_each_role_shape():
+    postgres = load(FIXTURES / "postgres")
+    kv = load(FIXTURES / "kv")
+    combined = load(FIXTURES / "combined")
 
-    assert config.host.config_dir == CONFIG_DIR
-    assert config.host.state_dir == STATE_DIR
-    assert config.host.backup_dir == BACKUP_DIR
-    assert config.host.lock_dir == LOCK_DIR
-    assert config.host.retention == DEFAULT_RETENTION
-    assert config.host.min_free_gb == 5
-    assert config.host.backup_max_age_hours == 26
-    assert config.host.restore_max_age_days == 30
+    assert [item.identity for item in postgres.databases] == ["app-prod-01/postgres"]
+    assert [item.identity for item in kv.databases] == ["app-dev-01/kv"]
+    assert [item.identity for item in combined.databases] == [
+        "app-test-01/postgres",
+        "app-test-01/kv",
+    ]
+    assert combined.select("app-test-01/postgres").compose_project == "evdb-app-test-01-postgres"
+    assert combined.select("app-test-01/kv").compose_project == "evdb-app-test-01-kv"
+
+
+def test_defaults_are_typed_and_concise():
+    config = load(FIXTURES / "kv")
+    database = config.select("app-dev-01/kv")
+
+    assert config.host.backup.retention == DEFAULT_RETENTION
     assert config.host.timeouts == DEFAULT_TIMEOUTS
     assert (config.host.http_port_start, config.host.http_port_end) == (
         DEFAULT_HTTP_START,
         DEFAULT_HTTP_END,
     )
-    assert all("@sha256:" in image for image in config.host.images.values())
-
-    postgres = config.select("postgres/example-prod-01")
-    assert postgres.env == "prod"
-    assert postgres.port == 5432
-    assert postgres.container == "example-prod-01-postgres-1"
-    assert postgres.project == "example-prod-01"
-    assert postgres.data == Path("/srv/databases/postgres/example-prod-01/data")
-    assert postgres.domain == "example-prod-01.postgres-test-01.storage.example.com"
-    assert postgres.durable and postgres.backup == {"enabled": True}
-    assert postgres.settings == {
-        "user": "default",
-        "database": "postgres",
-        "pgbouncer": True,
-        "max_clients": 100,
-        "pool_size": 20,
-        "reserve_size": 5,
-    }
-    assert postgres.secrets == {"password": "op://Test/example-prod-01-postgres/password"}
-
-    redis = config.select("redis/cache-dev-01")
-    assert redis.env == "dev"
-    assert redis.port == 6379
-    assert redis.settings == {}
-    assert redis.http == {
-        "enabled": True,
-        "port": 13379,
-        "domain": "cache-dev-01.kv-test-01.storage.example.com",
-        "image": config.host.images["http"],
-        "max_connections": 20,
-        "token": "op://Test/cache-dev-01-kv/http-token",
-    }
-
-    dragonfly = config.select("dragonfly/queue-test-01")
-    assert dragonfly.env == "test"
-    assert dragonfly.settings == {"threads": 1, "maxmemory": "256mb", "cache": False}
-    assert dragonfly.durable
-    assert dragonfly.http["port"] == 13380
+    assert database.engine == "dragonfly"
+    assert database.settings.mode == "durable"
+    assert database.settings.memory == "256mb"
+    assert database.settings.threads == 1
+    assert database.settings.http.enabled
+    assert database.settings.http.connections == 20
 
 
-def test_supported_overrides_change_only_requested_behavior():
-    config = load(FIXTURES / "overrides")
+def test_select_requires_role_when_project_has_both():
+    config = load(FIXTURES / "combined")
 
-    assert config.host.retention == {**DEFAULT_RETENTION, "daily": 3}
-    assert config.host.min_free_gb == 10
-    assert config.host.backup_max_age_hours == 30
-    assert config.host.restore_max_age_days == 14
-    assert (config.host.http_port_start, config.host.http_port_end) == (14000, 14009)
-
-    postgres = config.select("pooled-prod-01")
-    assert postgres.settings == {
-        "user": "default",
-        "database": "postgres",
-        "pgbouncer": False,
-        "max_clients": 500,
-        "pool_size": 40,
-        "reserve_size": 8,
-    }
-    assert postgres.resources == {"database": "unlimited"}
-
-    dragonfly = config.select("transient-prod-01")
-    assert dragonfly.settings == {"threads": 8, "maxmemory": "2gb", "cache": True}
-    assert not dragonfly.durable
-    assert dragonfly.backup == {"enabled": False}
-    assert dragonfly.http["enabled"] is False
-    assert dragonfly.http["port"] is None
-    assert "token" not in dragonfly.http
-    assert dragonfly.resources == {"database": "unlimited"}
-
-
-def test_same_name_across_types_requires_a_typed_selector():
-    source = load_source(FIXTURES / "minimal")
-    redis = replace(source.databases[1], name="example-prod-01")
-    source = replace(source, databases=(source.databases[0], redis, source.databases[2]))
-    lock = resolve_lock(source, load_lock(FIXTURES / "minimal/host.lock.json"), resolver=_unused)
-    config = normalize(source, lock)
-
-    assert config.select("postgres/example-prod-01").engine == "postgres"
-    assert config.select("redis/example-prod-01").engine == "redis"
     with pytest.raises(ConfigError) as caught:
-        config.select("example-prod-01")
-    assert "ambiguous" in str(caught.value)
-    assert "postgres/example-prod-01" in str(caught.value)
-    assert "redis/example-prod-01" in str(caught.value)
+        config.select("app-test-01")
+
+    message = str(caught.value)
+    assert "app-test-01/postgres" in message
+    assert "app-test-01/kv" in message
 
 
 @pytest.mark.parametrize(
-    ("change", "message"),
+    ("name", "message"),
     [
-        (lambda data: data["databases"][0].update(type="mysql"), "unsupported type"),
-        (lambda data: data["databases"][0].update(name="Bad Name"), "safe lowercase"),
-        (lambda data: data["databases"][0].update(pooler="yes"), "must be a boolean"),
-        (lambda data: data["databases"][2].update(memory="lots"), "positive kb"),
-        (lambda data: data["databases"][0].update(current={}), "migration-only field current"),
-        (lambda data: data["databases"][0].update(target={}), "migration-only field target"),
-        (lambda data: data["databases"][1].update(memory="1gb"), "only valid for dragonfly"),
-        (lambda data: data["databases"][0].update(http=True), "HTTP is only valid for KV"),
+        ("old-schema.yml", "old source schema"),
+        ("bad-suffix.yml", "must end in"),
+        ("engine-setting.yml", "require dragonfly"),
+        ("secret.yml", "must not contain secrets"),
+        ("unsafe-path.yml", "safe absolute path"),
+        ("major.yml", "positive postgres major"),
+        ("duplicate-role.yml", "duplicate YAML key"),
     ],
 )
-def test_invalid_source_fields_fail(tmp_path, change, message):
-    data = _source_data("minimal")
-    change(data)
-    path = _write_source(tmp_path, data)
-
+def test_invalid_fixtures_fail_before_side_effects(name, message):
     with pytest.raises(ConfigError, match=message):
-        load_source(path)
+        load(FIXTURES / "invalid" / name)
+
+
+@pytest.mark.parametrize("name", ["postgres.yml", "kv.yml", "host.lock.json"])
+def test_old_side_files_are_rejected(tmp_path, name):
+    (tmp_path / "host.yml").write_text((FIXTURES / "postgres/host.yml").read_text())
+    (tmp_path / name).write_text("{}\n")
+
+    with pytest.raises(ConfigError, match="old source layout"):
+        load(tmp_path)
 
 
 @pytest.mark.parametrize(
     "image",
-    [
-        "postgres",
-        "registry.example.com:5000/postgres",
-        "postgres:latest",
-        "postgres:latest@sha256:" + "a" * 64,
-    ],
+    ["postgres", "registry.example.com:5000/postgres", "postgres:latest", " postgres:16"],
 )
-def test_source_images_reject_implicit_and_explicit_latest(tmp_path, image):
-    data = _source_data("minimal")
-    data["host"]["images"]["postgres"] = image
-
-    with pytest.raises(ConfigError, match="latest|explicit non-latest"):
-        load_source(_write_source(tmp_path, data))
+def test_images_reject_unversioned_latest_and_invalid_sources(image):
+    with pytest.raises(ConfigError):
+        validate_source(image)
 
 
-def test_source_images_accept_explicit_tag_and_immutable_digest(tmp_path):
-    data = _source_data("minimal")
-    data["host"]["images"]["postgres"] = "registry.example.com:5000/postgres:16.9"
-    data["host"]["images"]["http"] = "example/http@sha256:" + "b" * 64
+def test_images_accept_version_tags_and_digests():
+    digest_image = f"example/http@{DIGEST}"
 
-    source = load_source(_write_source(tmp_path, data))
-
-    assert source.images["postgres"] == "registry.example.com:5000/postgres:16.9"
-    assert source.images["http"] == "example/http@sha256:" + "b" * 64
+    assert validate_source("registry.example.com:5000/postgres:16.9")
+    assert validate_source(digest_image)
+    assert locked_image("postgres:16", DIGEST) == f"postgres:16@{DIGEST}"
+    assert image_major("dragonfly:v1.34.1") == 1
 
 
-@pytest.mark.parametrize(
-    ("engine", "image"),
-    [
-        ("postgres", "postgres:stable"),
-        ("postgres", "registry16.example.com/postgres:stable"),
-        ("postgres", "postgres@sha256:" + "a" * 64),
-        ("redis", "redis:0"),
-        ("dragonfly", "dragonfly:version-1"),
-    ],
-)
-def test_source_engine_images_require_positive_tag_major(tmp_path, engine, image):
-    data = _source_data("minimal")
-    data["host"]["images"][engine] = image
+def test_paths_are_project_first_and_fully_injectable(config, paths):
+    database = config.select("app-test-01/postgres")
 
-    with pytest.raises(ConfigError, match="positive engine major"):
-        load_source(_write_source(tmp_path, data))
+    assert config.paths.source == paths.config / "host.yml"
+    assert database.compose == paths.config / "projects/app-test-01/postgres/compose.yaml"
+    assert config.paths.role_secrets(database.project, database.role) == (
+        paths.config / "secrets/app-test-01/postgres"
+    )
+    assert database.data == config.host.data_root / "app-test-01/postgres/data"
+    assert config.paths.role_backups(database.project, database.role) == (
+        paths.state / "backups/app-test-01/postgres"
+    )
 
 
-def test_duplicate_typed_identity_fails(tmp_path):
-    data = _source_data("minimal")
-    data["databases"].append(deepcopy(data["databases"][0]))
+def test_round_trip_is_deterministic(tmp_path):
+    original = load(FIXTURES / "combined")
+    source = tmp_path / "host.yml"
+    source.write_text(dump(original))
 
-    with pytest.raises(ConfigError, match="duplicate typed identity"):
-        load_source(_write_source(tmp_path, data))
+    loaded = load(source)
 
-
-def test_distinct_kv_types_with_same_name_fail_on_derived_collision(tmp_path):
-    data = _source_data("minimal")
-    data["databases"][2]["name"] = data["databases"][1]["name"]
-
-    with pytest.raises(ConfigError, match="derived container collides"):
-        load_source(_write_source(tmp_path, data))
+    assert as_dict(loaded) == as_dict(original)
+    assert dump(loaded) == dump(original)
 
 
-def test_secret_value_fails_without_printing_it(tmp_path):
-    data = _source_data("minimal")
-    data["databases"][0]["password"] = "do-not-print"
+def test_role_add_defaults_are_persisted_explicitly():
+    config = load(FIXTURES / "postgres")
+    from evanovation_db.config import HTTP, KV
 
-    with pytest.raises(ConfigError) as caught:
-        load_source(_write_source(tmp_path, data))
-    assert "password" in str(caught.value)
-    assert "do-not-print" not in str(caught.value)
+    updated = with_role(
+        config,
+        "queue-prod-01",
+        "kv",
+        KV("dragonfly", "docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1", http=HTTP()),
+    )
+    data = as_dict(updated)["projects"]["queue-prod-01"]["kv"]
 
-
-def test_old_separate_source_files_are_rejected(tmp_path):
-    _write_source(tmp_path, _source_data("minimal"))
-    (tmp_path / "postgres.yml").write_text("instances: []\n")
-
-    with pytest.raises(ConfigError, match="old source layout is not supported"):
-        load_source(tmp_path)
-
-
-def test_host_lock_rejects_duplicate_ports_and_secret_data(tmp_path):
-    data = json.loads((FIXTURES / "minimal/host.lock.json").read_text())
-    data["http_ports"]["redis/other-prod-01"] = 13379
-    path = tmp_path / "host.lock.json"
-    path.write_text(json.dumps(data))
-    with pytest.raises(ConfigError, match="duplicate HTTP port"):
-        load_lock(path)
-
-    data = json.loads((FIXTURES / "minimal/host.lock.json").read_text())
-    data["token"] = "do-not-print"
-    path.write_text(json.dumps(data))
-    with pytest.raises(ConfigError) as caught:
-        load_lock(path)
-    assert "secret data" in str(caught.value)
-    assert "do-not-print" not in str(caught.value)
+    assert data["engine"] == "dragonfly"
+    assert data["image"].endswith(":v1.34.1")
+    assert data["http"]["enabled"] is True
+    assert data["http"]["image"].startswith("hiett/serverless-redis-http@sha256:")
 
 
-def test_write_lock_is_atomic_and_loadable(tmp_path):
-    lock = load_lock(FIXTURES / "minimal/host.lock.json")
-    target = tmp_path / "host.lock.json"
-    target.write_text("old\n")
+def test_replace_role_changes_only_selected_database():
+    config = load(FIXTURES / "combined")
+    database = config.select("app-test-01/kv")
+    changed = replace(database.settings, mode="durable")
 
-    write_lock(target, lock)
+    updated = replace_role(config, database, changed)
 
-    assert load_lock(target) == lock
-    assert target.stat().st_mode & 0o777 == 0o644
-    assert not list(tmp_path.glob(".host.lock.json.*"))
-
-
-def test_verbose_manifest_resolution_selects_linux_amd64(monkeypatch):
-    calls = []
-    output = [
-        {
-            "Digest": "sha256:" + "1" * 64,
-            "Platform": {"os": "linux", "architecture": "arm64"},
-        },
-        {
-            "Digest": DIGEST,
-            "Platform": {"os": "linux", "architecture": "amd64"},
-        },
-    ]
-
-    def fake_run(args, *, timeout):
-        calls.append((args, timeout))
-        return Result(tuple(args), 0, json.dumps(output), "")
-
-    monkeypatch.setattr(config_module, "run", fake_run)
-
-    assert resolve_image_digest("postgres:16") == DIGEST
-    assert calls == [(["docker", "manifest", "inspect", "--verbose", "postgres:16"], 120)]
+    assert updated.select(database.identity).settings.mode == "durable"
+    assert (
+        updated.select("app-test-01/postgres").settings
+        == config.select("app-test-01/postgres").settings
+    )
 
 
-def test_lock_refresh_preserves_unchanged_images_and_resolves_only_changes():
-    source = load_source(FIXTURES / "minimal")
-    current = load_lock(FIXTURES / "minimal/host.lock.json", source)
-    images = {**source.images, "postgres": "postgres:17"}
-    source = replace(source, images=images)
+def test_machine_state_round_trip_and_stable_port(config):
+    role = RoleState(
+        "redis",
+        {"primary": ImageState("redis:7.2.5", DIGEST, 7)},
+        http_port=14001,
+        compose_hash="abc",
+        installed=True,
+    )
+    state = MachineState(1, config.host.id, {}, {"app-test-01/kv": role}, "1.0.0")
+
+    write_state(config, state)
+    loaded = load_state(config)
+
+    assert loaded == state
+    assert loaded.roles["app-test-01/kv"].http_port == 14001
+    assert json.loads(config.paths.machine_state.read_text()) == state_dict(state)
+    assert config.paths.machine_state.stat().st_mode & 0o777 == 0o600
+
+
+def test_state_resolution_preserves_ports_images_and_orphans(config):
     calls = []
 
-    def resolver(image, **platform):
-        calls.append((image, platform))
+    def resolver(source):
+        calls.append(source)
         return DIGEST
 
-    updated = resolve_lock(source, current, resolver=resolver)
+    initial = resolve_state(config, resolver=resolver)
+    reordered = replace(config, projects=tuple(reversed(config.projects)))
+    stable = resolve_state(reordered, initial, resolver=resolver)
 
-    assert calls == [("postgres:17", {"os_name": "linux", "architecture": "amd64"})]
-    assert updated.images["postgres"] == ImageLock("postgres:17", DIGEST)
-    for name in current.images.keys() - {"postgres"}:
-        assert updated.images[name] is current.images[name]
+    assert stable == initial
+    assert stable.roles["app-test-01/kv"].http_port == config.host.http_port_start
+    assert calls
 
-
-def test_lock_reuses_source_digest_without_resolution_or_double_digest():
-    source = load_source(FIXTURES / "minimal")
-    current = load_lock(FIXTURES / "minimal/host.lock.json", source)
-    digest = "sha256:" + "b" * 64
-    source = replace(source, images={**source.images, "postgres": f"postgres:16@{digest}"})
-
-    updated = resolve_lock(source, current, resolver=_unused)
-    normalized = normalize(source, updated)
-
-    assert updated.images["postgres"] == ImageLock(f"postgres:16@{digest}", digest)
-    assert normalized.host.images["postgres"] == f"postgres:16@{digest}"
-    assert normalized.host.images["postgres"].count("@") == 1
+    orphan = RoleState("redis", {}, installed=True)
+    current = replace(initial, roles={**initial.roles, "old-prod-01/kv": orphan})
+    preserved = resolve_state(config, current, resolver=resolver)
+    assert preserved.roles["old-prod-01/kv"] is orphan
 
 
-def test_http_ports_stay_stable_across_reorder_add_and_remove():
-    source = load_source(FIXTURES / "minimal")
-    current = load_lock(FIXTURES / "minimal/host.lock.json", source)
-    reordered = replace(source, databases=tuple(reversed(source.databases)))
-    stable = resolve_lock(reordered, current, resolver=_unused)
-    assert stable.http_ports == current.http_ports
-
-    added = replace(
-        source,
-        databases=(
-            *source.databases,
-            DatabaseSource(name="new-prod-01", type="redis"),
-        ),
+def test_state_resolution_never_reallocates_a_surviving_port(config):
+    initial = resolve_state(config, resolver=lambda source: DIGEST)
+    narrower = replace(
+        config,
+        host=replace(config.host, http_port_start=config.host.http_port_start + 1),
     )
-    with_new = resolve_lock(added, current, resolver=_unused)
-    assert with_new.http_ports["redis/cache-dev-01"] == 13379
-    assert with_new.http_ports["dragonfly/queue-test-01"] == 13380
-    assert with_new.http_ports["redis/new-prod-01"] == 13381
-
-    removed = replace(source, databases=(source.databases[0], source.databases[2]))
-    without_redis = resolve_lock(removed, current, resolver=_unused)
-    assert without_redis.http_ports == {"dragonfly/queue-test-01": 13380}
-
-
-def test_lock_refresh_never_reallocates_a_surviving_port():
-    source = load_source(FIXTURES / "minimal")
-    current = load_lock(FIXTURES / "minimal/host.lock.json", source)
-    narrower = replace(source, http_port_start=13380)
 
     with pytest.raises(ConfigError, match="instead of reallocating"):
-        resolve_lock(narrower, current, resolver=_unused)
+        resolve_state(narrower, initial, resolver=lambda source: DIGEST)
 
 
-def test_normalization_rejects_source_lock_drift():
-    source = load_source(FIXTURES / "minimal")
-    lock = load_lock(FIXTURES / "minimal/host.lock.json", source)
-    changed = replace(source, images={**source.images, "redis": "redis:7.4"})
-    with pytest.raises(ConfigError, match="image redis source changed"):
-        normalize(changed, lock)
-
-    missing = replace(lock, http_ports={"redis/cache-dev-01": 13379})
-    with pytest.raises(ConfigError, match="missing HTTP ports"):
-        normalize(source, missing)
-
-
-def test_normalization_is_deterministic():
-    source = load_source(FIXTURES / "minimal")
-    lock = load_lock(FIXTURES / "minimal/host.lock.json", source)
-
-    assert normalize(source, lock) == normalize(source, lock)
-
-
-def test_runtime_render_uses_only_protected_secret_paths(tmp_path):
-    rendered = render(FIXTURES / "minimal", tmp_path)
-    text = "\n".join(path.read_text() for path in tmp_path.rglob("*.json"))
-
-    assert "op://" not in text
-    assert "do-not-print" not in text
-    assert all(path.stat().st_mode & 0o777 == 0o600 for path in tmp_path.rglob("*.json"))
-    runtime = load(tmp_path)
-    assert runtime.host.runtime
-    assert {item.selector for item in runtime.instances} == {
-        "postgres/example-prod-01",
-        "redis/cache-dev-01",
-        "dragonfly/queue-test-01",
-    }
-    assert (
-        runtime.select("example-prod-01").secrets["password"]
-        == (Path("/etc/evanovation-db/secrets/postgres-example-prod-01.password")).as_posix()
+def test_disabled_http_port_is_preserved_and_reserved_for_reenable(config):
+    initial = resolve_state(config, resolver=lambda source: DIGEST)
+    target = config.select("app-test-01/kv")
+    disabled_settings = replace(
+        target.settings,
+        http=replace(target.settings.http, enabled=False),
     )
-    assert rendered.select("cache-dev-01").http["token"].startswith("op://")
-    assert runtime.select("cache-dev-01").http["token"].endswith("kv-cache-dev-01-http.token")
+    disabled = replace_role(config, target, disabled_settings)
+    disabled_state = resolve_state(disabled, initial, resolver=lambda source: DIGEST)
+    added = with_role(
+        disabled,
+        "other-test-01",
+        "kv",
+        replace(target.settings, mode="durable"),
+    )
+    final = resolve_state(added, disabled_state, resolver=lambda source: DIGEST)
+
+    assert disabled_state.roles[target.identity].http_port == config.host.http_port_start
+    assert final.roles[target.identity].http_port == config.host.http_port_start
+    assert final.roles["other-test-01/kv"].http_port == config.host.http_port_start + 1
 
 
-def test_montreal_normalization_matches_golden_contract():
-    root = ROOT / "config/montreal-01"
-    source = load_source(root)
-    config = load(root)
-    golden = json.loads((FIXTURES / "montreal-contract.json").read_text())
-
-    assert source.images == golden["source_images"]
-    assert _host_contract(config) == golden["host"]
-    assert _instance_contract(config) == _expand_instances(golden)
-
-
-def _source_data(name: str) -> dict:
-    return yaml.safe_load((FIXTURES / name / "host.yml").read_text())
-
-
-def _write_source(root: Path, data: dict) -> Path:
-    path = root / "host.yml"
-    path.write_text(yaml.safe_dump(data, sort_keys=False))
-    return path
-
-
-def _unused(*args, **kwargs):
-    raise AssertionError(f"resolver should not be called: {args!r} {kwargs!r}")
-
-
-def _host_contract(config) -> dict:
-    host = config.host
-    return {
-        "id": host.id,
-        "ssh": host.ssh,
-        "domain": host.domain,
-        "data_root": str(host.data_root),
-        "config_dir": str(host.config_dir),
-        "state_dir": str(host.state_dir),
-        "backup_dir": str(host.backup_dir),
-        "lock_dir": str(host.lock_dir),
-        "repos": host.repos,
-        "retention": host.retention,
-        "images": host.images,
-        "secrets": host.secrets,
-        "min_free_gb": host.min_free_gb,
-    }
-
-
-def _instance_contract(config) -> list[dict]:
-    return [
-        {
-            "name": item.id,
-            "env": item.env,
-            "engine": item.engine,
-            "image": item.image,
-            "port": item.port,
-            "container": item.container,
-            "project": item.project,
-            "data": str(item.data),
-            "domain": item.domain,
-            "durable": item.durable,
-            "backup": item.backup,
-            "settings": item.settings,
-            "password": item.secrets["password"],
-            "http": item.http,
-        }
-        for item in config.instances
-    ]
-
-
-def _expand_instances(golden: dict) -> list[dict]:
-    result = []
-    for item in golden["databases"]:
-        name = item["name"]
-        engine = item["engine"]
-        group = "postgres" if engine == "postgres" else "kv"
-        settings = {**golden["settings"][engine], **item.get("settings", {})}
-        http = None
-        if group == "kv":
-            http = {
-                "enabled": True,
-                "port": item["http_port"],
-                "domain": golden["patterns"]["domain"].format(name=name, group=group),
-                "image": golden["host"]["images"]["http"],
-                "max_connections": 20,
-                "token": golden["patterns"]["token"].format(name=name),
-            }
-        result.append(
+def test_state_rejects_secrets(config):
+    path = config.paths.machine_state
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
             {
-                "name": name,
-                "env": name.rsplit("-", 2)[1],
-                "engine": engine,
-                "image": golden["host"]["images"][engine],
-                "port": 5432 if engine == "postgres" else 6379,
-                "container": golden["patterns"]["container"][group].format(name=name),
-                "project": golden["patterns"]["project"].format(name=name),
-                "data": golden["patterns"]["data"].format(name=name, group=group),
-                "domain": golden["patterns"]["domain"].format(name=name, group=group),
-                "durable": True,
-                "backup": {"enabled": True},
-                "settings": settings,
-                "password": golden["patterns"]["password"].format(name=name, group=group),
-                "http": http,
+                "version": 1,
+                "host": config.host.id,
+                "images": {},
+                "roles": {},
+                "password": "do-not-print",
             }
         )
-    return result
+    )
+
+    with pytest.raises(ConfigError) as caught:
+        load_state(config)
+    assert "do-not-print" not in str(caught.value)
+
+
+def test_atomic_config_write_keeps_one_previous_and_activity(config):
+    config.paths.source.parent.mkdir(parents=True)
+    config.paths.source.write_text("old\n")
+    database = config.select("app-test-01/kv")
+
+    write_config(config, command="database configure", database=database, changed=("mode",))
+
+    assert config.paths.previous.read_text() == "old\n"
+    assert config.paths.previous.stat().st_mode & 0o777 == 0o640
+    assert config.paths.source.stat().st_mode & 0o777 == 0o640
+    assert load(config.paths.source, paths=config.paths) == config
+    activity = json.loads(config.paths.activity.read_text())
+    assert activity["project"] == "app-test-01"
+    assert activity["role"] == "kv"
+    assert activity["changed"] == ["mode"]
+    assert "password" not in config.paths.activity.read_text().lower()
+
+
+def test_http_port_range_rejects_invalid_order(tmp_path):
+    text = (
+        (FIXTURES / "kv/host.yml")
+        .read_text()
+        .replace("projects:", "  http_ports:\n    start: 14001\n    end: 14000\nprojects:")
+    )
+    path = tmp_path / "host.yml"
+    path.write_text(text)
+
+    with pytest.raises(ConfigError, match="ordered unprivileged range"):
+        load(path)
+
+
+def test_config_source_contains_no_runtime_or_secret_fields():
+    data = as_dict(load(FIXTURES / "combined"))
+    text = json.dumps(data).lower()
+
+    assert "digest" not in text
+    assert "http_port" in text  # only the allocation range is human-owned
+    assert not any(word in text for word in ("password", "token", "op://", "current", "target"))

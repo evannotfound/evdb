@@ -13,7 +13,9 @@ from .errors import BackupError
 
 def private_dir(path: str | Path) -> Path:
     folder = Path(path)
-    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if folder.is_symlink():
+        raise OSError(f"managed directory must not be a symlink: {folder}")
+    _create_dirs(folder)
     folder.chmod(0o700)
     return folder
 
@@ -35,20 +37,7 @@ def require_file(path: str | Path) -> Path:
 
 
 def write_json(path: str | Path, data: Any, *, mode: int = 0o600) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-    temp = Path(temp_name)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(data, handle, sort_keys=True, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temp.chmod(mode)
-        temp.replace(target)
-    finally:
-        temp.unlink(missing_ok=True)
+    write_text(path, json.dumps(data, sort_keys=True, indent=2) + "\n", mode=mode)
 
 
 def write_text(path: str | Path, text: str, *, mode: int = 0o600) -> None:
@@ -57,10 +46,14 @@ def write_text(path: str | Path, text: str, *, mode: int = 0o600) -> None:
 
 def write_bytes(path: str | Path, data: bytes, *, mode: int = 0o600) -> None:
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _create_dirs(target.parent)
+    if target.is_symlink():
+        raise OSError(f"managed path must not be a symlink: {target}")
+    owner = (target if target.exists() else target.parent).stat()
     fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     temp = Path(temp_name)
     try:
+        os.fchown(fd, owner.st_uid, owner.st_gid)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
@@ -69,6 +62,22 @@ def write_bytes(path: str | Path, data: bytes, *, mode: int = 0o600) -> None:
         temp.replace(target)
     finally:
         temp.unlink(missing_ok=True)
+
+
+def _create_dirs(folder: Path) -> None:
+    missing = []
+    current = folder
+    while not current.exists():
+        if current.is_symlink():
+            raise OSError(f"managed directory must not be a symlink: {current}")
+        missing.append(current)
+        current = current.parent
+    if current.is_symlink() or not current.is_dir():
+        raise OSError(f"managed directory is unsafe: {current}")
+    for item in reversed(missing):
+        owner = item.parent.stat()
+        item.mkdir(mode=0o700)
+        os.chown(item, owner.st_uid, owner.st_gid)
 
 
 def read_json(path: str | Path) -> Any:

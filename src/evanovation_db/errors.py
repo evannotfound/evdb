@@ -10,19 +10,11 @@ class CommandError(Error):
     pass
 
 
-class ProtocolError(Error):
+class DatabaseError(Error):
     pass
 
 
-class RuntimeUnavailableError(ProtocolError):
-    pass
-
-
-class ProtocolMismatchError(ProtocolError):
-    pass
-
-
-class DeploymentError(Error):
+class HostError(Error):
     pass
 
 

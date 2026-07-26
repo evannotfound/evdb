@@ -1,47 +1,52 @@
 # Backup operations
 
-## Operator workflow
+## Commands
 
 ```sh
-evdb backup app-prod-01
-evdb backups app-prod-01
-evdb backup-check app-prod-01
-evdb backup-check app-prod-01 SNAPSHOT_ID
+evdb backup create app-prod-01/postgres
+evdb backup list app-prod-01/postgres
+evdb backup test app-prod-01/postgres latest
+evdb backup retention app-prod-01/postgres
+evdb backup prune postgres
+evdb backup repository-check postgres --rotate
 ```
 
-`backup` runs the checked backup and Restic upload path on the managed host. It reports the
-completed backup time and exact snapshot ID only after dump validation, manifest hashing, and
-upload succeed. Cache-mode KV databases reject backups because durability is disabled.
+`backup create` runs on the authoritative host for one durable project/role. It reports a remote
+recovery point only after engine validation, manifest hashing, and Restic upload all succeed.
+Cache-mode KV rejects backup creation.
 
-`backups` merges completed local folders and tagged Restic snapshots in reverse chronological
-order. Each row shows local, remote, or combined source, time, backup ID, snapshot ID, and that
-backup's latest full verification state. Verification records remain attached to older backups
-when later backups are checked. A remote-only snapshot remains visible after local retention.
+Each run starts in a private `<time>.partial` folder under
+`/var/lib/evdb/backups/<project>/<role>`. Completion requires nonempty engine files, size and
+SHA-256 checks, and a valid `backup.json`; only then is the folder renamed. The record includes
+host, project, role, concrete engine, source and locked image, engine version, format, timestamps,
+purpose, content facts, files, checks, and upload result.
 
-`backup-check` defaults to the newest restorable backup for that typed database. An optional
-argument selects an exact backup folder ID or Restic snapshot ID from `backups`. Selection rejects
-missing, ambiguous, cross-host, and cross-database snapshots.
+Postgres stores globals and one custom archive for every connectable non-template database. Redis
+waits for a successful new BGSAVE and checks the RDB. Dragonfly creates one uniquely named native
+DFS generation, copies its summary and every numbered shard, and removes only those temporary
+source files. Backup records contain bounded facts and hashes, not raw sampled values or
+credentials.
 
-## Verification
+## History and testing
 
-Every backup first uses a private `<utc-time>.partial` directory and becomes complete only after
-engine checks, sizes, SHA-256 hashes, and `backup.json` are valid. Postgres stores globals and one
-custom archive per connectable non-template database. Redis and Dragonfly store `dump.rdb`.
+`backup list` merges local folders and stable Restic snapshots in reverse time order. Every row
+shows purpose, local and remote availability, snapshot identity, and that exact backup's latest
+verification. A remote-only backup remains visible after local retention.
 
-Full backup-check verifies exact host and typed database identity plus manifest hashes, then
-restores into an isolated compatible engine container with no published ports or live data mounts.
-The locked current image may differ by patch tag or digest from the backup image, but the engine
-must match and its major version cannot be older than the backup's. Postgres checks restored
-databases and catalog facts. Redis and Dragonfly compare database and key counts, key types,
-sampled value hashes, and TTL behavior without persisting raw values.
-Temporary containers and download staging are removed after success, failure, timeout, or
-interruption. Live data is never changed.
+`backup test` selects an exact local backup or Restic snapshot, verifies its identity and hashes,
+and restores it into an isolated same-engine container with no live mounts, routes, aliases, or
+published ports. Postgres checks restored catalogs. Redis and Dragonfly compare database and key
+counts, key types, sampled hashes, and TTL behavior. Temporary resources are removed after success,
+failure, timeout, or interruption; live data never changes.
 
-If upload fails after a checked local backup, the local folder remains and failure is recorded.
-The latest local completion, last successful upload, last successful verification, per-backup
-verification records, and current operation error are independent. A current upload failure does
-not make a still-recent prior successful snapshot stale. A failed scheduled database does not stop
-other eligible databases. Repository and instance locks serialize conflicting work.
+## Retention and failures
 
-Backup command output, history, manifests, state, and structured logs are secret-free. Treat local
-backup folders as sensitive database contents even though they contain no controller credentials.
+The policy defaults to 7 daily, 4 weekly, and 12 monthly snapshots per durable project/role.
+Retention runs without prune; prune is a separate monthly repository operation. Repository checks
+rotate through configured data subsets. All grouping uses stable host/project/role tags rather than
+mutable image metadata.
+
+At least two newest uploaded local backups are retained, and unuploaded backups are never deleted
+automatically. A failed new upload remains separate from the most recent confirmed snapshot. A
+failed backup test remains attached to its selected backup. One role's failure does not overwrite
+another role's result or stop independent scheduled work.

@@ -151,7 +151,7 @@ The serverless Redis HTTP sidecar remains part of the KV Compose project, defaul
 
 ### Backup identity and one-command restore
 
-Backup folders, `backup.json`, Restic tags, locks, status, and history use host/project/role identity. Backup records additionally preserve the concrete engine, engine version, image, format, file hashes, facts, and upload result. Existing checked engine procedures, repository format v1, retention, local safety, repository locking, and periodic full restore tests remain.
+Backup folders, `backup.json`, Restic tags, locks, status, and history use host/project/role identity. Backup records additionally preserve the concrete engine, engine version, image, format, file hashes, facts, and upload result. Dragonfly backups use one complete native DFS generation containing exactly one summary and every numbered shard; Redis continues to use a confirmed RDB. Existing checked engine procedures, repository format v1, retention, local safety, repository locking, and periodic full restore tests remain.
 
 `evdb backup test` is the human name for isolated end-to-end restore verification. `evdb restore PROJECT/ROLE BACKUP` performs the complete live recovery workflow:
 
