@@ -2,9 +2,9 @@
 
 Host-local database management for self-hosted Postgres, Dragonfly, and Redis.
 
-[![Check](https://github.com/evannotfound/evanovation-db/actions/workflows/check.yml/badge.svg)](https://github.com/evannotfound/evanovation-db/actions/workflows/check.yml)
-[![Release](https://img.shields.io/github/v/release/evannotfound/evanovation-db)](https://github.com/evannotfound/evanovation-db/releases)
-[![License](https://img.shields.io/github/license/evannotfound/evanovation-db)](LICENSE)
+[![Check](https://github.com/evannotfound/evdb/actions/workflows/check.yml/badge.svg)](https://github.com/evannotfound/evdb/actions/workflows/check.yml)
+[![Release](https://img.shields.io/github/v/release/evannotfound/evdb)](https://github.com/evannotfound/evdb/releases)
+[![License](https://img.shields.io/github/license/evannotfound/evdb)](LICENSE)
 
 evdb turns one Linux host into a small database platform. It gives every project a Postgres role, a
 Redis-compatible KV role, or both, then manages their containers, routing, credentials, backups,
