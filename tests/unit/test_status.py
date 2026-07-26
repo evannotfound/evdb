@@ -1,6 +1,6 @@
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from evanovation_db import compose, secrets, status
 from evanovation_db.config import resolve_state, write_state
@@ -11,7 +11,7 @@ DIGEST = "sha256:" + "a" * 64
 
 
 def _healthy(config, monkeypatch):
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     state = resolve_state(config, resolver=lambda source: DIGEST)
     roles = {}
     services = {}
@@ -220,7 +220,7 @@ def test_failed_backup_test_is_operation_failure_and_stale(config, monkeypatch):
         **role.operations,
         "backup_test": {
             "ok": False,
-            "time": datetime.now(timezone.utc).isoformat(),
+            "time": datetime.now(UTC).isoformat(),
             "error": "verification failed " + "x" * 800,
         },
     }

@@ -48,7 +48,7 @@ def test_release_builds_one_file_archives_with_checksums_and_units():
         "tar -czf",
         "sha256sum",
         "tools/check_release.py",
-        "actions/upload-artifact@v4",
+        "actions/upload-artifact@v7",
     ):
         assert phrase in text
     assert "uv tool install" not in text
@@ -66,7 +66,7 @@ def test_release_publishes_only_after_both_builds_with_provenance():
         "id-token": "write",
         "attestations": "write",
     }
-    assert "actions/download-artifact@v5" in steps
+    assert "actions/download-artifact@v8" in steps
     assert "install.sh release/install.sh" in steps
     assert "actions/attest@v4" in steps
     assert "release/evdb_linux_*.tar.gz" in steps

@@ -7,7 +7,7 @@ import socket
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -431,7 +431,7 @@ def append_activity(
     backup: str | None = None,
     safety_snapshot: str | None = None,
 ) -> None:
-    finished = datetime.now(timezone.utc).isoformat()
+    finished = datetime.now(UTC).isoformat()
     record = {
         "time": finished,
         "started": started or finished,
@@ -508,7 +508,7 @@ def require_no_orphans(config: Config, state: MachineState | None = None) -> Non
     for path in config.paths.projects.glob("*/*/compose.yaml"):
         try:
             project, role, name = path.relative_to(config.paths.projects).parts
-        except (ValueError, OSError):
+        except ValueError, OSError:
             continue
         if name == "compose.yaml" and role in {"postgres", "kv"}:
             installed.add(f"{project}/{role}")

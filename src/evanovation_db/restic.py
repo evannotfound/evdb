@@ -4,7 +4,7 @@ import hashlib
 import json
 import shutil
 import time
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -422,7 +422,7 @@ def _snapshot_time(value: Any) -> datetime | None:
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return result if result.tzinfo is not None else result.replace(tzinfo=timezone.utc)
+    return result if result.tzinfo is not None else result.replace(tzinfo=UTC)
 
 
 def _protected_values(*paths: Path) -> tuple[str, ...]:

@@ -12,10 +12,10 @@ jobs:
   check:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
         with:
-          python-version: "3.10"
+          python-version: "3.14"
           enable-cache: true
       - run: uv sync --locked
       - name: Verify release version
@@ -36,10 +36,10 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
         with:
-          python-version: "3.10"
+          python-version: "3.14"
           enable-cache: true
       - run: uv sync --locked
       - run: make binary
@@ -59,7 +59,7 @@ jobs:
           (cd artifacts && sha256sum "${ASSET}" > "${ASSET}.sha256")
           uv run python tools/check_release.py "artifacts/${ASSET}" "${GITHUB_REF_NAME}"
         working-directory: ${{ github.workspace }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.arch }}
           path: artifacts/*
@@ -74,8 +74,8 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: release

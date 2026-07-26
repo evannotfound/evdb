@@ -30,7 +30,7 @@ def state(name: str, *, timeout: int = 30, health: bool = False) -> dict:
         )
         if health:
             value["healthy"] = value["running"] and health_data.get("Status") == "healthy"
-    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+    except json.JSONDecodeError, IndexError, KeyError, TypeError:
         pass
     return value
 

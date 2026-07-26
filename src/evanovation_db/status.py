@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -398,7 +398,7 @@ def _orphans(config: Config, state) -> tuple[str, ...]:
     for path in config.paths.projects.glob("*/*/compose.yaml"):
         try:
             project, role, name = path.relative_to(config.paths.projects).parts
-        except (ValueError, OSError):
+        except ValueError, OSError:
             continue
         if name == "compose.yaml" and role in {"postgres", "kv"}:
             installed.add(f"{project}/{role}")
@@ -421,7 +421,7 @@ def _infrastructure(config, state, errors):
                 and len(network_data) == 1
                 and network_data[0].get("Labels", {}).get(compose.NETWORK_LABEL) == "true"
             )
-        except (AttributeError, json.JSONDecodeError, TypeError):
+        except AttributeError, json.JSONDecodeError, TypeError:
             network_owned = False
     network_ok = network_available and network_owned
     proxy = docker.state(compose.TRAEFIK_CONTAINER, timeout=10, health=True)
@@ -444,7 +444,7 @@ def _infrastructure(config, state, errors):
                 and proxy["labels"].get(compose.CONTRACT_LABEL)
                 == expected["labels"][compose.CONTRACT_LABEL]
             )
-        except (KeyError, TypeError, ValueError):
+        except KeyError, TypeError, ValueError:
             pass
     traefik_configuration_match = traefik_source_match and traefik_definition_match
     traefik_ok = bool(
@@ -602,7 +602,7 @@ def _transaction(config: Config) -> dict[str, Any] | None:
                         try:
                             value = json.loads(record.read_text())
                             data = value if isinstance(value, dict) else {}
-                        except (OSError, json.JSONDecodeError):
+                        except OSError, json.JSONDecodeError:
                             pass
                     project = data.get("project")
                     role = data.get("role")
@@ -625,15 +625,13 @@ def _transaction(config: Config) -> dict[str, Any] | None:
                         "role": role if role in {"postgres", "kv"} else None,
                         "phase": data.get("phase") or "staged",
                         "recovery": data.get("recovery") or "run evdb host check before mutation",
-                        "updated": datetime.fromtimestamp(
-                            details.st_mtime, timezone.utc
-                        ).isoformat(),
+                        "updated": datetime.fromtimestamp(details.st_mtime, UTC).isoformat(),
                     }
     return None
 
 
 def _freshness(config, target, upload, test, errors):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     upload_time = _date(upload.get("time")) if isinstance(upload, dict) else None
     test_time = _date(test.get("time")) if isinstance(test, dict) and test.get("ok") else None
     upload_stale = (
@@ -653,7 +651,7 @@ def _compose_matches(path: Path, expected: dict[str, Any]) -> bool:
         text = path.read_text()
         rendered = yaml.safe_dump(expected, sort_keys=False)
         return yaml.safe_load(text) == expected and text == rendered
-    except (OSError, yaml.YAMLError):
+    except OSError, yaml.YAMLError:
         return False
 
 
@@ -675,7 +673,7 @@ def _date(value: Any) -> datetime | None:
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return result if result.tzinfo else result.replace(tzinfo=timezone.utc)
+    return result if result.tzinfo else result.replace(tzinfo=UTC)
 
 
 def _backup_cell(value) -> str:

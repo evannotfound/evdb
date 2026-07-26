@@ -6,7 +6,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -195,7 +195,7 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
     timeout = config.host.timeouts["command"]
     command_name = "database configure" if change.prior else "database add"
     started = time.monotonic()
-    activity_started = datetime.now(timezone.utc).isoformat()
+    activity_started = datetime.now(UTC).isoformat()
     protected = secrets.protected(change.secret_files)
     log_write(
         "database_operation",

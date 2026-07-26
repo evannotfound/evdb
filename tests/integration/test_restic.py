@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -82,7 +82,7 @@ def test_local_restic_retention_prune_and_subset_check(config, tmp_path):
     folder = tmp_path / "history"
     folder.mkdir()
     (folder / "data").write_text("first")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for days in (100, 40, 8, 0):
         (folder / "data").write_text(str(days))
         restic._run(

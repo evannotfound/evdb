@@ -5,7 +5,7 @@ import shutil
 import time
 from contextlib import nullcontext, suppress
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -72,12 +72,12 @@ def create(
             error=str(exc),
         )
         raise
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     partial = root / f"{run_id}.partial"
     context = nullcontext() if lock_held else operation(config, database)
     with context:
         private_dir(partial)
-        started = datetime.now(timezone.utc).isoformat()
+        started = datetime.now(UTC).isoformat()
         step = "engine"
         try:
             facts = _engine(database).backup(config, database, partial, run_id, current)
@@ -92,7 +92,7 @@ def create(
                 "source_image": database.image,
                 "image": role.images["primary"].image,
                 "started": started,
-                "finished": datetime.now(timezone.utc).isoformat(),
+                "finished": datetime.now(UTC).isoformat(),
                 "version": facts.pop("version"),
                 "format": facts.pop("format"),
                 "purpose": purpose,
@@ -127,7 +127,7 @@ def create(
                     "ok": True,
                     "backup": run_id,
                     "snapshot": snapshot,
-                    "time": datetime.now(timezone.utc).isoformat(),
+                    "time": datetime.now(UTC).isoformat(),
                 }
                 manifest_write(folder, data)
                 _record(config, database, "backup", _summary(data, folder.name))
@@ -198,7 +198,7 @@ def history(config: Config, database: Database) -> list[dict[str, Any]]:
                 continue
             try:
                 data = manifest_check(folder)
-            except (BackupError, OSError, ValueError):
+            except BackupError, OSError, ValueError:
                 continue
             if not _matches(config, database, data):
                 continue
@@ -305,7 +305,7 @@ def _test(config: Config, database: Database, value: str | None = None) -> dict[
             result = verify(config, database, folder, keep=False)
             record = {
                 "ok": True,
-                "time": datetime.now(timezone.utc).isoformat(),
+                "time": datetime.now(UTC).isoformat(),
                 "backup": selected["backup"],
                 "snapshot": selected["snapshot"],
                 "result": result["result"],
@@ -315,7 +315,7 @@ def _test(config: Config, database: Database, value: str | None = None) -> dict[
         except Exception as exc:
             record = {
                 "ok": False,
-                "time": datetime.now(timezone.utc).isoformat(),
+                "time": datetime.now(UTC).isoformat(),
                 "backup": selected["backup"],
                 "snapshot": selected["snapshot"],
                 "error": _message(exc),
@@ -576,7 +576,7 @@ def _error(
     errors[command] = {
         "command": command,
         "step": step,
-        "time": datetime.now(timezone.utc).isoformat(),
+        "time": datetime.now(UTC).isoformat(),
         "message": _message(error),
         **fields,
     }
@@ -689,9 +689,9 @@ def _snapshot_tag(snapshot: dict[str, Any], name: str) -> str | None:
 def _time(value: str) -> datetime:
     try:
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (AttributeError, ValueError):
-        return datetime.min.replace(tzinfo=timezone.utc)
-    return result if result.tzinfo else result.replace(tzinfo=timezone.utc)
+    except AttributeError, ValueError:
+        return datetime.min.replace(tzinfo=UTC)
+    return result if result.tzinfo else result.replace(tzinfo=UTC)
 
 
 def _message(error: BaseException) -> str:

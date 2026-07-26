@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from .run import redact as redact_values
@@ -29,7 +29,7 @@ def sanitize(text: str, secrets: tuple[str, ...] = ()) -> str:
 
 def write(event: str, *, secrets: tuple[str, ...] = (), **fields: Any) -> None:
     data = {
-        "time": datetime.now(timezone.utc).isoformat(),
+        "time": datetime.now(UTC).isoformat(),
         "event": event,
         **fields,
     }

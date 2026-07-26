@@ -172,7 +172,7 @@ def settings(target: Database, *, input_fn=input, output=print) -> tuple[dict, t
                     raise ValueError
                 if name == "memory" and not re.fullmatch(r"[1-9][0-9]*(?:kb|mb|gb)", parsed):
                     raise ValueError
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 output("Invalid value")
                 continue
             values[name] = parsed

@@ -5,7 +5,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -92,7 +92,7 @@ def restore(
     if not database.durable:
         raise RestoreError(f"restore is disabled for cache database {database.identity}")
     current = state or load_state(config)
-    activity_started = datetime.now(timezone.utc).isoformat()
+    activity_started = datetime.now(UTC).isoformat()
     started = time.monotonic()
     log_write(
         "restore_operation",
@@ -188,7 +188,7 @@ def restore(
             try:
                 try:
                     _compose(config, database, "stop")
-                except (KeyboardInterrupt, SystemExit):
+                except KeyboardInterrupt, SystemExit:
                     stopped = True
                     raise
                 stopped = True

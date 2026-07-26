@@ -618,7 +618,7 @@ def _ports_available() -> bool:
             values = json.loads(result.out)
             labels = values[0]["Config"]["Labels"] or {}
             running = values[0]["State"]["Running"] is True
-        except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+        except json.JSONDecodeError, IndexError, KeyError, TypeError:
             return False
         owned = bool(
             labels.get("com.docker.compose.project") == compose.TRAEFIK_PROJECT
