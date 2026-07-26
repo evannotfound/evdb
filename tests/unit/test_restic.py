@@ -115,7 +115,7 @@ def test_upload_tags_checked_manifest_identity_not_staging_name(
             "started": "2026-01-01T00:00:00+00:00",
             "finished": "2026-01-01T00:01:00+00:00",
             "version": "16.1",
-            "format": "test-v1",
+            "format": "postgres-custom-v1",
             "purpose": "manual",
             "facts": {},
             "files": backup.manifest_files(folder, ["data.bin"]),
@@ -138,6 +138,7 @@ def test_upload_tags_checked_manifest_identity_not_staging_name(
 
     assert restic.upload(config, target, folder) == "snapshot-1"
     assert "backup:backup-identity" in calls[0]
+    assert "purpose:manual" in calls[0]
     assert "backup:temporary-upload-view" not in calls[0]
     events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
     complete = next(
@@ -171,6 +172,60 @@ def test_retention_groups_only_filtered_role_not_mutable_metadata(config, monkey
     tags = command[command.index("--tag") + 1]
     assert tags == "host:test-01,project:app-test-01,role:postgres"
     assert "engine:" not in tags and "backup:" not in tags
+
+    restic.approve_retention(config, target)
+    restic.forget(config, target, dry_run=False)
+    assert "--dry-run" not in calls[-1]
+
+
+def test_retention_requires_matching_reviewed_dry_run(config, monkeypatch):
+    _ready(config)
+    target = config.select("app-test-01/postgres")
+
+    def fake_run(args, **kwargs):
+        output = '{"version":1}' if args[-2:] == ["cat", "config"] else ""
+        return Result(tuple(args), 0, output, "")
+
+    monkeypatch.setattr(restic, "run", fake_run)
+
+    with pytest.raises(ResticError, match="reviewed dry run"):
+        restic.forget(config, target, dry_run=False)
+
+
+def test_upload_rejects_manifest_for_another_role(config, tmp_path, monkeypatch):
+    _ready(config)
+    target = config.select("app-test-01/postgres")
+    folder = tmp_path / "wrong-role"
+    folder.mkdir()
+    (folder / "data.bin").write_bytes(b"checked")
+    record = {
+        "status": "complete",
+        "backup": "wrong-role",
+        "host": config.host.id,
+        "project": target.project,
+        "role": "kv",
+        "engine": "redis",
+        "source_image": "redis:7.2.5",
+        "image": f"redis:7.2.5@{DIGEST}",
+        "started": "2026-01-01T00:00:00+00:00",
+        "finished": "2026-01-01T00:01:00+00:00",
+        "version": "7.2.5",
+        "format": "redis-rdb-v1",
+        "purpose": "manual",
+        "facts": {},
+        "files": backup.manifest_files(folder, ["data.bin"]),
+        "checks": ["size", "sha256", "redis"],
+        "upload": {"ok": True, "backup": "wrong-role"},
+    }
+    backup.manifest_write(folder, record)
+    monkeypatch.setattr(
+        restic,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Restic started")),
+    )
+
+    with pytest.raises(ResticError, match="backup role does not match"):
+        restic.upload(config, target, folder)
 
 
 def test_repository_check_rotation_is_stable(config):

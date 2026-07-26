@@ -6,6 +6,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -24,6 +25,7 @@ from .config import (
     dump,
     load_state,
     replace_role,
+    require_no_orphans,
     resolve_state,
     state_dict,
     with_role,
@@ -102,7 +104,7 @@ def prepare_add(
     resolver=None,
     generate=None,
 ) -> Change:
-    _require_no_orphans(config, state or load_state(config))
+    require_no_orphans(config, state or load_state(config))
     identity = f"{project}/{role}"
     try:
         existing = config.select(identity)
@@ -130,7 +132,7 @@ def prepare_add(
         settings = KV(
             engine,
             DEFAULT_IMAGES[engine],
-            http=HTTP(),
+            http=HTTP(domain=f"{project}.kv-{config.host.id}.{config.host.domain}"),
             memory="256mb" if engine == "dragonfly" else None,
             threads=1 if engine == "dragonfly" else None,
         )
@@ -162,7 +164,7 @@ def prepare_configure(
     generate=None,
 ) -> Change:
     current = state or load_state(config)
-    _require_no_orphans(config, current)
+    require_no_orphans(config, current)
     database = config.select(selector)
     settings, changed = _settings(database, values, reset)
     if database.engine != ("postgres" if database.role == "postgres" else settings.engine):
@@ -193,6 +195,7 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
     timeout = config.host.timeouts["command"]
     command_name = "database configure" if change.prior else "database add"
     started = time.monotonic()
+    activity_started = datetime.now(timezone.utc).isoformat()
     protected = secrets.protected(change.secret_files)
     log_write(
         "database_operation",
@@ -206,10 +209,23 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
         result="started",
     )
     with operation(config, database, write=True, timeout=timeout):
-        _require_no_orphans(config, load_state(config))
-        if _fingerprint(change.before, change.prior) != change.fingerprint:
-            raise DatabaseError("configuration changed after preview; run the command again")
+        try:
+            require_no_orphans(config, load_state(config))
+            if _fingerprint(change.before, change.prior) != change.fingerprint:
+                raise DatabaseError("configuration changed after preview; run the command again")
+        except BaseException:
+            append_activity(
+                config,
+                command=command_name,
+                database=database,
+                changed=change.changed,
+                result="failed",
+                recovery=None,
+                started=activity_started,
+            )
+            raise
         safety = None
+        safety_snapshot = None
         if change.safety_backup:
             try:
                 if backup_create is None:
@@ -218,6 +234,7 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
                 snapshot = safety.get("snapshot") or safety.get("upload", {}).get("snapshot")
                 if not snapshot:
                     raise DatabaseError("safety backup did not produce a confirmed snapshot")
+                safety_snapshot = snapshot
                 live_state = load_state(config)
                 live_role = live_state.roles.get(database.identity)
                 candidate_role = change.after_state.roles.get(database.identity)
@@ -236,7 +253,17 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
                         },
                     ),
                 )
-            except Exception as exc:
+            except BaseException as exc:
+                append_activity(
+                    config,
+                    command=command_name,
+                    database=database,
+                    changed=change.changed,
+                    result="failed",
+                    recovery=None,
+                    started=activity_started,
+                    safety_snapshot=safety_snapshot,
+                )
                 log_write(
                     "database_operation",
                     secrets=protected,
@@ -252,26 +279,41 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
                 )
                 raise
 
-        targets = _installed_paths(change)
-        prior_files = _snapshot(targets)
-        asset_dirs = (
-            database.data,
-            change.after.paths.role_config(database.project, database.role),
-            change.after.paths.role_secrets(database.project, database.role),
-        )
-        for path in asset_dirs:
-            if path.is_symlink() or (path.exists() and not path.is_dir()):
-                raise DatabaseError(f"managed asset path is unsafe: {path}")
-        created_dirs = tuple(path for path in asset_dirs if not path.exists())
-        write_json(
-            change.transaction / "transaction.json",
-            {
-                "host": config.host.id,
-                "database": database.identity,
-                "changed": list(change.changed),
-                "phase": "installing",
-            },
-        )
+        try:
+            targets = _installed_paths(change)
+            prior_files = _snapshot(targets)
+            asset_dirs = (
+                database.data,
+                change.after.paths.role_config(database.project, database.role),
+                change.after.paths.role_secrets(database.project, database.role),
+            )
+            for path in asset_dirs:
+                if path.is_symlink() or (path.exists() and not path.is_dir()):
+                    raise DatabaseError(f"managed asset path is unsafe: {path}")
+            created_dirs = tuple(path for path in asset_dirs if not path.exists())
+            write_json(
+                change.transaction / "transaction.json",
+                {
+                    "kind": "settings",
+                    "host": config.host.id,
+                    "database": database.identity,
+                    "changed": list(change.changed),
+                    "phase": "installing",
+                    "recovery": "run evdb host check before retrying the settings change",
+                },
+            )
+        except BaseException:
+            append_activity(
+                config,
+                command=command_name,
+                database=database,
+                changed=change.changed,
+                result="failed",
+                recovery=None,
+                started=activity_started,
+                safety_snapshot=safety_snapshot,
+            )
+            raise
         candidate_invoked = False
         try:
             _install(change)
@@ -288,7 +330,7 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
                 secrets=secrets.protected(change.secret_files),
             )
             health(change.after, database, state=change.after_state)
-        except Exception as exc:
+        except BaseException as exc:
             failures = []
             if change.prior is None and candidate_invoked:
                 try:
@@ -297,7 +339,7 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
                         timeout=timeout,
                         secrets=secrets.protected(change.secret_files),
                     )
-                except Exception:
+                except BaseException:
                     failures.append("candidate service stop")
             if not failures:
                 failures.extend(_restore(prior_files))
@@ -315,7 +357,7 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
                         secrets=secrets.protected(change.secret_files),
                     )
                     health(config, change.prior, state=change.before_state)
-                except Exception:
+                except BaseException:
                     failures.append("prior service health")
             elif not failures:
                 failures.extend(_remove_created_empty(created_dirs))
@@ -326,6 +368,8 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
                 changed=change.changed,
                 result="failed",
                 recovery="failed" if failures else "recovered",
+                started=activity_started,
+                safety_snapshot=safety_snapshot,
             )
             log_write(
                 "database_operation",
@@ -342,6 +386,17 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
                 error=str(exc),
             )
             if failures:
+                write_json(
+                    change.transaction / "transaction.json",
+                    {
+                        "kind": "settings",
+                        "host": config.host.id,
+                        "database": database.identity,
+                        "changed": list(change.changed),
+                        "phase": "recovery_failed",
+                        "recovery": "inspect protected files and run evdb host check",
+                    },
+                )
                 raise DatabaseError(
                     f"database change failed and recovery failed; inspect {change.transaction}"
                 ) from exc
@@ -357,6 +412,8 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
             changed=change.changed,
             result="success",
             recovery=None,
+            started=activity_started,
+            safety_snapshot=safety_snapshot,
         )
         log_write(
             "database_operation",
@@ -384,44 +441,76 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
 
 
 def start(config: Config, database: Database, *, state: MachineState | None = None) -> None:
-    current = state or load_state(config)
-    _require_installed(config, database, current)
-    with operation(config, database, timeout=config.host.timeouts["command"]):
-        run(
-            compose.command(
-                database.compose,
-                database.compose_project,
-                "up",
-                "-d",
-                "--remove-orphans",
-            ),
-            timeout=config.host.timeouts["command"],
-            secrets=_protected_credentials(config, database),
-        )
-        health(config, database, state=current)
+    _lifecycle(config, database, "start", ("up", "-d", "--remove-orphans"), state, True)
 
 
 def stop(config: Config, database: Database, *, state: MachineState | None = None) -> None:
-    current = state or load_state(config)
-    _require_installed(config, database, current)
-    with operation(config, database, timeout=config.host.timeouts["command"]):
-        run(
-            compose.command(database.compose, database.compose_project, "stop"),
-            timeout=config.host.timeouts["command"],
-            secrets=_protected_credentials(config, database),
-        )
+    _lifecycle(config, database, "stop", ("stop",), state, False)
 
 
 def restart(config: Config, database: Database, *, state: MachineState | None = None) -> None:
-    current = state or load_state(config)
-    _require_installed(config, database, current)
-    with operation(config, database, timeout=config.host.timeouts["command"]):
-        run(
-            compose.command(database.compose, database.compose_project, "restart"),
-            timeout=config.host.timeouts["command"],
-            secrets=_protected_credentials(config, database),
+    _lifecycle(config, database, "restart", ("restart",), state, True)
+
+
+def _lifecycle(
+    config: Config,
+    database: Database,
+    command: str,
+    args: tuple[str, ...],
+    state: MachineState | None,
+    check_health: bool,
+) -> None:
+    started = time.monotonic()
+    protected = _protected_credentials(config, database)
+    log_write(
+        "database_lifecycle",
+        secrets=protected,
+        host=config.host.id,
+        project=database.project,
+        role=database.role,
+        engine=database.engine,
+        command=f"database {command}",
+        step="start",
+        result="started",
+    )
+    try:
+        current = state or load_state(config)
+        _require_installed(config, database, current)
+        with operation(config, database, timeout=config.host.timeouts["command"]):
+            run(
+                compose.command(database.compose, database.compose_project, *args),
+                timeout=config.host.timeouts["command"],
+                secrets=protected,
+            )
+            if check_health:
+                health(config, database, state=current)
+    except BaseException as exc:
+        log_write(
+            "database_lifecycle",
+            secrets=protected,
+            host=config.host.id,
+            project=database.project,
+            role=database.role,
+            engine=database.engine,
+            command=f"database {command}",
+            step="complete",
+            result="failed",
+            duration=round(time.monotonic() - started, 3),
+            error=str(exc),
         )
-        health(config, database, state=current)
+        raise
+    log_write(
+        "database_lifecycle",
+        secrets=protected,
+        host=config.host.id,
+        project=database.project,
+        role=database.role,
+        engine=database.engine,
+        command=f"database {command}",
+        step="complete",
+        result="success",
+        duration=round(time.monotonic() - started, 3),
+    )
 
 
 def logs(config: Config, database: Database, *, lines: int = 200) -> str:
@@ -669,7 +758,7 @@ def _stage(
         if prior is not None:
             prior_data = compose.database(before, prior, current)
             primary_change = prior_data["services"][primary_name] != data["services"][primary_name]
-        contract = next(iter(data["services"].values()))["labels"][compose.CONTRACT_LABEL]
+        contract = compose.service_hash(data)
         role = after_state.roles[target.identity]
         role = replace(role, compose_hash=contract, installed=True)
         after_state = replace(
@@ -909,26 +998,8 @@ def _replace_paths(value: Any, replacements: list[tuple[str, str]]) -> Any:
     return value
 
 
-def _require_no_orphans(config: Config, state: MachineState) -> None:
-    configured = {item.identity for item in config.databases}
-    installed = {identity for identity, role in state.roles.items() if role.installed}
-    for path in config.paths.projects.glob("*/*/compose.yaml"):
-        try:
-            relative = path.relative_to(config.paths.projects)
-            project, role, _ = relative.parts
-        except ValueError:
-            continue
-        installed.add(f"{project}/{role}")
-    missing = installed - configured
-    if missing:
-        names = ", ".join(sorted(missing))
-        raise DatabaseError(
-            f"database removal is unsupported; restore source roles before mutation: {names}"
-        )
-
-
 def _require_installed(config: Config, database: Database, state: MachineState) -> None:
-    _require_no_orphans(config, state)
+    require_no_orphans(config, state)
     role = state.roles.get(database.identity)
     if role is None or not role.installed or not database.compose.is_file():
         raise DatabaseError(f"database is not installed: {database.identity}")

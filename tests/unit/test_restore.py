@@ -5,7 +5,7 @@ import pytest
 
 from evanovation_db import backup, restore
 from evanovation_db.config import resolve_state, write_state
-from evanovation_db.errors import CommandError, RestoreError
+from evanovation_db.errors import BackupError, CommandError, RestoreError
 from evanovation_db.run import Result
 
 DIGEST = "sha256:" + "a" * 64
@@ -46,7 +46,7 @@ def _backup(config, target, tmp_path, *, source_image="postgres:16", version="16
         "started": "2026-01-01T00:00:00+00:00",
         "finished": "2026-01-01T00:01:00+00:00",
         "version": version,
-        "format": "test-v1",
+        "format": "postgres-custom-v1",
         "purpose": "manual",
         "facts": {},
         "files": backup.manifest_files(folder, ["data.bin"]),
@@ -101,6 +101,22 @@ def test_verify_rejects_recorded_engine_version_mismatch_before_start(
     )
 
     with pytest.raises(RestoreError, match="majors must match"):
+        restore.verify(config, target, folder, state=state)
+
+
+def test_verify_rejects_incompatible_backup_format_before_start(config, tmp_path, monkeypatch):
+    state = _ready(config)
+    target = config.select("app-test-01/postgres")
+    folder = _backup(config, target, tmp_path)
+    record = backup.manifest_read(folder)
+    backup.manifest_write(folder, {**record, "format": "redis-rdb-v1"})
+    monkeypatch.setattr(
+        restore,
+        "_engine",
+        lambda database: (_ for _ in ()).throw(AssertionError("engine started")),
+    )
+
+    with pytest.raises(BackupError, match="format does not match"):
         restore.verify(config, target, folder, state=state)
 
 
@@ -204,6 +220,93 @@ def test_decline_keeps_live_data_and_removes_candidate(config, tmp_path, monkeyp
     assert calls == []
 
 
+def test_confirmation_interrupt_keeps_live_data_and_removes_candidate(
+    config, tmp_path, monkeypatch
+):
+    state, target, calls = _workflow(config, tmp_path, monkeypatch)
+
+    with pytest.raises(KeyboardInterrupt):
+        restore.restore(
+            config,
+            target,
+            confirm=lambda preview: (_ for _ in ()).throw(KeyboardInterrupt()),
+            state=state,
+        )
+
+    assert (target.data / "live").read_text() == "old"
+    assert not list(target.data.parent.glob(".data.candidate-*"))
+    assert calls == []
+
+
+def test_stop_interrupt_restarts_live_service_and_cleans_candidate(config, tmp_path, monkeypatch):
+    state, target, calls = _workflow(config, tmp_path, monkeypatch)
+    first = True
+
+    def interrupted(args, **kwargs):
+        nonlocal first
+        calls.append(args)
+        if first:
+            first = False
+            raise KeyboardInterrupt()
+        return Result(tuple(args), 0, "", "")
+
+    monkeypatch.setattr(restore, "run", interrupted)
+    monkeypatch.setattr(restore.databases, "health", lambda *args, **kwargs: None)
+
+    with pytest.raises(KeyboardInterrupt):
+        restore.restore(config, target, yes=True, state=state)
+
+    assert calls[0][-1] == "stop"
+    assert calls[1][-3:] == ["up", "-d", "--remove-orphans"]
+    assert (target.data / "live").read_text() == "old"
+    assert not list(target.data.parent.glob(".data.candidate-*"))
+
+
+def test_interrupt_between_renames_recovers_prior_and_cleans_candidate(
+    config, tmp_path, monkeypatch
+):
+    state, target, _calls = _workflow(config, tmp_path, monkeypatch)
+    monkeypatch.setattr(restore.databases, "health", lambda *args, **kwargs: None)
+
+    def interrupted(live, candidate, prior):
+        live.replace(prior)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(restore, "_exchange", interrupted)
+
+    with pytest.raises(RestoreError, match="prior data recovered"):
+        restore.restore(config, target, yes=True, state=state)
+
+    assert (target.data / "live").read_text() == "old"
+    assert not list(target.data.parent.glob(".data.candidate-*"))
+    assert not list(target.data.parent.glob(".data.prior-*"))
+    assert not list(config.paths.restores.glob("*/transaction.json"))
+
+
+def test_start_interrupt_recovers_prior_and_preserves_failed_data(config, tmp_path, monkeypatch):
+    state, target, calls = _workflow(config, tmp_path, monkeypatch)
+    starts = 0
+
+    def interrupted(args, **kwargs):
+        nonlocal starts
+        calls.append(args)
+        if args[-3:] == ["up", "-d", "--remove-orphans"]:
+            starts += 1
+            if starts == 1:
+                raise KeyboardInterrupt()
+        return Result(tuple(args), 0, "", "")
+
+    monkeypatch.setattr(restore, "run", interrupted)
+    monkeypatch.setattr(restore.databases, "health", lambda *args, **kwargs: None)
+
+    with pytest.raises(RestoreError, match="prior data recovered"):
+        restore.restore(config, target, yes=True, state=state)
+
+    assert (target.data / "live").read_text() == "old"
+    assert list(target.data.parent.glob(".data.failed-*"))
+    assert not list(config.paths.restores.glob("*/transaction.json"))
+
+
 def test_failed_restore_recovers_prior_and_preserves_failed(config, tmp_path, monkeypatch):
     state, target, _calls = _workflow(config, tmp_path, monkeypatch)
     checks = 0
@@ -301,7 +404,7 @@ def test_recovery_stop_failure_preserves_exact_prior_and_failed_paths(
         if args[-1] == "stop":
             stops += 1
             if stops == 2:
-                raise CommandError("recovery stop failed")
+                raise KeyboardInterrupt()
         return Result(tuple(args), 0, "", "")
 
     monkeypatch.setattr(restore, "run", fail_recovery_stop)
@@ -319,4 +422,9 @@ def test_recovery_stop_failure_preserves_exact_prior_and_failed_paths(
     assert (target.data / "restored").read_text() == "new"
     assert f"prior={prior}" in str(caught.value)
     assert f"failed={target.data}" in str(caught.value)
-    assert list(config.paths.restores.glob("*/transaction.json"))
+    transaction = next(config.paths.restores.glob("*/transaction.json"))
+    record = json.loads(transaction.read_text())
+    assert record["kind"] == "restore"
+    assert record["prior"] == str(prior)
+    assert record["failed"] == str(target.data.parent / record["failed"].split("/")[-1])
+    assert record["recovery"]

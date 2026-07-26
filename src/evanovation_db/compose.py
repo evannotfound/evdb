@@ -156,16 +156,21 @@ def validate(
 
 
 def ensure_network(*, timeout: int = 60) -> None:
+    if _network_exists(timeout=timeout):
+        return
+    run(
+        ["docker", "network", "create", "--label", f"{NETWORK_LABEL}=true", NETWORK],
+        timeout=timeout,
+    )
+
+
+def _network_exists(*, timeout: int = 60) -> bool:
     result = run(["docker", "network", "inspect", NETWORK], timeout=timeout, check=False)
     if result.code != 0:
         detail = (result.err or result.out).lower()
         if detail and "not found" not in detail and "no such network" not in detail:
             raise ConfigError("evdb Docker network inspection failed")
-        run(
-            ["docker", "network", "create", "--label", f"{NETWORK_LABEL}=true", NETWORK],
-            timeout=timeout,
-        )
-        return
+        return False
     try:
         items = json.loads(result.out)
         labels = items[0]["Labels"]
@@ -173,6 +178,7 @@ def ensure_network(*, timeout: int = 60) -> None:
         raise ConfigError("existing evdb Docker network is invalid") from exc
     if labels.get(NETWORK_LABEL) != "true":
         raise ConfigError("existing evdb Docker network is not owned by evdb")
+    return True
 
 
 def expected_services(value: dict[str, Any], target: Database) -> dict[str, dict[str, Any]]:

@@ -4,12 +4,16 @@ import argparse
 import json
 import os
 import sys
+import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from . import backup, database, interactive, restic, restore, status
-from .config import CONFIG_DIR, Config, load, load_state
+from .config import CONFIG_DIR, Config, load, load_state, require_no_orphans
 from .errors import Error
+from .log import sanitize
+from .log import write as log_write
 
 
 def parser() -> argparse.ArgumentParser:
@@ -70,6 +74,7 @@ def parser() -> argparse.ArgumentParser:
     retention = backup_commands.add_parser("retention")
     retention.add_argument("database", nargs="?")
     retention.add_argument("--all", action="store_true")
+    retention.add_argument("--dry-run", action="store_true")
     retention.add_argument("--yes", action="store_true")
     prune = backup_commands.add_parser("prune")
     prune.add_argument("role", nargs="?", choices=("postgres", "kv"))
@@ -88,7 +93,8 @@ def parser() -> argparse.ArgumentParser:
 
     host = commands.add_parser("host", help="check, set up, or update this host")
     host_commands = host.add_subparsers(dest="host_command", required=True)
-    host_commands.add_parser("check")
+    host_check = host_commands.add_parser("check")
+    host_check.add_argument("--json", action="store_true")
     setup = host_commands.add_parser("setup")
     setup.add_argument("--host-id")
     setup.add_argument("--domain")
@@ -113,6 +119,7 @@ def main(
     output=None,
     error=None,
 ) -> int:
+    terminal_output = output is None and sys.stdout.isatty()
     input_fn = input_fn or input
     output = output or print
     error = error or (lambda value: print(value, file=sys.stderr))
@@ -142,6 +149,8 @@ def main(
                 if values is None:
                     output("Cancelled")
                     return 0
+            elif not source.is_file():
+                _require_setup_values(values)
             output(
                 _host_setup(
                     source,
@@ -163,27 +172,82 @@ def main(
                 output(_host_setup(source, values, False, input_fn, output))
                 return 0
         config = load(args.config)
+        if _mutating(args):
+            require_no_orphans(config)
         if args.command is None:
             return interactive.run(
                 config,
-                _actions(config, input_fn, output),
+                _actions(config, input_fn, output, terminal_output=terminal_output),
                 input_fn=input_fn,
                 output=output,
             )
-        return _dispatch(config, args, input_fn, output)
+        return _dispatch(config, args, input_fn, output, terminal_output=terminal_output)
     except (Error, OSError, ValueError) as exc:
         error(f"evdb: {exc}")
         return 1
 
 
-def _dispatch(config: Config, args, input_fn, output) -> int:
+def _dispatch(config: Config, args, input_fn, output, *, terminal_output: bool = False) -> int:
+    started = time.monotonic()
+    target = None
+    selector = getattr(args, "database", None)
+    if isinstance(selector, str):
+        with suppress(Error):
+            target = config.select(selector)
+    command = args.command
+    subcommand = getattr(args, f"{command}_command", None)
+    if subcommand:
+        command = f"{command} {subcommand}"
+    fields = {
+        "host": config.host.id,
+        "project": target.project if target else None,
+        "role": target.role if target else None,
+        "engine": target.engine if target else None,
+        "command": command,
+    }
+    log_write("cli_operation", **fields, step="start", result="started")
+    try:
+        result = _dispatch_command(
+            config,
+            args,
+            input_fn,
+            output,
+            terminal_output=terminal_output,
+        )
+    except BaseException as exc:
+        log_write(
+            "cli_operation",
+            **fields,
+            step="complete",
+            result="failed",
+            duration=round(time.monotonic() - started, 3),
+            error=str(exc),
+        )
+        raise
+    log_write(
+        "cli_operation",
+        **fields,
+        step="complete",
+        result="success" if result == 0 else "failed",
+        duration=round(time.monotonic() - started, 3),
+    )
+    return result
+
+
+def _dispatch_command(
+    config: Config, args, input_fn, output, *, terminal_output: bool = False
+) -> int:
     if args.command == "status":
+        if os.getenv("EVDB_COMPATIBILITY_CHECK") == "1":
+            from . import host
+
+            host.compatibility(config, Path(os.getenv("EVDB_UNIT_DIR", "/etc/systemd/system")))
         target = config.select(args.database) if args.database else None
         value = status.collect(config, target)
         output(status.dumps(value) if args.json else status.render(value))
         return 0 if value["healthy"] else 1
     if args.command == "database":
-        return _database(config, args, input_fn, output)
+        return _database(config, args, input_fn, output, terminal_output=terminal_output)
     if args.command == "backup":
         return _backup(config, args, input_fn, output)
     if args.command == "restore":
@@ -197,7 +261,7 @@ def _dispatch(config: Config, args, input_fn, output) -> int:
 
         if args.host_command == "check":
             value = host.check(config)
-            output(status.render(value))
+            output(status.dumps(value) if args.json else status.render(value))
             return 0 if value["healthy"] else 1
         version = _required(args.version, "version", "1.2.3", input_fn)
         output(_host_update(config, version, args.yes, input_fn, output))
@@ -205,7 +269,7 @@ def _dispatch(config: Config, args, input_fn, output) -> int:
     raise Error("unknown command")
 
 
-def _database(config, args, input_fn, output):
+def _database(config, args, input_fn, output, *, terminal_output=False):
     command = args.database_command
     if command == "list":
         for item in config.databases:
@@ -231,7 +295,7 @@ def _database(config, args, input_fn, output):
     selector = _required(args.database, "database", "app-prod-01/postgres", input_fn)
     target = config.select(selector)
     if command == "info":
-        if not sys.stdout.isatty():
+        if not terminal_output:
             raise Error("database info prints credentials and requires a terminal")
         value = database.info(config, target)
         output(_info(value))
@@ -305,14 +369,11 @@ def _backup(config, args, input_fn, output):
         selector = _required(args.database, "database", "app-prod-01/postgres", input_fn)
         target = config.select(selector)
     if command == "list":
-        for row in backup.history(config, target):
-            output(
-                f"{row['time']}  {row['backup']}  {row['source']}  {row['verification']['state']}"
-            )
+        output(_history(backup.history(config, target)))
         return 0
     if command == "retention":
         targets = [item for item in config.databases if item.durable] if args.all else [target]
-        if not _confirm(
+        if not args.dry_run and not _confirm(
             f"Host: {config.host.id}\nApply retention: "
             + ", ".join(item.identity for item in targets),
             args.yes,
@@ -321,14 +382,20 @@ def _backup(config, args, input_fn, output):
         ):
             return 0
         for item in targets:
-            restic.forget(config, item, dry_run=False)
-        output("Retention complete")
+            result = restic.forget(config, item, dry_run=args.dry_run)
+            if args.dry_run:
+                preview = sanitize(result.out).strip() or "No snapshots would be removed"
+                output(f"{item.identity}:\n{preview}")
+                restic.approve_retention(config, item)
+        output("Retention dry run complete" if args.dry_run else "Retention complete")
         return 0
     output(_backup_action(config, target, command, args.backup, args.yes, input_fn, output))
     return 0
 
 
-def _actions(config: Config, input_fn, output) -> interactive.Actions:
+def _actions(
+    config: Config, input_fn, output, *, terminal_output: bool = False
+) -> interactive.Actions:
     current = config
 
     def refresh():
@@ -341,6 +408,37 @@ def _actions(config: Config, input_fn, output) -> interactive.Actions:
         active = refresh()
         result = call(active)
         return result, refresh()
+
+    def observe(active, target, command, call):
+        started = time.monotonic()
+        fields = {
+            "host": active.host.id,
+            "project": target.project,
+            "role": target.role,
+            "engine": target.engine,
+            "command": command,
+        }
+        log_write("cli_operation", **fields, step="start", result="started")
+        try:
+            result = call()
+        except BaseException as exc:
+            log_write(
+                "cli_operation",
+                **fields,
+                step="complete",
+                result="failed",
+                duration=round(time.monotonic() - started, 3),
+                error=str(exc),
+            )
+            raise
+        log_write(
+            "cli_operation",
+            **fields,
+            step="complete",
+            result="success",
+            duration=round(time.monotonic() - started, 3),
+        )
+        return result
 
     def show_status():
         active = refresh()
@@ -357,7 +455,13 @@ def _actions(config: Config, input_fn, output) -> interactive.Actions:
 
     def history(target):
         active = refresh()
-        return backup.history(active, active.select(target))
+        selected = active.select(target)
+        return observe(
+            active,
+            selected,
+            "backup list",
+            lambda: backup.history(active, selected),
+        )
 
     def add(project, role, engine):
         return mutation(lambda active: _add(active, project, role, engine, False, input_fn, output))
@@ -375,12 +479,45 @@ def _actions(config: Config, input_fn, output) -> interactive.Actions:
         )
 
     def info(target):
+        if not terminal_output:
+            raise Error("database info prints credentials and requires a terminal")
         active = refresh()
-        return _info(database.info(active, active.select(target)))
+        selected = active.select(target)
+        return observe(
+            active,
+            selected,
+            "database info",
+            lambda: _info(database.info(active, selected)),
+        )
 
     def logs(target):
         active = refresh()
-        return database.logs(active, active.select(target))
+        selected = active.select(target)
+        return observe(
+            active,
+            selected,
+            "database logs",
+            lambda: database.logs(active, selected),
+        )
+
+    def test_backup(target, selected):
+        active = refresh()
+        database_target = active.select(target)
+        result = observe(
+            active,
+            database_target,
+            "backup test",
+            lambda: _backup_action(
+                active,
+                database_target,
+                "test",
+                selected,
+                False,
+                input_fn,
+                output,
+            ),
+        )
+        return result, refresh()
 
     return interactive.Actions(
         status=show_status,
@@ -405,17 +542,7 @@ def _actions(config: Config, input_fn, output) -> interactive.Actions:
         ),
         backup_list=lambda target: _history(history(target)),
         backup_history=history,
-        backup_test=lambda target, selected: mutation(
-            lambda active: _backup_action(
-                active,
-                active.select(target),
-                "test",
-                selected,
-                False,
-                input_fn,
-                output,
-            )
-        ),
+        backup_test=test_backup,
         restore=lambda target, selected: mutation(
             lambda active: _restore(
                 active,
@@ -485,7 +612,15 @@ def _backup_action(config, target, command, selected, yes, input_fn, output):
         if command == "create"
         else backup.test(config, target, selected)
     )
-    return _result(result)
+    if command == "create":
+        return (
+            f"{target.identity}: backup {result['backup']} completed at {result['finished']}; "
+            f"snapshot {result.get('snapshot') or 'not uploaded'}"
+        )
+    return (
+        f"{target.identity}: backup {result['backup']} tested at {result['time']}; "
+        f"snapshot {result.get('snapshot') or 'local'}"
+    )
 
 
 def _restore(config, target, selected, yes, input_fn, output):
@@ -531,6 +666,22 @@ def _required(value, name, example, input_fn):
     raise Error(f"{name} is required; example: {example}")
 
 
+def _require_setup_values(values: dict[str, Any]) -> None:
+    examples = {
+        "host_id": "--host-id host-01",
+        "domain": "--domain storage.example.com",
+        "data_root": "--data-root /srv/databases",
+        "acme_email": "--acme-email ops@example.com",
+        "dns_provider": "--dns-provider cloudflare",
+        "postgres_repo": "--postgres-repo rclone:remote:host-01/postgres",
+        "kv_repo": "--kv-repo rclone:remote:host-01/kv",
+        "dns_env_file": "--dns-env-file /root/evdb-dns.env",
+    }
+    for name, example in examples.items():
+        if not values.get(name):
+            raise Error(f"{name.replace('_', '-')} is required; example: evdb host setup {example}")
+
+
 def _confirm(text, yes, input_fn, output):
     output(text)
     if yes:
@@ -574,7 +725,8 @@ def _history(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return "No backups available"
     return "\n".join(
-        f"{row['time']}  {row['backup']}  {row.get('source', 'unknown')}  "
+        f"{row['time']}  {row['backup']}  {row.get('purpose', 'unknown')}  "
+        f"{row.get('source', 'unknown')}  {row.get('snapshot') or '-'}  "
         f"{row.get('verification', {}).get('state', 'unknown')}"
         for row in rows
     )

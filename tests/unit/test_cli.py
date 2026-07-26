@@ -6,6 +6,7 @@ import pytest
 
 from evanovation_db import cli
 from evanovation_db.config import replace_role
+from evanovation_db.run import Result
 
 
 @pytest.mark.parametrize(
@@ -88,6 +89,37 @@ def test_database_info_refuses_non_terminal_output(config, monkeypatch):
 
     assert code == 1
     assert "prints credentials" in errors[0]
+
+
+def test_database_info_rejects_injected_output_even_when_stdout_is_terminal(config, monkeypatch):
+    monkeypatch.setattr(cli, "load", lambda path: config)
+    monkeypatch.setattr(cli.sys, "stdout", SimpleNamespace(isatty=lambda: True))
+    errors = []
+
+    code = cli.main(
+        ["database", "info", "app-test-01/kv"],
+        output=lambda value: None,
+        error=errors.append,
+    )
+
+    assert code == 1
+    assert "prints credentials" in errors[0]
+
+
+def test_non_tty_initial_setup_names_missing_option_and_example(paths, monkeypatch):
+    monkeypatch.setattr(cli, "_canonical", lambda source: True)
+    monkeypatch.setattr(cli, "_tty", lambda: False)
+    errors = []
+
+    code = cli.main(
+        ["--config", str(paths.source), "host", "setup", "--yes"],
+        output=lambda value: None,
+        error=errors.append,
+    )
+
+    assert code == 1
+    assert "host-id is required" in errors[0]
+    assert "evdb host setup --host-id host-01" in errors[0]
 
 
 def test_yes_confirms_but_does_not_invent_missing_input(config, monkeypatch):
@@ -403,6 +435,28 @@ def test_alternate_config_retains_source_only_database_list(config, tmp_path, mo
 )
 def test_mutating_command_classification(argv):
     assert cli._mutating(cli.parser().parse_args(argv))
+
+
+def test_retention_dry_run_displays_preview_before_approval(config, monkeypatch):
+    output = []
+    approvals = []
+    args = cli.parser().parse_args(["backup", "retention", "app-test-01/postgres", "--dry-run"])
+    monkeypatch.setattr(
+        cli.restic,
+        "forget",
+        lambda *args, **kwargs: Result(("restic",), 0, "remove old snapshot token=private\n", ""),
+    )
+    monkeypatch.setattr(
+        cli.restic,
+        "approve_retention",
+        lambda current, target: approvals.append((target.identity, len(output))),
+    )
+
+    assert cli._backup(config, args, input, output.append) == 0
+
+    assert "remove old snapshot" in output[0]
+    assert "private" not in output[0]
+    assert approvals == [("app-test-01/postgres", 1)]
 
 
 def test_interactive_actions_reload_config_and_state_between_mutations(config, monkeypatch):

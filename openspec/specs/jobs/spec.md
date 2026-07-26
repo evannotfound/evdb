@@ -14,102 +14,100 @@ External commands SHALL use argument arrays without `shell=True`, enforce timeou
 - **THEN** the stored and displayed error replaces that value with a redaction marker
 
 ### Requirement: Unified database status
-`evdb status` SHALL report every configured database's running state, engine health, deployment drift, latest completed local backup, latest confirmed remote backup and upload result, latest successful full backup verification, and current operation failure in one concise table.
+`evdb status` SHALL report every configured project/role's running state, concrete engine health, installed-configuration match, current image, latest completed local backup, latest confirmed Restic snapshot and upload result, latest successful backup test, and current operation failure in one concise table.
 
 #### Scenario: All databases are healthy
-- **WHEN** every configured database is reachable, current, backed up, and recently verified
-- **THEN** status prints one compact healthy row per database and exits zero
+- **WHEN** every configured role is running, matches installed Compose, is backed up, and has recent recovery verification
+- **THEN** status prints one compact healthy row per project/role and exits zero
 
 #### Scenario: One database is unhealthy
-- **WHEN** a database fails an engine health check
-- **THEN** its row identifies the failure, the remaining rows are still reported, and status exits nonzero
+- **WHEN** one role fails an engine health check
+- **THEN** its row identifies the failure, remaining rows are reported, and status exits nonzero
 
 ### Requirement: Host status
-Status SHALL include SSH reachability, free data and backup disk space, active release identity, configuration-lock consistency, and required timer state.
-
-#### Scenario: Host is unreachable
-- **WHEN** SSH cannot reach the configured host
-- **THEN** status reports the host failure locally, performs no write, and exits nonzero
+Status SHALL include host identity, installed evdb version, configuration and machine-state consistency, dedicated Traefik and network health, native listener state, free data and backup disk space, required timer state, and any incomplete settings, restore, setup, or update transaction. It SHALL not depend on SSH reachability or an active deployment release.
 
 #### Scenario: Disk space is below policy
 - **WHEN** free space is below the configured minimum
-- **THEN** status marks the host unhealthy and reports the affected filesystem without exposing unrelated host data
+- **THEN** status marks the host unhealthy and names the affected evdb filesystem without exposing unrelated host data
+
+#### Scenario: Settings transaction was interrupted
+- **WHEN** private transaction state remains after an interrupted mutation
+- **THEN** host status identifies the affected project/role and directs the operator to a safe host check
 
 ### Requirement: Live engine checks
-The remote runtime SHALL inspect container state and perform an engine-native ping or simple query for each running database. A running container alone SHALL NOT be considered healthy.
+The host-local runtime SHALL inspect Compose service state and perform an engine-native ping or simple query for each running database. A running container alone SHALL NOT be considered healthy.
 
-#### Scenario: Container is running but database rejects queries
-- **WHEN** Docker reports a running container but the engine-native check fails
-- **THEN** status marks the database unhealthy and records the engine check failure
+#### Scenario: Container runs but engine rejects queries
+- **WHEN** Docker reports a running primary but the native check fails
+- **THEN** status marks the project/role unhealthy and records the engine check failure
 
 ### Requirement: Drift reporting
-Status SHALL compare the active release, locked images, generated configuration, shared network, Traefik, and every expected primary and sidecar container's image, health, and service-contract label. It SHALL distinguish pending desired changes from unplanned live drift.
+Status SHALL compare authoritative host source, installed generated Compose hashes, resolved image state, dedicated network and Traefik, and every expected primary and sidecar's image, health, and service-contract label. Human output SHALL say that configuration or a running service differs rather than exposing desired/deployed/release terminology.
 
-#### Scenario: Live image was changed manually
-- **WHEN** a container image digest differs from both the active release and desired lock
-- **THEN** status reports unplanned image drift for that database
+#### Scenario: Live image changed manually
+- **WHEN** a running image digest differs from installed generated Compose and machine state
+- **THEN** status reports that the selected project/role differs from its installed configuration
 
-#### Scenario: Source has an unapplied change
-- **WHEN** desired configuration differs from the healthy active release
-- **THEN** local status reports the database as pending rather than unhealthy solely because it is unapplied
+#### Scenario: Generated Compose was edited
+- **WHEN** an installed Compose file differs from the canonical source-derived structure
+- **THEN** status marks the role unhealthy and directs the operator to run its settings workflow
 
-#### Scenario: Live service was replaced with the same image
-- **WHEN** a primary database or Traefik container has the expected image but a missing or wrong service-contract hash label
-- **THEN** status reports unplanned service-definition drift
+#### Scenario: Sidecar is unhealthy
+- **WHEN** expected PgBouncer or HTTP service is absent, stopped, unhealthy, or has the wrong contract label
+- **THEN** status marks only that database unhealthy and continues assessing others
 
-#### Scenario: Database sidecar is unhealthy
-- **WHEN** an expected PgBouncer or HTTP sidecar is absent, stopped, unhealthy, or has a wrong contract label
-- **THEN** status reports database deployment drift, marks the database unhealthy, and continues assessing other databases
-
-#### Scenario: Traefik has no Docker health status
-- **WHEN** Traefik is running without a concrete healthy Docker health status
-- **THEN** status marks host infrastructure unhealthy rather than treating the missing healthcheck as healthy
+#### Scenario: Traefik has no health status
+- **WHEN** dedicated Traefik is running without concrete healthy Docker status
+- **THEN** host status marks native routing unhealthy
 
 ### Requirement: Backup and recovery freshness
-Status SHALL evaluate backup upload and full restore-verification timestamps against host policy and distinguish stale state from operation failure.
+Status SHALL evaluate project/role backup uploads and full backup-test timestamps against host policy and distinguish stale state from the latest operation failure.
 
 #### Scenario: Backup is stale
-- **WHEN** no confirmed remote snapshot exists within the configured maximum age
-- **THEN** status marks backup freshness stale and exits nonzero
+- **WHEN** no confirmed remote snapshot exists within configured maximum age
+- **THEN** status marks the project/role backup stale and exits nonzero
 
-#### Scenario: Verification is stale
-- **WHEN** no successful full backup verification exists within the configured maximum age
+#### Scenario: Backup test is stale
+- **WHEN** no successful isolated backup test exists within configured maximum age
 - **THEN** status marks recovery verification stale
 
 #### Scenario: Last backup attempt failed
-- **WHEN** a backup operation recorded an error after the last successful snapshot
-- **THEN** status reports the error separately from the age of the last success
+- **WHEN** an operation recorded an error after the latest successful snapshot
+- **THEN** status reports the failure separately from the age of the last success
 
 ### Requirement: Structured status output
-`evdb status --json` SHALL emit a versioned JSON document containing the same host and database assessment as human output. It SHALL use the same exit status and SHALL contain no secret values.
+`evdb status --json` SHALL emit one secret-free JSON object containing integer `version`, boolean `healthy`, object `host`, object `databases`, and array `errors`. `host` SHALL include host identity, installed tool version, infrastructure health, disk status, timer status, and active transaction summary. `databases` SHALL be keyed by exact `<project>/<role>` identity and each value SHALL include project, role, concrete engine, running and health state, installed image, configuration match, latest backup/upload/test summaries, and a bounded current error when present. Errors SHALL use stable codes and bounded human messages without subprocess dumps or secrets. Additive fields MAY be introduced within one version; removing fields or changing their type or meaning SHALL increment `version`. The command SHALL use the same health exit status as human output and remain suitable for SSH polling and a future read-only central monitor.
 
 #### Scenario: Automation requests JSON
-- **WHEN** status is invoked with `--json`
-- **THEN** it emits parseable versioned JSON and no human table text
+- **WHEN** status runs non-interactively with `--json`
+- **THEN** it emits one parseable JSON document, no menu or table text, and no credential-bearing field
+
+#### Scenario: Status contract changes incompatibly
+- **WHEN** a release removes a required field or changes its type or meaning
+- **THEN** the top-level status version is incremented and the prior tool is not treated as producing the new contract
 
 ### Requirement: Partial assessment
-Failure to assess one database SHALL NOT prevent status from assessing and reporting other databases when the host remains reachable.
+Failure to assess one project/role SHALL NOT prevent status from assessing and reporting other databases or host infrastructure when local execution remains possible.
 
 #### Scenario: One engine check times out
-- **WHEN** one database health command exceeds its timeout
-- **THEN** status records that timeout and continues with the remaining configured databases
+- **WHEN** one native health command exceeds its timeout
+- **THEN** status records that timeout and continues with remaining roles
 
 ### Requirement: Structured logs
-Commands SHALL write concise structured logs with host, database, command, step, result, duration, and error fields. Logs SHALL be useful through journald and readable during local tests.
+Commands SHALL write concise structured logs with host, project, role, concrete engine when relevant, command, step, result, duration, and redacted error fields. Logs SHALL be useful through journald and readable during local tests.
 
-#### Scenario: Database backup fails
-- **WHEN** an engine command fails
-- **THEN** one error record identifies the database and failed step without exposing credentials
+#### Scenario: Backup fails
+- **WHEN** an engine backup command fails
+- **THEN** one error record identifies project/role and failed step without exposing credentials
 
 ### Requirement: Systemd jobs and timer preservation
-The repository SHALL include canonical systemd units for per-database backup, daily status, due restore verification, weekly checks and retention, and monthly prune. Timers SHALL use persistent scheduling, randomized delays, execution timeouts, and low CPU and I/O priority.
-
-Routine apply and release activation SHALL preserve each existing timer's enabled and running state.
+The installed package SHALL include canonical systemd units for per-database backups, daily status, due backup testing, weekly Restic checks and retention, and monthly prune. Timers SHALL use persistent scheduling, randomized delays, execution timeouts, and low CPU and I/O priority. Host setup and tool updates SHALL preserve each timer's enabled and running state unless the operator explicitly changes scheduling.
 
 #### Scenario: Host was offline at backup time
 - **WHEN** a persistent timer becomes active after the host returns
-- **THEN** systemd schedules the missed work instead of waiting a full day
+- **THEN** systemd schedules missed work instead of waiting a full day
 
-#### Scenario: Routine apply updates units
-- **WHEN** canonical systemd units are activated for a healthy release
-- **THEN** timers that were enabled or running retain that state and disabled timers remain disabled
+#### Scenario: Tool update refreshes units
+- **WHEN** a candidate package installs compatible canonical units
+- **THEN** enabled and running timers retain state and disabled timers remain disabled

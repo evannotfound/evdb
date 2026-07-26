@@ -2,6 +2,7 @@ import ast
 from pathlib import Path
 
 from evanovation_db import cli
+from tests.fixtures.containers import _guard
 
 ROOT = Path(__file__).parents[2]
 REMOVED_MODULES = {
@@ -67,6 +68,23 @@ def test_ci_and_tests_never_target_production_config():
 
     offenders = [path.relative_to(ROOT) for path in paths if PRODUCTION_CONFIG in path.read_text()]
     assert not offenders, offenders
+
+
+def test_disposable_command_guard_rejects_production_and_host_mutation():
+    unsafe = (
+        ["ssh", "db-host"],
+        ["systemctl", "restart", "docker"],
+        ["tool", PRODUCTION_CONFIG],
+    )
+    for args in unsafe:
+        try:
+            _guard(args)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"unsafe disposable command accepted: {args}")
+
+    _guard(["restic", "snapshots"], {"RESTIC_REPOSITORY": "/tmp/local-repository"})
 
 
 def test_operator_support_has_no_alternate_config_and_ci_keeps_docker_opt_in():

@@ -6,7 +6,7 @@ import pytest
 
 from evanovation_db import backup, compose, database, secrets
 from evanovation_db.config import dump, load_state, replace_role, resolve_state, write_state
-from evanovation_db.errors import CommandError, DatabaseError
+from evanovation_db.errors import CommandError, ConfigError, DatabaseError
 from evanovation_db.run import Result
 
 DIGEST = "sha256:" + "a" * 64
@@ -129,6 +129,56 @@ def test_configure_previews_and_uses_one_restart_after_safety_backup(config, mon
     assert change.after.paths.previous.stat().st_mode & 0o777 == 0o640
     assert change.database.compose.stat().st_mode & 0o777 == 0o640
     assert change.after.paths.machine_state.stat().st_mode & 0o777 == 0o600
+
+
+def test_safety_backup_without_snapshot_aborts_before_install(config, monkeypatch):
+    state = _prepare(config, monkeypatch)
+    source = config.paths.source.read_bytes()
+    calls = []
+    monkeypatch.setattr(
+        database,
+        "run",
+        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
+    )
+    change = database.prepare_configure(
+        config,
+        "app-test-01/postgres",
+        {"image": "postgres:16.1"},
+        state=state,
+        resolver=lambda value: DIGEST,
+    )
+
+    with pytest.raises(DatabaseError, match="confirmed snapshot"):
+        database.commit(change, backup_create=lambda *args, **kwargs: {"snapshot": None})
+
+    assert config.paths.source.read_bytes() == source
+    assert not calls
+    activity = json.loads(config.paths.activity.read_text())
+    assert activity["result"] == "failed"
+    assert activity["command"] == "database configure"
+
+
+def test_snapshot_preparation_failure_records_confirmed_activity(config, monkeypatch):
+    state = _prepare(config, monkeypatch)
+    change = database.prepare_configure(
+        config,
+        "app-test-01/kv",
+        {"http_connections": 44},
+        state=state,
+        resolver=lambda value: DIGEST,
+    )
+    monkeypatch.setattr(
+        database,
+        "_snapshot",
+        lambda paths: (_ for _ in ()).throw(OSError("snapshot unavailable")),
+    )
+
+    with pytest.raises(OSError, match="snapshot unavailable"):
+        database.commit(change)
+
+    activity = json.loads(config.paths.activity.read_text())
+    assert activity["result"] == "failed"
+    assert activity["command"] == "database configure"
 
 
 def test_service_contracts_limit_safety_backup_to_primary_changes(config, monkeypatch):
@@ -281,6 +331,41 @@ def test_failed_candidate_restores_exact_files_and_prior_health(config, monkeypa
     assert all("--remove-orphans" in args for args in calls if "up" in args)
 
 
+def test_interrupted_candidate_restores_prior_files_and_health(config, monkeypatch):
+    state = _prepare(config, monkeypatch)
+    source = config.paths.source.read_bytes()
+    target = config.select("app-test-01/kv")
+    prior_compose = target.compose.read_bytes()
+    monkeypatch.setattr(
+        database,
+        "run",
+        lambda args, **kwargs: Result(tuple(args), 0, "", ""),
+    )
+    checks = 0
+
+    def health(*args, **kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            raise KeyboardInterrupt()
+
+    change = database.prepare_configure(
+        config,
+        target.identity,
+        {"http_connections": 33},
+        state=state,
+        resolver=lambda source: DIGEST,
+    )
+
+    with pytest.raises(DatabaseError, match="prior service recovered"):
+        database.commit(change, check_health=health)
+
+    assert config.paths.source.read_bytes() == source
+    assert target.compose.read_bytes() == prior_compose
+    assert checks == 2
+    assert not change.transaction.exists()
+
+
 def test_failed_recovery_preserves_diagnostics(config, monkeypatch):
     state = _prepare(config, monkeypatch)
     monkeypatch.setattr(
@@ -326,7 +411,7 @@ def test_orphaned_installed_role_blocks_mutation_without_deleting_it(config, mon
     orphan = replace(state.roles["app-test-01/kv"], installed=True)
     state = replace(state, roles={**state.roles, "old-prod-01/kv": orphan})
 
-    with pytest.raises(DatabaseError, match="removal is unsupported"):
+    with pytest.raises(ConfigError, match="removal is unsupported"):
         database.prepare_configure(
             config,
             "app-test-01/kv",

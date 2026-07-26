@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from evanovation_db import backup, restic
-from evanovation_db.config import resolve_state, write_state
+from evanovation_db.config import load_state, replace_role, resolve_state, write_state
 from evanovation_db.errors import BackupError, ResticError
 
 DIGEST = "sha256:" + "a" * 64
@@ -17,7 +17,7 @@ class Engine:
         del config, database, run_id, state
         (folder / "data.bin").write_bytes(b"checked data")
         return {
-            "format": "test-v1",
+            "format": "postgres-custom-v1",
             "version": "16.1",
             "facts": {"objects": 1},
             "files": ["data.bin"],
@@ -57,7 +57,7 @@ def test_create_writes_checked_manifest_upload_and_project_role_path(config, mon
     assert record["engine"] == "postgres"
     assert record["backup"] == result["backup"]
     assert record["purpose"] == "manual"
-    assert record["format"] == "test-v1"
+    assert record["format"] == "postgres-custom-v1"
     assert record["upload"]["snapshot"] == "snapshot-1"
     assert uploaded["backup"] == result["backup"]
     assert uploaded["upload"] == {"ok": True, "backup": result["backup"]}
@@ -133,7 +133,7 @@ def test_manifest_rejects_tampering_and_unsafe_file_names(config, tmp_path):
         "started": "2026-01-01T00:00:00+00:00",
         "finished": "2026-01-01T00:01:00+00:00",
         "version": "16.1",
-        "format": "test-v1",
+        "format": "postgres-custom-v1",
         "purpose": "manual",
         "facts": {},
         "files": files,
@@ -181,13 +181,14 @@ def test_history_merges_local_and_remote_and_rejects_cross_role(config, monkeypa
         backup.select(config, target, "other-role-snapshot")
 
 
-def test_backup_test_attaches_result_to_exact_identities(config, monkeypatch):
+def test_backup_test_attaches_result_to_exact_identities(config, monkeypatch, capsys):
     _installed(config)
     target = config.select("app-test-01/postgres")
     monkeypatch.setattr(backup, "_engine", lambda database: Engine)
     monkeypatch.setattr(restic, "upload", lambda *args: "snapshot-1")
     monkeypatch.setattr(restic, "snapshots", lambda *args: [])
     created = backup.create(config, target)
+    capsys.readouterr()
     entered = []
 
     @contextmanager
@@ -211,6 +212,17 @@ def test_backup_test_attaches_result_to_exact_identities(config, monkeypatch):
     assert entered[0][0][1] == target
     assert entered[0][1]["timeout"] == config.host.timeouts["restore"]
     assert operations["verifications"][f"backup:{created['backup']}"]["ok"]
+    events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    complete = next(
+        event
+        for event in events
+        if event.get("command") == "backup test" and event.get("result") == "success"
+    )
+    assert (complete["project"], complete["role"], complete["engine"]) == (
+        target.project,
+        target.role,
+        target.engine,
+    )
 
 
 def test_due_uses_latest_successful_verification_not_latest_failed_attempt(config):
@@ -283,14 +295,61 @@ def test_local_retention_keeps_two_uploaded_and_every_unuploaded(config, monkeyp
     _installed(config)
     target = config.select("app-test-01/postgres")
     monkeypatch.setattr(backup, "_engine", lambda database: Engine)
-    snapshots = iter(["one", "two", "three"])
+    snapshots = iter(["one", "two", "three", "four"])
     monkeypatch.setattr(restic, "upload", lambda *args: next(snapshots))
 
     for _ in range(3):
         backup.create(config, target)
+    unuploaded = backup.create(config, target, upload=False)["backup"]
+    backup.create(config, target)
 
     folders = list(config.paths.role_backups(target.project, target.role).iterdir())
-    assert len(folders) == 2
+    assert len(folders) == 3
+    assert (config.paths.role_backups(target.project, target.role) / unuploaded).is_dir()
+
+
+def test_create_checks_space_before_engine(config, monkeypatch):
+    _installed(config)
+    target = config.select("app-test-01/postgres")
+    monkeypatch.setattr(
+        backup,
+        "require_space",
+        lambda *args: (_ for _ in ()).throw(BackupError("insufficient free space")),
+    )
+    monkeypatch.setattr(
+        backup,
+        "_engine",
+        lambda database: (_ for _ in ()).throw(AssertionError("engine started")),
+    )
+
+    with pytest.raises(BackupError, match="free space"):
+        backup.create(config, target)
+
+    error = load_state(config).roles[target.identity].operations["errors"]["backup"]
+    assert error["step"] == "preflight"
+    assert "free space" in error["message"]
+
+
+def test_create_all_continues_after_one_database_fails(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    durable = replace_role(config, target, replace(target.settings, mode="durable"))
+    calls = []
+
+    def create(_config, database):
+        calls.append(database.identity)
+        if database.role == "postgres":
+            raise BackupError("postgres failed")
+        return {"backup": "kv-backup"}
+
+    monkeypatch.setattr(backup, "create", create)
+
+    result = backup.create_all(durable)
+
+    assert calls == ["app-test-01/postgres", "app-test-01/kv"]
+    assert result == {
+        "app-test-01/postgres": "error: postgres failed",
+        "app-test-01/kv": "kv-backup",
+    }
 
 
 def test_manifest_and_state_are_secret_free(config, monkeypatch):

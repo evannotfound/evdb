@@ -1,9 +1,11 @@
 import json
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from evanovation_db import lock as lock_module
 from evanovation_db.config import (
     DEFAULT_HTTP_END,
     DEFAULT_HTTP_START,
@@ -13,11 +15,13 @@ from evanovation_db.config import (
     ImageState,
     MachineState,
     RoleState,
+    append_activity,
     as_dict,
     dump,
     load,
     load_state,
     replace_role,
+    require_valid,
     resolve_state,
     state_dict,
     with_role,
@@ -119,6 +123,31 @@ def test_images_accept_version_tags_and_digests():
     assert image_major("dragonfly:v1.34.1") == 1
 
 
+def test_config_rejects_repository_credentials_and_overlong_host_label(config):
+    credentialed = replace(
+        config,
+        host=replace(
+            config.host,
+            backup=replace(
+                config.host.backup,
+                repos={**config.host.backup.repos, "kv": "rest:https://user@repo.example/db"},
+            ),
+        ),
+    )
+    with pytest.raises(ConfigError, match="must not contain credentials"):
+        require_valid(credentialed)
+
+    with pytest.raises(ConfigError, match="at most 60"):
+        require_valid(replace(config, host=replace(config.host, id="a" * 61)))
+
+
+def test_http_domains_must_be_unique_between_kv_roles(config):
+    target = config.select("app-test-01/kv")
+
+    with pytest.raises(ConfigError, match="HTTP domain collides"):
+        with_role(config, "other-test-01", "kv", target.settings)
+
+
 def test_paths_are_project_first_and_fully_injectable(config, paths):
     database = config.select("app-test-01/postgres")
 
@@ -195,6 +224,39 @@ def test_machine_state_round_trip_and_stable_port(config):
     assert config.paths.machine_state.stat().st_mode & 0o777 == 0o600
 
 
+def test_activity_history_is_bounded(config):
+    path = config.paths.activity
+    path.parent.mkdir(parents=True)
+    path.write_text("{}\n" * 1001)
+
+    append_activity(config, command="test", result="success")
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1000
+    assert json.loads(lines[-1])["command"] == "test"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert (config.paths.locks / "activity.lock").is_file()
+
+
+@pytest.mark.parametrize("failure", [OSError("disk unavailable"), KeyboardInterrupt()])
+def test_activity_write_failure_is_logged_without_failing_completed_operation(
+    config, monkeypatch, capsys, failure
+):
+    @contextmanager
+    def unavailable(*args, **kwargs):
+        raise failure
+        yield
+
+    monkeypatch.setattr(lock_module, "lock", unavailable)
+
+    append_activity(config, command="database configure", result="success")
+
+    event = json.loads(capsys.readouterr().err)
+    assert event["event"] == "activity_operation"
+    assert event["result"] == "failed"
+    assert event["command"] == "database configure"
+
+
 def test_state_resolution_preserves_ports_images_and_orphans(config):
     calls = []
 
@@ -214,6 +276,26 @@ def test_state_resolution_preserves_ports_images_and_orphans(config):
     current = replace(initial, roles={**initial.roles, "old-prod-01/kv": orphan})
     preserved = resolve_state(config, current, resolver=resolver)
     assert preserved.roles["old-prod-01/kv"] is orphan
+
+
+def test_state_resolution_rejects_duplicate_ports_and_skips_occupied_ports(config):
+    initial = resolve_state(
+        config,
+        resolver=lambda source: DIGEST,
+        port_available=lambda port: port != config.host.http_port_start,
+    )
+    target = config.select("app-test-01/kv")
+    assert initial.roles[target.identity].http_port == config.host.http_port_start + 1
+
+    duplicate = replace(
+        initial,
+        roles={
+            **initial.roles,
+            "other-test-01/kv": replace(initial.roles[target.identity], installed=False),
+        },
+    )
+    with pytest.raises(ConfigError, match="assigned to both"):
+        resolve_state(config, duplicate, resolver=lambda source: DIGEST)
 
 
 def test_state_resolution_never_reallocates_a_surviving_port(config):

@@ -78,6 +78,16 @@ A package update does not regenerate database Compose, change image digests, res
 restore data, or perform an engine migration. A candidate unable to read the installed contracts is
 rejected before activation.
 
+## Package release requirements
+
+Every published release must use one exact semantic version in `pyproject.toml`. Build both the
+wheel and source archive with `uv build`, inspect the wheel to confirm that it contains only the
+`evdb` entry point plus every canonical service and timer, and run the repository checks against the
+same source revision before publishing. Publish immutable artifacts to the configured Python
+registry; host installation and update always request `evanovation-db==<version>` and never a
+floating version. Registry hashes, release signing, and production registry credentials must be
+defined before production migration.
+
 ## Development boundary
 
 Repository checks use `tests/fixtures/config` and temporary `/etc`, `/var/lib`, `/opt`, data, and

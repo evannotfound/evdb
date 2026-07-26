@@ -5,12 +5,13 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import backup, compose, docker
 from . import database as databases
-from .config import Config, Database, MachineState, append_activity, load_state
+from .config import Config, Database, MachineState, append_activity, load_state, require_no_orphans
 from .engines import dragonfly, postgres, redis
 from .errors import RestoreError
 from .files import private_dir, write_json
@@ -43,6 +44,7 @@ def verify(
     source = selected.resolve()
     record = backup.manifest_check(source)
     current = state or load_state(config)
+    require_no_orphans(config, current)
     _compatible(config, database, current, record)
     database.data.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     name = f"evdb-verify-{database.project}-{database.role}-{uuid.uuid4().hex[:10]}"
@@ -90,6 +92,7 @@ def restore(
     if not database.durable:
         raise RestoreError(f"restore is disabled for cache database {database.identity}")
     current = state or load_state(config)
+    activity_started = datetime.now(timezone.utc).isoformat()
     started = time.monotonic()
     log_write(
         "restore_operation",
@@ -174,19 +177,34 @@ def restore(
                 transaction / "transaction.json",
                 {
                     **preview,
+                    "kind": "restore",
                     "phase": "stopping",
                     "prior": str(prior),
                     "failed": str(failed),
+                    "recovery": "run evdb host check before retrying restore",
                 },
             )
             stopped = False
             try:
-                _compose(config, database, "stop")
+                try:
+                    _compose(config, database, "stop")
+                except (KeyboardInterrupt, SystemExit):
+                    stopped = True
+                    raise
                 stopped = True
-                database.data.replace(prior)
+                _exchange(database.data, candidate.path, prior)
                 mutated = True
-                candidate.path.replace(database.data)
-                write_json(transaction / "transaction.json", {**preview, "phase": "starting"})
+                write_json(
+                    transaction / "transaction.json",
+                    {
+                        **preview,
+                        "kind": "restore",
+                        "phase": "starting",
+                        "prior": str(prior),
+                        "failed": str(failed),
+                        "recovery": "run evdb host check before retrying restore",
+                    },
+                )
                 _compose(config, database, "up", "-d", "--remove-orphans")
                 databases.health(config, database, state=current)
             except BaseException as exc:
@@ -211,12 +229,17 @@ def restore(
                     changed=("data",),
                     result="failed",
                     recovery="failed" if recovery_error else "recovered",
+                    started=activity_started,
+                    backup=selected["backup"],
+                    safety_snapshot=snapshot,
                 )
                 if recovery_error:
                     protected_prior = prior if prior.exists() else database.data
                     protected_failed = (
                         failed
                         if failed.exists()
+                        else candidate.path
+                        if candidate.path.exists()
                         else database.data
                         if prior.exists() and database.data.exists()
                         else failed
@@ -226,8 +249,12 @@ def restore(
                         f"prior={protected_prior} failed={protected_failed} "
                         f"transaction={transaction}"
                     ) from exc
+                if candidate.path.exists():
+                    _remove_data(database, current, candidate.path, missing_ok=True)
+                shutil.rmtree(transaction, ignore_errors=True)
+                detail = f"failed={failed}" if failed.exists() else "unpromoted candidate cleaned"
                 raise RestoreError(
-                    f"restored data failed health; prior data recovered; failed={failed}"
+                    f"restored data failed health; prior data recovered; {detail}"
                 ) from exc
             _remove_data(database, current, prior)
             shutil.rmtree(transaction)
@@ -238,6 +265,9 @@ def restore(
                 changed=("data",),
                 result="success",
                 recovery=None,
+                started=activity_started,
+                backup=selected["backup"],
+                safety_snapshot=snapshot,
             )
             log_write(
                 "restore_operation",
@@ -299,6 +329,11 @@ def _recover(
         return exc
 
 
+def _exchange(live: Path, candidate: Path, prior: Path) -> None:
+    live.replace(prior)
+    candidate.replace(live)
+
+
 def _compose(config: Config, database: Database, *args: str, check: bool = True) -> None:
     run(
         compose.command(database.compose, database.compose_project, *args),
@@ -322,6 +357,13 @@ def _compatible(
     for key, value in expected.items():
         if record.get(key) != value:
             raise RestoreError(f"backup {key} does not match {value}")
+    expected_format = {
+        "postgres": "postgres-custom-v1",
+        "redis": "redis-rdb-v1",
+        "dragonfly": "dragonfly-dfs-v1",
+    }[database.engine]
+    if record.get("format") != expected_format:
+        raise RestoreError(f"backup format does not match {expected_format}")
     role = state.roles.get(database.identity)
     if role is None or not role.installed or role.engine != database.engine:
         raise RestoreError("target database identity is not installed with the selected engine")

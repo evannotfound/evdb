@@ -6,208 +6,137 @@ Define safe remote management, immutable deployment releases, health-gated activ
 
 ## Requirements
 
-### Requirement: Local operator command
-The system SHALL provide an `evdb` command that reads local source configuration and manages the configured host over SSH without requiring operators to invoke Ansible or host-local Python commands directly.
+### Requirement: Direct settings transaction
+`evdb database configure PROJECT/ROLE` SHALL collect and validate typed settings, render private candidate files, resolve immutable image digests, validate candidate Compose, preview exact changes and restart effects, and require confirmation before changing installed files or services. It SHALL perform at most one restart for all changes in one session.
 
-#### Scenario: Operator requests status
-- **WHEN** the operator runs `evdb status`
-- **THEN** the command connects to the host declared in `host.yml` and prints the remote status result locally
+#### Scenario: Operator changes two Dragonfly settings
+- **WHEN** memory and threads change in one confirmed session
+- **THEN** evdb installs one generated definition and restarts the KV project once
 
-### Requirement: Safe SSH transport
-The controller SHALL use subprocess argument arrays and a fixed versioned remote command. Normal operations SHALL execute code and runtime configuration through `/opt/evanovation-db/current`. A separate `/opt/evanovation-db/host-runtime` mode SHALL read an atomically refreshed normalized runtime from `/opt/evanovation-db/host-runtime/runtime` only after explicit confirmation for first install or protocol upgrade.
+### Requirement: Safety backup before durable service recreation
+A confirmed settings transaction that recreates the primary container of a durable database SHALL create, validate, and upload a current backup before stopping or replacing that service. Cache-mode KV and sidecar-only changes SHALL not claim to have created a database recovery point when no backup ran.
 
-The transport SHALL NOT read preserved `/etc` legacy JSON, use a shell command string, or place secret values in SSH arguments.
+#### Scenario: Durable Postgres image is updated
+- **WHEN** a compatible same-major image change requires container recreation
+- **THEN** a confirmed Restic snapshot of current data exists before Compose replaces the container
 
-#### Scenario: Remote operation is invoked
-- **WHEN** the controller sends an operation to the host
-- **THEN** operation data is validated JSON over stdin and stdout and the process argument list contains no secret value
+### Requirement: Failed settings recovery
+Before installing a settings transaction, evdb SHALL retain exact prior source, generated files, secret-file metadata, and resolved state. If candidate validation, startup, or health fails after mutation starts, it SHALL restore the previous files and same-engine Compose definition, restart affected prior services, and verify their health without prompting.
 
-#### Scenario: Active runtime is unavailable
-- **WHEN** the fixed active runtime is explicitly absent or reports an incompatible protocol
-- **THEN** confirmed bootstrap installs stable code, atomically refreshes its dedicated normalized runtime, removes stale bootstrap instance JSON, and release-state plus apply use it until the candidate release activates
+#### Scenario: New image is unhealthy
+- **WHEN** a configured same-major image cannot pass container and engine health
+- **THEN** evdb restores the prior image definition and settings and reports whether prior health recovered
 
-#### Scenario: Existing release uses an older runtime schema
-- **WHEN** protocol mismatch triggers confirmed bootstrap on a host with active timers and legacy active runtime JSON
-- **THEN** bootstrap leaves current release units, pointer, `/etc` runtime, and timer state unchanged until a healthy candidate activates transactionally
+### Requirement: Settings activity record
+Every confirmed settings transaction SHALL append a bounded secret-free activity record containing host, project/role, command, changed setting names, start and finish times, result, and recovery result. It SHALL NOT retain a selectable deployment release.
 
-#### Scenario: Remote response is malformed
-- **WHEN** SSH fails, output is malformed, active configuration is invalid, or a remote operation fails
-- **THEN** the controller fails closed without invoking Ansible or treating the error as a bootstrap condition
+#### Scenario: Settings recovery succeeds
+- **WHEN** candidate health fails and previous settings recover
+- **THEN** activity reports the failed change and successful recovery without storing prior secret values
 
-### Requirement: Read-only plan
-`evdb plan` SHALL compare normalized desired configuration with the active remote release and live state without changing source, lock, secrets, releases, services, containers, or data.
+### Requirement: Unsupported role removal is non-destructive
+Omitting an installed project role from source configuration SHALL NOT stop or remove its containers, route, Compose, secrets, machine state, backups, or data. Host check and status SHALL report an unsupported removal or orphan condition, and every mutating command SHALL fail closed until source is restored or a future retirement workflow handles the role.
 
-#### Scenario: New database is planned
-- **WHEN** source contains a database absent from the active release
-- **THEN** plan reports a create action and performs no remote write
+#### Scenario: Installed role is removed from YAML
+- **WHEN** host source no longer contains a project/role that still has installed generated state
+- **THEN** evdb leaves all service and persistent assets unchanged and reports that database removal is unsupported
 
-#### Scenario: Deployed database was removed from source
-- **WHEN** the active release contains a database absent from source
-- **THEN** plan reports the removal as blocked and directs the operator to a future retirement workflow
+### Requirement: Dedicated native routing proxy
+evdb SHALL manage one dedicated Traefik Compose project that owns host ports 5432 and 6379, uses the Docker provider on a dedicated external network, carries a concrete healthcheck, and routes every database through a unique TLS `HostSNI` router and backend.
 
-### Requirement: Immutable deployment releases
-Each apply SHALL stage an immutable release containing application code, normalized secret-free runtime configuration, generated Compose files, canonical systemd units, the image lock, and a manifest of every expected database service and container, engine major versions, shared `traefik-net`, and Traefik. Every managed Compose service SHALL carry its non-circular generated project service-contract hash label recorded in the manifest.
+#### Scenario: Project has both roles
+- **WHEN** one project runs Postgres and KV on the shared network
+- **THEN** native SNI traffic reaches the matching type-qualified backend without a shared `postgres` or `redis` alias
 
-Mutable data, secrets, logs, and operation state SHALL remain outside releases.
+### Requirement: ACME DNS certificates
+Dedicated Traefik SHALL use a configured ACME DNS-01 resolver for native database certificates, a scoped DNS-provider credential in a private host file, and persistent `acme.json` with mode `0600`. It SHALL NOT require or bind ports 80 or 443.
 
-#### Scenario: Release is staged
-- **WHEN** apply prepares a deployment
-- **THEN** every artifact needed to reproduce its service definitions is stored under one unique release id without copying secret values or database data
-
-### Requirement: Confirmed health-gated apply
-`evdb apply` SHALL show the plan, require interactive confirmation unless `--yes` is supplied, stage a release, apply only affected Compose projects, and activate the release only after validation and health checks succeed.
-
-Apply SHALL inspect and idempotently create the shared network when absent, require a concrete healthy Docker health status for Traefik before databases, and require every expected primary and sidecar container plus engine-native database health. Missing, stopped, unhealthy, wrong-image, or wrong-contract sidecars SHALL be affected even when the primary image is unchanged.
-
-#### Scenario: Operator declines apply
-- **WHEN** the operator does not confirm the displayed production plan
-- **THEN** no lock, secret, release, service, container, or data change occurs
-
-#### Scenario: Apply succeeds
-- **WHEN** all staged configuration and affected services validate and become healthy
-- **THEN** the new release becomes active and unchanged database projects are not restarted
-
-#### Scenario: Fresh host has no shared network
-- **WHEN** initial apply finds `docker network inspect traefik-net` absent
-- **THEN** it creates the network before Traefik and database services
-
-### Requirement: Automatic failed-apply recovery
-If an affected project fails to become healthy, apply SHALL restore the prior release's Traefik and database definitions and images for changed projects, verify recovered health, and leave the prior release active.
-
-Before candidate secret installation, apply SHALL snapshot every target's bytes, mode, ownership, and existence in memory. Compose validation, health, activation, or recovery failure SHALL restore exact prior files and remove newly created files before prior Compose is restarted. Secret contents SHALL never be persisted in release or recovery state. Existing database credentials and protected configuration SHALL NOT change during apply; new databases and missing files MAY be installed. Restic password replacement and existing rclone preservation semantics SHALL remain unchanged.
-
-#### Scenario: New image fails health check
-- **WHEN** an updated database container does not become healthy within its timeout
-- **THEN** the prior locked image and Compose definition are restored without changing database data
-
-#### Scenario: Recovery also fails
-- **WHEN** the prior service cannot be restored automatically
-- **THEN** apply retains both releases, records a high-severity failure with recovery steps, and exits nonzero without claiming either unhealthy release as successfully active
-
-#### Scenario: Release assets activate
-- **WHEN** every affected service is healthy
-- **THEN** apply snapshots prior unit files, runtime files, and active pointer, installs the staged canonical units, switches runtime and pointer, reloads systemd, and preserves each timer's enabled and running state
-
-#### Scenario: Unit activation fails
-- **WHEN** unit installation, runtime refresh, pointer replacement, or daemon reload fails
-- **THEN** prior unit bytes and modes, active runtime, pointer, and loaded definitions are restored before prior services are recovered
+#### Scenario: Native certificate renews
+- **WHEN** Traefik completes a DNS-01 renewal
+- **THEN** certificate state persists across proxy restarts without exposing the provider token in Compose, status, or logs
 
 ### Requirement: Idempotent database creation
-`evdb create <type> <name>` SHALL atomically add a minimal source entry, ensure convention-based 1Password fields exist, display the resulting plan, and use the normal apply path after confirmation. Rerunning an interrupted create SHALL converge without duplicating configuration or secret items.
+`evdb database add PROJECT postgres` and `evdb database add PROJECT kv [--engine ENGINE]` SHALL validate identity, select and persist explicit defaults, generate required private host credentials, render and validate an independent Compose project, preview the operation, require confirmation, start services, and require full health before committing successful installation state. Rerunning an interrupted or matching add SHALL not duplicate a role, data directory, secret, project, or route.
 
-#### Scenario: New database is created
-- **WHEN** the operator confirms creation of a valid absent database
-- **THEN** source contains one minimal entry, 1Password contains one managed item, and the healthy deployment is active
+#### Scenario: Default KV is added
+- **WHEN** the operator confirms a valid absent KV role without selecting an engine
+- **THEN** one Dragonfly-backed KV role with HTTP and backups becomes healthy and source records the engine explicitly
 
-#### Scenario: Remote apply fails after local creation
-- **WHEN** configuration and secrets were created but remote deployment fails
-- **THEN** desired configuration and the secret item remain intact and the command can be rerun safely
-
-### Requirement: Secure 1Password writes
-Create workflows SHALL require a write-capable desktop or service-account 1Password session, send item templates and secret material through stdin, and suppress secret-bearing output and logs.
-
-#### Scenario: Connect-only authentication is active
-- **WHEN** a create workflow detects Connect-only environment variables without write-capable authentication
-- **THEN** it fails before source or remote changes and explains the required authentication mode
-
-#### Scenario: Existing managed item is found
-- **WHEN** the convention-based item and required fields already exist
-- **THEN** create reuses them without rotating or revealing their values
+#### Scenario: New creation fails health
+- **WHEN** candidate services cannot become healthy
+- **THEN** evdb stops candidate services, does not claim installation success, and removes only empty files and data proven to belong to that transaction
 
 ### Requirement: Routine lifecycle commands
-The controller SHALL provide start, stop, restart, and logs commands for a selected database. These operations SHALL retain data, configuration, secrets, and backups.
+The host CLI SHALL provide `database start`, `stop`, `restart`, and `logs` for one project/role. Start SHALL use installed generated Compose and reconcile stopped services; stop and restart SHALL preserve source, generated definitions, secrets, data, backup history, and tool history. Start and restart SHALL require container, sidecar, contract, and engine health.
 
 #### Scenario: Database is stopped
-- **WHEN** the operator confirms a stop command
-- **THEN** the database project stops while its data, release configuration, secrets, and backups remain present
+- **WHEN** the operator confirms `evdb database stop PROJECT/ROLE`
+- **THEN** only that role's Compose services stop while its project sibling role and all persistent files remain unchanged
 
 #### Scenario: Logs are requested
-- **WHEN** the operator requests logs for a database
-- **THEN** the controller streams that project's remote logs without exposing protected secret files
+- **WHEN** the operator requests bounded logs
+- **THEN** evdb reads that Compose project's logs and redacts credentials, URLs, references, and secret-bearing fields
 
 ### Requirement: Unambiguous selectors
-Commands SHALL accept a plain name when it resolves to one database and SHALL require `<type>/<name>` when more than one configured database shares the name.
+Database commands SHALL use `<project>/postgres` or `<project>/kv`. Guided flows MAY select the same identity from a numbered project list. A project name alone SHALL be accepted only when exactly one role exists and no credential-bearing output can be disclosed ambiguously.
 
-#### Scenario: Plain name is ambiguous
-- **WHEN** an operator selects a name used by Postgres and KV databases
-- **THEN** the command performs no operation and lists the valid typed selectors
+#### Scenario: Project has two roles
+- **WHEN** an operator supplies only the project name
+- **THEN** evdb performs no mutation and lists the valid project/role identities
 
 ### Requirement: Production guardrails
-Write operations SHALL identify the target host, show affected databases and host infrastructure, serialize conflicting operations with locks, and require explicit confirmation or `--yes`. Generated inventory for the real target SHALL retain production group membership and target production so mutable extra variables cannot downgrade the guard. Operations SHALL fail closed when controller and remote protocol versions are incompatible.
+Write operations SHALL run on the authoritative host, display its configured host ID and affected project/role or host infrastructure, acquire compatible host/database/repository locks, and require explicit confirmation or `--yes`. They SHALL fail closed on invalid config, unsafe ownership, incompatible schemas, missing prerequisites, or changed operation state.
 
-#### Scenario: Protocol versions differ
-- **WHEN** the local controller cannot safely communicate with the deployed runtime
-- **THEN** the operation stops before any remote write and requests installation of a compatible release
+#### Scenario: Host state changes during confirmation
+- **WHEN** installed source or generated files differ from the previewed candidate before mutation
+- **THEN** evdb aborts and asks the operator to run the command again
 
 ### Requirement: Production paths
-Immutable releases SHALL live under `/opt/evanovation-db/releases`, the active release SHALL be addressed through `/opt/evanovation-db/current`, confirmed bootstrap assets SHALL live under `/opt/evanovation-db/host-runtime`, protected host files SHALL live under `/etc/evanovation-db/secrets`, and mutable backup and operation state SHALL live under `/var/lib/evanovation-db`.
+Host source and generated service files SHALL live under `/etc/evdb`, mutable state under `/var/lib/evdb`, managed tool versions under `/opt/evdb`, and database data under the configured project-first data root. Secrets and mutable state SHALL remain outside tool versions and generated Compose.
 
-#### Scenario: Secret file is installed
-- **WHEN** apply writes a resolved secret required by a new database
-- **THEN** the file is owned by the service account with mode `0600` and is not stored in the release
+#### Scenario: Tool updates
+- **WHEN** `/opt/evdb/current` changes versions
+- **THEN** every database continues using stable Compose, secret, state, and data paths
 
 ### Requirement: Mutable rclone configuration
-Apply SHALL seed the live rclone configuration from 1Password only when it is absent. Once created, the live file SHALL be owned by the service account and SHALL NOT be overwritten during routine applies because rclone updates its OAuth token.
+Host setup SHALL seed live rclone configuration only when absent. Once created, the service account-owned file under `/var/lib/evdb/rclone` SHALL remain mutable and SHALL NOT be overwritten by setup, settings changes, tool updates, or generated Compose because rclone may refresh OAuth data.
 
-#### Scenario: Live token has changed
-- **WHEN** apply runs after rclone refreshed its token
-- **THEN** the existing live configuration remains unchanged
+#### Scenario: Live OAuth token changed
+- **WHEN** setup or tool update runs after rclone refreshes its token
+- **THEN** the existing live rclone file remains byte-for-byte unchanged
 
 ### Requirement: Service account
-Deployed jobs SHALL run as a dedicated service account with access to Docker and only the files required by this system. Documentation SHALL state that Docker access is root-equivalent.
+Database jobs and routine operations SHALL run under the dedicated non-login evdb service account where privilege permits. Setup SHALL grant only required file access and Docker group membership; documentation SHALL identify Docker access as root-equivalent. Privileged setup and tool activation SHALL require root.
 
-#### Scenario: Backup service starts
-- **WHEN** systemd starts a backup unit
-- **THEN** it runs as the service account rather than as an interactive user
+#### Scenario: Restore verification starts
+- **WHEN** systemd or an operator starts a backup test
+- **THEN** temporary Docker work and private files use the evdb service identity rather than an interactive user's home
 
 ### Requirement: Generated Compose and shared routing
-Each release SHALL contain generated Compose definitions for Postgres, Redis, Dragonfly, HTTP sidecars, and Traefik using locked images. Only Traefik SHALL publish host database ports 5432 and 6379; database and pooler containers SHALL remain internal.
+The system SHALL generate independent YAML Compose definitions for every Postgres and KV role plus dedicated Traefik. Generated images SHALL resolve to immutable digests; no secret value SHALL appear in YAML. Only dedicated Traefik SHALL publish native database ports. Postgres, PgBouncer, Redis, Dragonfly, and HTTP sidecars SHALL use type-qualified projects and unique network identities.
 
-Traefik SHALL use TLS `HostSNI` routes to send Postgres traffic to the matching PgBouncer and KV traffic to the matching Redis or Dragonfly container by a database-specific backend name.
+#### Scenario: Generated Compose validates
+- **WHEN** a candidate database or Traefik definition is rendered
+- **THEN** `docker compose config --quiet` succeeds before the file is installed
 
-#### Scenario: Two Postgres databases share port 5432
-- **WHEN** clients connect to two configured Postgres domains on host port 5432
-- **THEN** TLS SNI sends each connection to that domain's PgBouncer and database
-
-#### Scenario: Two KV databases share port 6379
-- **WHEN** clients connect to two configured KV domains on host port 6379
-- **THEN** TLS SNI sends each connection to that domain's Redis or Dragonfly container
-
-#### Scenario: Shared Redis alias is used
-- **WHEN** a Traefik KV route points to a shared name such as `redis:6379`
-- **THEN** validation fails and requires the database-specific backend name
-
-### Requirement: Explicit release rollback
-`evdb rollback [release]` SHALL default to the previous active release, display affected service and image changes, require confirmation, health-check restored projects, and activate the selected release only on success.
-
-#### Scenario: Previous release is rolled back
-- **WHEN** the operator confirms a compatible previous release
-- **THEN** its service definitions and locked images become active while current database data remains in place
+#### Scenario: Two databases share native port
+- **WHEN** several Postgres or KV roles run on one host
+- **THEN** Traefik SNI routes each hostname to its unique database-specific backend
 
 ### Requirement: Data-format compatibility guard
-Rollback SHALL compare engine types and major versions with live data and SHALL block a release whose engine cannot safely open the existing data format.
+Settings operations SHALL compare the installed role, concrete engine, source image major, backup compatibility, and live data contract. They SHALL reject engine replacement and engine-major changes before stopping a service. Compatible same-engine image updates MAY proceed through the safety-backup transaction.
 
-#### Scenario: Postgres major downgrade is requested
-- **WHEN** rollback would run an older Postgres major version against data initialized by a newer major version
-- **THEN** rollback fails before stopping the live database and directs the operator to backup restore instead
+#### Scenario: Postgres major changes
+- **WHEN** an operator selects a Postgres image with another major version
+- **THEN** evdb rejects the settings change and identifies major migration as a future explicit workflow
 
-### Requirement: Release audit and retention
-The system SHALL record creation time, source and lock hashes, controller version, active predecessor, plan summary, and outcome for every staged release. It SHALL retain the active and previous successful releases and SHALL never remove a failed or recovery-relevant release automatically.
-
-#### Scenario: Operator inspects releases
-- **WHEN** release history is requested
-- **THEN** it identifies active, successful, failed, and rolled-back releases without exposing secrets
-
-### Requirement: Rollback does not restore data
-Release rollback SHALL NOT replace, rename, restore, or delete a database data directory or select a backup snapshot.
-
-#### Scenario: Operator needs older data
-- **WHEN** the selected release is healthy but the operator needs database contents from an earlier time
-- **THEN** rollback leaves data unchanged and directs the operator to the staged restore workflow
+#### Scenario: KV implementation changes
+- **WHEN** an operator attempts to change an installed KV role from Redis to Dragonfly
+- **THEN** evdb refuses to treat the conversion as a settings update
 
 ### Requirement: Local deployment test
-Generated Compose, normalized runtime configuration, systemd units, remote transport, apply, and recovery SHALL be tested on disposable local infrastructure before deployment behavior is accepted.
+Generated YAML, direct settings transactions, failed-settings recovery, dedicated Traefik, host setup, and tool updates SHALL be tested on disposable local infrastructure. Tests SHALL NOT invoke production hosts, repositories, credentials, Docker changes, cron changes, or systemd changes on `montreal-01`.
 
-#### Scenario: Full local deploy runs
-- **WHEN** the deployment integration test finishes
-- **THEN** the test host can validate configuration and run local backup and restore operations without production credentials
+#### Scenario: Full disposable operation completes
+- **WHEN** the integration suite adds and configures test databases
+- **THEN** it proves independent projects, native routing, health gates, safety files, and failure recovery without production resources

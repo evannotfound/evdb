@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -13,6 +15,7 @@ from .config import Config, Database, load_state
 from .engines import dragonfly, postgres, redis
 from .files import free_gb
 from .log import sanitize
+from .log import write as log_write
 from .run import run
 
 VERSION = 1
@@ -26,6 +29,7 @@ _REQUIRED_TIMERS = (
 
 
 def collect(config: Config, database: Database | None = None) -> dict[str, Any]:
+    started = time.monotonic()
     errors = []
     try:
         state = load_state(config)
@@ -71,13 +75,25 @@ def collect(config: Config, database: Database | None = None) -> dict[str, Any]:
         databases[target.identity] = item
         errors.extend(item_errors)
     healthy = host["healthy"] and all(item["healthy"] for item in databases.values())
-    return {
+    value = {
         "version": VERSION,
         "healthy": healthy,
         "host": host,
         "databases": databases,
         "errors": errors,
     }
+    log_write(
+        "status_operation",
+        host=config.host.id,
+        project=database.project if database else None,
+        role=database.role if database else None,
+        engine=database.engine if database else None,
+        command="status",
+        step="complete",
+        result="healthy" if healthy else "failed",
+        duration=round(time.monotonic() - started, 3),
+    )
+    return value
 
 
 def render(value: dict[str, Any]) -> str:
@@ -124,10 +140,33 @@ def _host(config, state, errors, orphans):
     infrastructure = _infrastructure(config, state, errors)
     timers = _timers(config, errors)
     transaction = _transaction(config)
+    tool_version = _version()
+    tool_match = state is not None and state.tool_version == tool_version
+    if not tool_match:
+        errors.append(
+            _error(
+                "tool_version_mismatch",
+                "host/configuration",
+                "machine state tool version differs from the running evdb package",
+            )
+        )
     if transaction:
-        errors.append(_error("transaction_incomplete", "host", transaction))
+        scope = (
+            f"{transaction['project']}/{transaction['role']}"
+            if transaction.get("project") and transaction.get("role")
+            else "host"
+        )
+        errors.append(
+            _error(
+                "transaction_incomplete",
+                scope,
+                f"incomplete {transaction['kind']} transaction in phase "
+                f"{transaction['phase']}; {transaction['recovery']}",
+            )
+        )
     healthy = (
         state is not None
+        and tool_match
         and infrastructure["healthy"]
         and disks["data"]["ok"]
         and disks["backup"]["ok"]
@@ -137,11 +176,13 @@ def _host(config, state, errors, orphans):
     )
     return {
         "id": config.host.id,
-        "tool_version": _version(),
+        "tool_version": tool_version,
         "healthy": healthy,
         "configuration": {
-            "ok": state is not None and not orphans,
+            "ok": state is not None and tool_match and not orphans,
             "state_version": state.version if state else None,
+            "state_tool_version": state.tool_version if state else None,
+            "tool_match": tool_match,
             "orphans": list(orphans),
         },
         "infrastructure": infrastructure,
@@ -159,6 +200,8 @@ def _failed_host(config, state, orphans):
         "configuration": {
             "ok": state is not None and not orphans,
             "state_version": state.version if state else None,
+            "state_tool_version": state.tool_version if state else None,
+            "tool_match": False,
             "orphans": list(orphans),
         },
         "infrastructure": {
@@ -231,10 +274,20 @@ def _database(config: Config, target: Database, state) -> tuple[dict[str, Any], 
     generated = compose.database(config, target, state)
     expected = compose.expected_services(generated, target)
     generated_match = _compose_matches(target.compose, generated)
-    configuration_match = source_match and generated_match
+    expected_contract = compose.service_hash(generated)
+    state_contract_match = role.compose_hash == expected_contract
+    configuration_match = source_match and generated_match and state_contract_match
     if not generated_match:
         errors.append(
             _error("generated_changed", target.identity, "generated configuration differs")
+        )
+    if not state_contract_match:
+        errors.append(
+            _error(
+                "state_contract_mismatch",
+                target.identity,
+                "machine state contract differs from generated configuration",
+            )
         )
     running = False
     services_healthy = True
@@ -534,13 +587,49 @@ def _unit_ok(value) -> bool:
     return bool(value and value.get("loaded") and value.get("enabled") and value.get("active"))
 
 
-def _transaction(config: Config) -> str | None:
+def _transaction(config: Config) -> dict[str, Any] | None:
     roots = (config.paths.state / "transactions", config.paths.restores)
+    active = os.getenv("EVDB_ACTIVE_TRANSACTION")
+    active_path = Path(active).resolve() if active else None
     for root in roots:
         if root.is_dir():
             for path in sorted(root.iterdir()):
+                if active_path is not None and path.resolve() == active_path:
+                    continue
                 if path.is_dir() and any(path.iterdir()):
-                    return str(path)
+                    data = {}
+                    record = path / "transaction.json"
+                    if record.is_file() and not record.is_symlink():
+                        try:
+                            value = json.loads(record.read_text())
+                            data = value if isinstance(value, dict) else {}
+                        except (OSError, json.JSONDecodeError):
+                            pass
+                    project = data.get("project")
+                    role = data.get("role")
+                    identity = data.get("database")
+                    if isinstance(identity, str) and "/" in identity:
+                        project, role = identity.split("/", 1)
+                    if not project or role not in {"postgres", "kv"}:
+                        for candidate_role in ("postgres", "kv"):
+                            marker = f"-{candidate_role}-"
+                            if marker in path.name:
+                                project = path.name.rsplit(marker, 1)[0]
+                                role = candidate_role
+                                break
+                    details = path.stat()
+                    return {
+                        "kind": data.get("kind")
+                        or ("restore" if root == config.paths.restores else "settings"),
+                        "path": str(path),
+                        "project": project if isinstance(project, str) else None,
+                        "role": role if role in {"postgres", "kv"} else None,
+                        "phase": data.get("phase") or "staged",
+                        "recovery": data.get("recovery") or "run evdb host check before mutation",
+                        "updated": datetime.fromtimestamp(
+                            details.st_mtime, timezone.utc
+                        ).isoformat(),
+                    }
     return None
 
 

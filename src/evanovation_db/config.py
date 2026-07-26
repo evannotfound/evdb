@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -424,9 +427,15 @@ def append_activity(
     changed: tuple[str, ...] = (),
     result: str,
     recovery: str | None = None,
+    started: str | None = None,
+    backup: str | None = None,
+    safety_snapshot: str | None = None,
 ) -> None:
+    finished = datetime.now(timezone.utc).isoformat()
     record = {
-        "time": datetime.now(timezone.utc).isoformat(),
+        "time": finished,
+        "started": started or finished,
+        "finished": finished,
         "host": config.host.id,
         "project": database.project if database else None,
         "role": database.role if database else None,
@@ -435,17 +444,45 @@ def append_activity(
         "changed": sorted(set(changed)),
         "result": result,
         "recovery": recovery,
+        "backup": backup,
+        "safety_snapshot": safety_snapshot,
     }
     if _has_secret(record):
         raise ConfigError("activity record contains a secret")
-    path = config.paths.activity
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    from .lock import lock
+
     try:
-        os.write(fd, (json.dumps(record, sort_keys=True, default=str) + "\n").encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        with lock(config.paths.locks / "activity.lock", timeout=config.host.timeouts["command"]):
+            path = config.paths.activity
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, (json.dumps(record, sort_keys=True, default=str) + "\n").encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            data = path.read_bytes()
+            lines = data.splitlines(keepends=True)
+            if len(lines) > 1000 or len(data) > 1024 * 1024:
+                lines = lines[-1000:]
+                while lines and sum(map(len, lines)) > 1024 * 1024:
+                    lines.pop(0)
+                write_bytes(path, b"".join(lines), mode=0o600)
+    except BaseException as exc:
+        from .log import write as log_write
+
+        with suppress(BaseException):
+            log_write(
+                "activity_operation",
+                host=config.host.id,
+                project=database.project if database else None,
+                role=database.role if database else None,
+                engine=database.engine if database else None,
+                command=command,
+                step="write",
+                result="failed",
+                error=str(exc),
+            )
 
 
 def load_state(config: Config) -> MachineState:
@@ -464,6 +501,25 @@ def load_state(config: Config) -> MachineState:
     return state
 
 
+def require_no_orphans(config: Config, state: MachineState | None = None) -> None:
+    current = state or load_state(config)
+    configured = {item.identity for item in config.databases}
+    installed = {identity for identity, role in current.roles.items() if role.installed}
+    for path in config.paths.projects.glob("*/*/compose.yaml"):
+        try:
+            project, role, name = path.relative_to(config.paths.projects).parts
+        except (ValueError, OSError):
+            continue
+        if name == "compose.yaml" and role in {"postgres", "kv"}:
+            installed.add(f"{project}/{role}")
+    missing = installed - configured
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise ConfigError(
+            f"database removal is unsupported; restore source roles before mutation: {names}"
+        )
+
+
 def write_state(config: Config, state: MachineState) -> None:
     if state.host != config.host.id or state.version != STATE_VERSION:
         raise ConfigError("incompatible machine state")
@@ -474,7 +530,11 @@ def write_state(config: Config, state: MachineState) -> None:
 
 
 def resolve_state(
-    config: Config, current: MachineState | None = None, *, resolver=None
+    config: Config,
+    current: MachineState | None = None,
+    *,
+    resolver=None,
+    port_available: Callable[[int], bool] | None = None,
 ) -> MachineState:
     state = current or MachineState.empty(config.host.id)
     if state.version != STATE_VERSION or state.host != config.host.id:
@@ -496,7 +556,17 @@ def resolve_state(
         for item in config.databases
         if item.role == "kv" and item.settings.http.enabled
     }
-    used = {role.http_port for role in roles.values() if role.http_port is not None}
+    owners: dict[int, str] = {}
+    for identity, role in roles.items():
+        if role.http_port is None:
+            continue
+        if role.http_port in owners:
+            raise ConfigError(
+                f"HTTP port {role.http_port} is assigned to both "
+                f"{owners[role.http_port]} and {identity}"
+            )
+        owners[role.http_port] = identity
+    used = set(owners)
     configured = {item.identity for item in config.databases}
     outside = {
         identity
@@ -513,10 +583,11 @@ def resolve_state(
             f"HTTP ports fall outside the configured range for {names}; "
             "expand the range instead of reallocating"
         )
+    check_port = port_available or _port_available
     available = (
         port
         for port in range(config.host.http_port_start, config.host.http_port_end + 1)
-        if port not in used
+        if port not in used and check_port(port)
     )
     for database in config.databases:
         existing = roles.get(database.identity)
@@ -557,6 +628,17 @@ def resolve_state(
     return MachineState(state.version, state.host, images, roles, state.tool_version)
 
 
+def _port_available(port: int) -> bool:
+    current = socket.socket()
+    try:
+        current.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        current.close()
+
+
 def state_dict(state: MachineState) -> dict[str, Any]:
     return {
         "version": state.version,
@@ -582,6 +664,14 @@ def state_dict(state: MachineState) -> dict[str, Any]:
 def with_role(config: Config, project_id: str, role: str, settings: Postgres | KV) -> Config:
     if role not in {"postgres", "kv"}:
         raise ConfigError(f"unsupported role: {role}")
+    if role == "kv":
+        domain = settings.http.domain or f"{project_id}.kv-{config.host.id}.{config.host.domain}"
+        settings = replace(
+            settings,
+            http=replace(settings.http, domain=domain),
+            memory=settings.memory or ("256mb" if settings.engine == "dragonfly" else None),
+            threads=settings.threads or (1 if settings.engine == "dragonfly" else None),
+        )
     projects = list(config.projects)
     for index, project in enumerate(projects):
         if project.id != project_id:
@@ -615,6 +705,23 @@ def replace_role(config: Config, database: Database, settings: Postgres | KV) ->
 def validate(config: Config) -> list[str]:
     errors: list[str] = []
     seen_domains: dict[str, str] = {}
+    seen_http_domains: dict[str, str] = {}
+    if not _NAME.fullmatch(config.host.id) or len(config.host.id) > 60:
+        errors.append("host.id must be a safe lowercase name of at most 60 characters")
+    if len(config.host.domain) > 253 or not _DOMAIN.fullmatch(config.host.domain):
+        errors.append("host.domain must be a valid lowercase domain")
+    if not config.host.data_root.is_absolute() or config.host.data_root == Path("/"):
+        errors.append("host.data_root must be a safe absolute path")
+    if _has_secret(config.host.backup.repos):
+        errors.append("host.backup.repos must not contain credentials")
+    data_root = config.host.data_root
+    for managed in (config.paths.config, config.paths.state, config.paths.tool):
+        if (
+            data_root == managed
+            or data_root.is_relative_to(managed)
+            or managed.is_relative_to(data_root)
+        ):
+            errors.append(f"host.data_root overlaps managed path {managed}")
     for database in config.databases:
         if not _ENV.search(database.project):
             errors.append(f"{database.project}: project must end in -dev-N, -test-N, or -prod-N")
@@ -630,6 +737,59 @@ def validate(config: Config) -> list[str]:
             errors.append(f"{database.identity}: data path is unsafe")
         if database.role == "kv" and database.settings.engine not in {"redis", "dragonfly"}:
             errors.append(f"{database.identity}: unsupported KV engine")
+        try:
+            validate_source(database.settings.image, f"{database.identity}.image")
+        except ConfigError as exc:
+            errors.append(str(exc))
+        if database.role == "postgres":
+            pool = database.settings.pgbouncer
+            if type(pool.enabled) is not bool:
+                errors.append(f"{database.identity}: pgbouncer must be true or false")
+            for name in ("max_clients", "pool_size", "reserve_size"):
+                value = getattr(pool, name)
+                if type(value) is not int or value < 1:
+                    errors.append(f"{database.identity}: {name} must be a positive integer")
+            try:
+                validate_source(pool.image, f"{database.identity}.pgbouncer.image")
+            except ConfigError as exc:
+                errors.append(str(exc))
+        else:
+            settings = database.settings
+            if settings.mode not in {"durable", "cache"}:
+                errors.append(f"{database.identity}: mode must be durable or cache")
+            if settings.engine == "redis" and (
+                settings.memory is not None or settings.threads is not None
+            ):
+                errors.append(f"{database.identity}: memory and threads require dragonfly")
+            if settings.engine == "dragonfly":
+                if settings.memory is not None and (
+                    not isinstance(settings.memory, str) or not _MEMORY.fullmatch(settings.memory)
+                ):
+                    errors.append(
+                        f"{database.identity}: memory must be a positive kb, mb, or gb value"
+                    )
+                if settings.threads is not None and (
+                    type(settings.threads) is not int or settings.threads < 1
+                ):
+                    errors.append(f"{database.identity}: threads must be a positive integer")
+            http = settings.http
+            if type(http.enabled) is not bool:
+                errors.append(f"{database.identity}: http must be true or false")
+            if type(http.connections) is not int or http.connections < 1:
+                errors.append(f"{database.identity}: http_connections must be a positive integer")
+            if http.domain is not None and (
+                len(http.domain) > 253 or not _DOMAIN.fullmatch(http.domain)
+            ):
+                errors.append(f"{database.identity}: HTTP domain is invalid")
+            if http.enabled and http.domain is not None:
+                previous = seen_http_domains.get(http.domain)
+                if previous:
+                    errors.append(f"{database.identity}: HTTP domain collides with {previous}")
+                seen_http_domains[http.domain] = database.identity
+            try:
+                validate_source(http.image, f"{database.identity}.http.image")
+            except ConfigError as exc:
+                errors.append(str(exc))
     return errors
 
 
@@ -651,7 +811,7 @@ def _config(data: dict[str, Any], paths: Paths) -> Config:
         item = _mapping(raw, f"projects.{project_id}")
         _only(item, {"postgres", "kv"}, f"projects.{project_id}")
         postgres = _postgres(item["postgres"], project_id) if "postgres" in item else None
-        kv = _kv(item["kv"], project_id) if "kv" in item else None
+        kv = _kv(item["kv"], project_id, host) if "kv" in item else None
         projects.append(Project(project_id, postgres, kv))
     return Config(host, tuple(sorted(projects, key=lambda item: item.id)), paths)
 
@@ -659,10 +819,10 @@ def _config(data: dict[str, Any], paths: Paths) -> Config:
 def _host(data: dict[str, Any]) -> Host:
     _only(data, {"id", "domain", "data_root", "backup", "routing", "http_ports"}, "host")
     host_id = _required_string(data, "id", "host")
-    if not _NAME.fullmatch(host_id):
-        raise ConfigError("host.id must be a safe lowercase name")
+    if not _NAME.fullmatch(host_id) or len(host_id) > 60:
+        raise ConfigError("host.id must be a safe lowercase name of at most 60 characters")
     domain = _required_string(data, "domain", "host").lower()
-    if not _DOMAIN.fullmatch(domain):
+    if len(domain) > 253 or not _DOMAIN.fullmatch(domain):
         raise ConfigError("host.domain must be a valid lowercase domain")
     data_root = Path(_required_string(data, "data_root", "host"))
     if not data_root.is_absolute() or data_root == Path("/"):
@@ -743,7 +903,7 @@ def _postgres(value: Any, project: str) -> Postgres:
     )
 
 
-def _kv(value: Any, project: str) -> KV:
+def _kv(value: Any, project: str, host: Host) -> KV:
     data = _mapping(value, f"projects.{project}.kv")
     _only(data, {"engine", "image", "mode", "http", "memory", "threads"}, f"projects.{project}.kv")
     engine = _required_string(data, "engine", f"projects.{project}.kv")
@@ -769,7 +929,7 @@ def _kv(value: Any, project: str) -> KV:
     enabled = _bool(http.get("enabled", True), f"projects.{project}.kv.http.enabled")
     http_image = http.get("image", DEFAULT_IMAGES["http"])
     validate_source(http_image, f"projects.{project}.kv.http.image")
-    domain = http.get("domain")
+    domain = http.get("domain") or f"{project}.kv-{host.id}.{host.domain}"
     if domain is not None and (not isinstance(domain, str) or not _DOMAIN.fullmatch(domain)):
         raise ConfigError(f"projects.{project}.kv.http.domain must be a valid domain")
     return KV(
@@ -968,5 +1128,9 @@ def _has_secret(value: Any) -> bool:
         return any(_has_secret(item) for item in value)
     elif isinstance(value, str):
         lowered = value.lower()
-        return lowered.startswith("op://") or "-----begin private key-----" in lowered
+        return (
+            lowered.startswith("op://")
+            or "-----begin private key-----" in lowered
+            or bool(re.search(r"://[^/@\s]+@", value))
+        )
     return False

@@ -8,6 +8,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -15,7 +16,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from . import compose, status
+from . import backup, compose, status
 from .config import (
     BackupSettings,
     Config,
@@ -25,12 +26,15 @@ from .config import (
     dump,
     load,
     load_state,
+    require_no_orphans,
+    require_valid,
     resolve_state,
     write_state,
 )
 from .errors import HostError
-from .files import write_bytes, write_text
+from .files import private_dir, write_bytes, write_json, write_text
 from .lock import operation
+from .log import write as log_write
 from .run import run
 
 VERSION = re.compile(
@@ -62,12 +66,63 @@ def check(config: Config) -> dict[str, Any]:
     return status.collect(config)
 
 
+def _log(config: Config, command: str, started: float, result: str, error=None) -> None:
+    fields = {
+        "host": config.host.id,
+        "command": command,
+        "step": "complete" if result != "started" else "start",
+        "result": result,
+    }
+    if result != "started":
+        fields["duration"] = round(time.monotonic() - started, 3)
+    if error is not None:
+        fields["error"] = str(error)
+    log_write("host_operation", **fields)
+
+
+def compatibility(config: Config, unit_root: Path) -> None:
+    state = load_state(config)
+    _require_regular(config.paths.traefik / "compose.yaml", "current Traefik Compose")
+    for database in config.databases:
+        role = state.roles.get(database.identity)
+        if role is not None and role.installed:
+            _require_regular(database.compose, f"current Compose for {database.identity}")
+    manifests = config.paths.backups.rglob("backup.json") if config.paths.backups.exists() else ()
+    for manifest in manifests:
+        _require_regular(manifest, "backup record")
+        try:
+            backup.manifest_contract(manifest.parent)
+        except Exception as exc:
+            raise HostError(f"invalid backup record: {manifest}") from exc
+    package_units = _units()
+    _validate_unit_sources(package_units, ())
+    for source in package_units:
+        installed = unit_root / source.name
+        if installed.exists() or installed.is_symlink():
+            _require_regular(installed, f"installed unit {source.name}")
+
+
 def prerequisites() -> list[str]:
     missing = [name for name in TOOLS if shutil.which(name) is None]
-    if shutil.which("python3") is None:
+    python = shutil.which("python3")
+    if python is None:
         missing.append("python3")
-    elif sys.version_info < MIN_PYTHON:
-        missing.append(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer")
+    else:
+        result = run(
+            [
+                python,
+                "-c",
+                "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+            ],
+            timeout=30,
+            check=False,
+        )
+        try:
+            discovered = tuple(int(value) for value in result.out.strip().split(".", 1))
+        except ValueError:
+            discovered = ()
+        if result.code != 0 or discovered < MIN_PYTHON:
+            missing.append(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer")
     if "docker" not in missing:
         result = run(["docker", "compose", "version"], timeout=30, check=False)
         if result.code != 0:
@@ -89,16 +144,56 @@ def setup(
     managed = paths or Paths(config=source_path.parent)
     existing = source_path.is_file()
     config = load(source_path, paths=managed) if existing else _initial(values, managed)
+    require_valid(config)
     _guard(config, source_path)
+    started = time.monotonic()
+    _log(config, "host setup", started, "started")
     missing = prerequisites()
     if missing:
-        raise HostError("missing prerequisites: " + ", ".join(sorted(set(missing))))
+        error = HostError(
+            "missing prerequisites: "
+            + ", ".join(sorted(set(missing)))
+            + "; install them with the host package manager, then rerun evdb host setup"
+        )
+        _log(config, "host setup", started, "failed", error)
+        raise error
+    try:
+        with operation(config, write=True, timeout=config.host.timeouts["maintenance"]):
+            require_no_orphans(config)
+            result = _setup_locked(
+                config,
+                values,
+                existing=existing,
+                yes=yes,
+                confirm=confirm,
+                unit_dir=unit_dir,
+                resolver=resolver,
+            )
+    except BaseException as exc:
+        _log(config, "host setup", started, "failed", exc)
+        raise
+    _log(config, "host setup", started, "cancelled" if result == "Cancelled" else "success")
+    return result
+
+
+def _setup_locked(
+    config: Config,
+    values: dict[str, Any],
+    *,
+    existing: bool,
+    yes: bool,
+    confirm,
+    unit_dir: str | Path,
+    resolver,
+) -> str:
+    managed = config.paths
     _validate_writable(config, Path(unit_dir))
     current_state = load_state(config)
     if not _ports_available():
         raise HostError(
             "ports 5432 or 6379 are occupied; perform an explicit native routing migration"
         )
+    compose._network_exists(timeout=config.host.timeouts["command"])
 
     dns_source = values.get("dns_env_file")
     dns_target = managed.traefik / "dns.env"
@@ -154,6 +249,16 @@ def setup(
         shutil.rmtree(candidate_root, ignore_errors=True)
         raise
     bootstrap_created = False
+    transaction = private_dir(managed.state / "transactions" / f"host-setup-{random.token_hex(8)}")
+    write_json(
+        transaction / "transaction.json",
+        {
+            "kind": "setup",
+            "host": config.host.id,
+            "phase": "installing",
+            "recovery": "run evdb host check before retrying setup",
+        },
+    )
 
     try:
         _account(managed)
@@ -194,7 +299,8 @@ def setup(
         result = check(config)
         if not result["host"]["infrastructure"]["healthy"]:
             raise HostError("native infrastructure check failed")
-    except Exception as exc:
+        shutil.rmtree(transaction)
+    except BaseException as exc:
         failures = _rollback_setup(
             snapshots,
             timers,
@@ -209,9 +315,19 @@ def setup(
             except Exception as cleanup_error:
                 failures.append(str(cleanup_error))
         if failures:
+            write_json(
+                transaction / "transaction.json",
+                {
+                    "kind": "setup",
+                    "host": config.host.id,
+                    "phase": "recovery_failed",
+                    "recovery": "inspect setup files and run evdb host check",
+                },
+            )
             raise HostError(
                 f"host setup failed and rollback was incomplete: {exc}; {'; '.join(failures)}"
             ) from exc
+        shutil.rmtree(transaction, ignore_errors=True)
         raise HostError(f"host setup failed; prior files restored: {exc}") from exc
     finally:
         shutil.rmtree(candidate_root, ignore_errors=True)
@@ -231,6 +347,8 @@ def update(
     _guard(config, config.paths.source)
     unit_root = Path(unit_dir)
     _validate_writable(config, unit_root)
+    started = time.monotonic()
+    _log(config, "host update", started, "started")
 
     with operation(config, write=True, timeout=config.host.timeouts["maintenance"]):
         current_units = _units()
@@ -262,8 +380,9 @@ def update(
                         "UV_TOOL_BIN_DIR": str(candidate / "bin"),
                     },
                 )
-            except Exception:
+            except BaseException as exc:
                 _remove_candidate(candidate, created)
+                _log(config, "host update", started, "failed", exc)
                 raise
 
         try:
@@ -278,24 +397,31 @@ def update(
                 extra_paths=set(current_dropins),
                 require_healthy=False,
             )
-        except Exception:
+        except BaseException as exc:
             _remove_candidate(candidate, created)
+            _log(config, "host update", started, "failed", exc)
             raise
 
         if candidate.resolve() == old_current:
             _stable_command(config.paths.tool)
             cleanup = _stage_version_cleanup(versions, {old_current, old_previous})
             pending = _finish_version_cleanup(cleanup) or _pending_version_cleanup(versions)
-            return _update_result(f"evdb is already at {selected}", pending)
+            result = _update_result(f"evdb is already at {selected}", pending)
+            _log(config, "host update", started, "success")
+            return result
 
+        changed_units = _unit_changes(current_units, candidate_units)
         preview = (
             f"Host: {config.host.id}\n"
             f"Tool version: {selected}\n"
+            "Configuration migration: none\n"
             f"Machine state tool version: {load_state(config).tool_version} -> {selected}\n"
+            f"Systemd units: {', '.join(changed_units) if changed_units else 'no changes'}\n"
             "Database Compose and services will not change"
         )
         if not yes and (confirm is None or not confirm(preview)):
             _remove_candidate(candidate, created)
+            _log(config, "host update", started, "cancelled")
             return "Cancelled"
 
         candidate_timers, candidate_instances = _desired_timers(
@@ -312,11 +438,26 @@ def update(
             timers = _timer_states(candidate_timers)
             stable = _stable_path(config.paths.tool)
             old_stable = _optional_raw_link(stable) if stable is not None else None
-        except Exception:
+        except Exception as exc:
             _remove_candidate(candidate, created)
+            _log(config, "host update", started, "failed", exc)
             raise
 
         cleanup = None
+        transaction = private_dir(
+            config.paths.state / "transactions" / f"host-update-{random.token_hex(8)}"
+        )
+        write_json(
+            transaction / "transaction.json",
+            {
+                "kind": "update",
+                "host": config.host.id,
+                "phase": "activating",
+                "from": old_current.name,
+                "to": selected,
+                "recovery": "run evdb host check before retrying update",
+            },
+        )
         try:
             _link(previous, old_current)
             _link(current, candidate)
@@ -337,9 +478,11 @@ def update(
                 candidate_units,
                 extra_paths=set(candidate_dropins),
                 require_healthy=True,
+                active_transaction=transaction,
             )
             cleanup = _stage_version_cleanup(versions, {candidate.resolve(), old_current})
-        except Exception as exc:
+            shutil.rmtree(transaction)
+        except BaseException as exc:
             failures = _rollback_update(
                 current,
                 previous,
@@ -351,16 +494,39 @@ def update(
                 timers,
                 cleanup,
             )
-            _remove_candidate(candidate, created)
+            if created:
+                try:
+                    if _link_target(current) == candidate.resolve():
+                        failures.append("candidate version remains active")
+                    else:
+                        _remove_candidate(candidate, True)
+                except BaseException as cleanup_error:
+                    failures.append(f"candidate cleanup failed: {cleanup_error}")
             if failures:
+                write_json(
+                    transaction / "transaction.json",
+                    {
+                        "kind": "update",
+                        "host": config.host.id,
+                        "phase": "recovery_failed",
+                        "from": old_current.name,
+                        "to": selected,
+                        "recovery": "inspect tool links and units, then run evdb host check",
+                    },
+                )
                 detail = "; ".join(failures)
+                _log(config, "host update", started, "failed", exc)
                 raise HostError(
                     f"tool update failed and rollback was incomplete: {exc}; {detail}"
                 ) from exc
+            shutil.rmtree(transaction, ignore_errors=True)
+            _log(config, "host update", started, "failed", exc)
             raise HostError(f"tool update failed; prior version restored: {exc}") from exc
 
         pending = _finish_version_cleanup(cleanup) or _pending_version_cleanup(versions)
-        return _update_result(f"Updated evdb to {selected}", pending)
+        result = _update_result(f"Updated evdb to {selected}", pending)
+        _log(config, "host update", started, "success")
+        return result
 
 
 def _initial(values: dict[str, Any], paths: Paths) -> Config:
@@ -461,7 +627,20 @@ def _ownership(config: Config) -> None:
 def _ports_available() -> bool:
     result = run(["docker", "inspect", compose.TRAEFIK_CONTAINER], timeout=10, check=False)
     if result.code == 0:
-        return True
+        try:
+            values = json.loads(result.out)
+            labels = values[0]["Config"]["Labels"] or {}
+            running = values[0]["State"]["Running"] is True
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+            return False
+        owned = bool(
+            labels.get("com.docker.compose.project") == compose.TRAEFIK_PROJECT
+            and labels.get(compose.CONTRACT_LABEL)
+        )
+        if not owned:
+            return False
+        if running:
+            return True
     sockets = []
     try:
         for port in (5432, 6379):
@@ -497,10 +676,25 @@ def _units() -> tuple[Path, ...]:
     return _unit_files(root)
 
 
-def _candidate_status(executable: Path, config: Config, *, require_healthy: bool) -> None:
+def _candidate_status(
+    executable: Path,
+    config: Config,
+    unit_root: Path,
+    *,
+    require_healthy: bool,
+    active_transaction: Path | None = None,
+) -> None:
+    command = ["host", "check", "--json"] if require_healthy else ["status", "--json"]
+    environment = {
+        "EVDB_COMPATIBILITY_CHECK": "1",
+        "EVDB_UNIT_DIR": str(unit_root),
+    }
+    if active_transaction is not None:
+        environment["EVDB_ACTIVE_TRANSACTION"] = str(active_transaction)
     result = run(
-        [str(executable), "--config", str(config.paths.source), "status", "--json"],
+        [str(executable), "--config", str(config.paths.source), *command],
         timeout=config.host.timeouts["command"],
+        env=environment,
         check=False,
     )
     if result.code not in {0, 1}:
@@ -516,12 +710,33 @@ def _candidate_status(executable: Path, config: Config, *, require_healthy: bool
         and isinstance(data.get("host"), dict)
         and data["host"].get("id") == config.host.id
         and isinstance(data.get("databases"), dict)
+        and set(data["databases"]) == {item.identity for item in config.databases}
+        and all(isinstance(item, dict) for item in data["databases"].values())
         and isinstance(data.get("errors"), list)
     )
     if not compatible:
         raise HostError("candidate returned structurally incompatible status")
     if require_healthy and (result.code != 0 or data["healthy"] is not True):
         raise HostError("candidate post-activation status is unhealthy")
+    if not require_healthy:
+        incompatible = {
+            "state_incompatible",
+            "host_assessment_failed",
+            "assessment_failed",
+            "generated_changed",
+            "image_source_mismatch",
+            "state_contract_mismatch",
+            "orphan_installed",
+            "traefik_configuration_changed",
+            "traefik_contract_changed",
+        }
+        codes = {
+            item.get("code")
+            for item in data["errors"]
+            if isinstance(item, dict) and isinstance(item.get("code"), str)
+        }
+        if codes & incompatible:
+            raise HostError("candidate cannot operate the installed host contracts")
 
 
 def _link(path: Path, target: Path) -> None:
@@ -945,6 +1160,16 @@ def _validate_unit_sources(candidate: tuple[Path, ...], current: tuple[Path, ...
     for path in candidate:
         if path.is_symlink() or not path.is_file() or not path.read_text().strip():
             raise HostError(f"candidate package contains an invalid unit: {path.name}")
+    result = run(["systemd-analyze", "verify", *(str(path) for path in candidate)], check=False)
+    if result.code != 0:
+        raise HostError("candidate package contains incompatible systemd units")
+
+
+def _unit_changes(current: tuple[Path, ...], candidate: tuple[Path, ...]) -> tuple[str, ...]:
+    before = {path.name: path.read_bytes() for path in current}
+    return tuple(
+        sorted(path.name for path in candidate if before.get(path.name) != path.read_bytes())
+    )
 
 
 def _validate_artifacts(config: Config, unit_root: Path, sources: tuple[Path, ...]) -> None:
@@ -954,6 +1179,7 @@ def _validate_artifacts(config: Config, unit_root: Path, sources: tuple[Path, ..
     if not config.paths.machine_state.is_file():
         raise HostError("current machine state is missing")
     state = load_state(config)
+    require_no_orphans(config, state)
     _require_regular(config.paths.traefik / "compose.yaml", "current Traefik Compose")
     for database in config.databases:
         role = state.roles.get(database.identity)
@@ -963,11 +1189,9 @@ def _validate_artifacts(config: Config, unit_root: Path, sources: tuple[Path, ..
     for manifest in manifests:
         _require_regular(manifest, "backup record")
         try:
-            data = json.loads(manifest.read_text())
-        except json.JSONDecodeError as exc:
+            backup.manifest_contract(manifest.parent)
+        except Exception as exc:
             raise HostError(f"invalid backup record: {manifest}") from exc
-        if not isinstance(data, dict):
-            raise HostError(f"invalid backup record: {manifest}")
     for source in sources:
         destination = unit_root / source.name
         _require_regular(destination, f"installed unit {source.name}")
@@ -999,6 +1223,9 @@ def _artifact_paths(
         result.update(config.paths.projects.rglob("compose.yaml"))
     if config.paths.backups.exists():
         result.update(config.paths.backups.rglob("backup.json"))
+    for root in (config.paths.state / "transactions", config.paths.restores):
+        if root.exists():
+            result.update(root.rglob("transaction.json"))
     return result
 
 
@@ -1039,11 +1266,14 @@ def _restore_files(values: dict[Path, _FileState | None]) -> None:
             continue
         if state is None:
             if path.is_dir() and not path.is_symlink():
-                raise HostError(f"cannot remove unexpected directory during rollback: {path}")
-            path.unlink(missing_ok=True)
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
             continue
         if path.is_symlink():
             path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
         write_bytes(path, state.data, mode=state.mode)
         _apply_metadata(path, state)
 
@@ -1063,17 +1293,34 @@ def _candidate_read_only(
     *,
     extra_paths: set[Path],
     require_healthy: bool,
+    active_transaction: Path | None = None,
 ) -> None:
     names = {source.name for source in sources}
     before_paths = _artifact_paths(config, unit_root, names, extra_paths=extra_paths)
     before = _snapshot_files(before_paths)
     failure = None
     try:
-        _candidate_status(executable, config, require_healthy=require_healthy)
-    except Exception as exc:
+        _candidate_status(
+            executable,
+            config,
+            unit_root,
+            require_healthy=require_healthy,
+            active_transaction=active_transaction,
+        )
+    except BaseException as exc:
         failure = exc
     after_paths = _artifact_paths(config, unit_root, names, extra_paths=extra_paths)
-    after = _snapshot_files(after_paths)
+    try:
+        after = _snapshot_files(after_paths)
+    except BaseException as exc:
+        try:
+            added = after_paths - before_paths
+            _restore_files({**{path: None for path in added}, **before})
+        except BaseException as restore_error:
+            raise HostError(
+                f"candidate compatibility check corrupted managed files: {restore_error}"
+            ) from exc
+        raise HostError("candidate compatibility check created unsafe managed files") from exc
     if before != after:
         added = after_paths - before_paths
         _restore_files({**{path: None for path in added}, **before})
@@ -1123,7 +1370,7 @@ def _rollback_update(
         lambda: _restore_link(previous, old_previous),
         lambda: _restore_link(stable, old_stable) if stable is not None else None,
         lambda: _restore_files(snapshots),
-        lambda: run(["systemctl", "daemon-reload"], timeout=60, check=False),
+        lambda: run(["systemctl", "daemon-reload"], timeout=60),
         lambda: _restore_timer_states(timers),
     )
     for action in actions:

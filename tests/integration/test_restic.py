@@ -107,6 +107,8 @@ def test_local_restic_retention_prune_and_subset_check(config, tmp_path):
         )
 
     before = restic.snapshots(config, target)
+    restic.forget(config, target, dry_run=True)
+    restic.approve_retention(config, target)
     restic.forget(config, target, dry_run=False)
     after = restic.snapshots(config, target)
     restic.prune(config, "postgres")
@@ -160,7 +162,11 @@ def _backup(config, target, folder, *, uploaded=True):
             "started": "2026-01-01T00:00:00+00:00",
             "finished": "2026-01-01T00:01:00+00:00",
             "version": "1.0",
-            "format": "integration-v1",
+            "format": {
+                "postgres": "postgres-custom-v1",
+                "redis": "redis-rdb-v1",
+                "dragonfly": "dragonfly-dfs-v1",
+            }[target.engine],
             "purpose": "manual",
             "facts": {},
             "files": backup.manifest_files(folder, ["data"]),

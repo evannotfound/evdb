@@ -38,6 +38,7 @@ def command(
     input_text: str | None = None,
     timeout: int = 300,
 ) -> subprocess.CompletedProcess[str]:
+    _guard(args, env)
     command_env = os.environ.copy()
     command_env.update(env or {})
     result = subprocess.run(
@@ -53,6 +54,19 @@ def command(
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise AssertionError(f"command failed ({result.returncode}): {args[0]}: {detail}")
     return result
+
+
+def _guard(args: Sequence[str], env: Mapping[str, str] | None = None) -> None:
+    values = tuple(str(item) for item in args)
+    if not values:
+        raise AssertionError("disposable command is empty")
+    if any("montreal-01" in item for item in values):
+        raise AssertionError("disposable tests cannot target production")
+    if values[0] in {"ansible", "ansible-playbook", "crontab", "ssh", "systemctl"}:
+        raise AssertionError(f"disposable tests cannot run {values[0]}")
+    repository = (env or {}).get("RESTIC_REPOSITORY")
+    if values[0] == "restic" and repository and not Path(repository).is_absolute():
+        raise AssertionError("disposable tests require a local Restic repository")
 
 
 def require_binary(name: str) -> str:

@@ -58,6 +58,9 @@ def test_docs_record_host_local_safety_contracts():
         "external HTTP proxy",
         "one previous version",
         "preserve timer state",
+        "uv build",
+        "immutable artifacts",
+        "retention project/role --dry-run",
         "separate production migration",
     ):
         assert phrase.lower() in TEXT.lower()

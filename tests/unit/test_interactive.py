@@ -74,6 +74,25 @@ def test_invalid_choice_reprompts_and_eof_exits(config):
     assert "Invalid choice" in output
 
 
+def test_settings_reprompt_invalid_value_and_save_reset(tmp_path):
+    root = Path(__file__).parents[2]
+    config = load(
+        root / "tests/fixtures/config/kv",
+        paths=Paths(tmp_path / "etc", tmp_path / "state", tmp_path / "opt"),
+    )
+    target = config.select("app-dev-01/kv")
+    output = []
+    values, reset = interactive.settings(
+        target,
+        input_fn=_input(["", "reset", "invalid", "false", "", "", "bad", "512mb", "2", "yes"]),
+        output=output.append,
+    )
+
+    assert values == {"http": False, "memory": "512mb", "threads": 2}
+    assert reset == ("mode",)
+    assert output.count("Invalid value") == 2
+
+
 def test_database_navigation_can_repeat_without_recursion(config):
     calls = []
     output = []

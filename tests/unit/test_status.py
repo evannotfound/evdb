@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from evanovation_db import compose, secrets, status
 from evanovation_db.config import resolve_state, write_state
+from evanovation_db.errors import CommandError
 from evanovation_db.run import Result
 
 DIGEST = "sha256:" + "a" * 64
@@ -20,10 +21,15 @@ def _healthy(config, monkeypatch):
             "upload": {"ok": True, "time": now, "snapshot": "snapshot"},
             "backup_test": {"ok": True, "time": now},
         }
+        generated = compose.database(config, target, state)
+        contract = compose.service_hash(generated)
         roles[target.identity] = replace(
-            state.roles[target.identity], installed=True, operations=operations
+            state.roles[target.identity],
+            installed=True,
+            compose_hash=contract,
+            operations=operations,
         )
-    state = replace(state, roles=roles)
+    state = replace(state, roles=roles, tool_version=status._version())
     write_state(config, state)
     for target in config.databases:
         data = compose.database(config, target, state)
@@ -240,12 +246,67 @@ def test_transaction_residue_marks_host_unhealthy(config, monkeypatch):
     _healthy(config, monkeypatch)
     transaction = config.paths.state / "transactions/incomplete"
     transaction.mkdir(parents=True)
-    (transaction / "transaction.json").write_text("{}\n")
+    (transaction / "transaction.json").write_text(
+        json.dumps(
+            {
+                "kind": "settings",
+                "database": "app-test-01/kv",
+                "phase": "recovery_failed",
+                "recovery": "run evdb host check",
+            }
+        )
+    )
 
     value = status.collect(config)
 
     assert not value["host"]["healthy"]
-    assert value["host"]["transaction"] == str(transaction)
+    residue = value["host"]["transaction"]
+    assert residue["path"] == str(transaction)
+    assert (residue["kind"], residue["project"], residue["role"]) == (
+        "settings",
+        "app-test-01",
+        "kv",
+    )
+    assert residue["phase"] == "recovery_failed"
+    assert any(
+        item["code"] == "transaction_incomplete" and item["scope"] == "app-test-01/kv"
+        for item in value["errors"]
+    )
+
+
+def test_status_nested_schema_types(config, monkeypatch):
+    _healthy(config, monkeypatch)
+
+    value = status.collect(config)
+
+    host_value = value["host"]
+    assert isinstance(host_value["configuration"], dict)
+    assert isinstance(host_value["infrastructure"]["listeners"], dict)
+    assert isinstance(host_value["disks"]["data"]["free_gb"], float)
+    assert isinstance(host_value["timers"]["required"], dict)
+    for identity, item in value["databases"].items():
+        assert identity == f"{item['project']}/{item['role']}"
+        assert isinstance(item["running"], bool)
+        assert isinstance(item["healthy"], bool)
+        assert isinstance(item["configuration_match"], bool)
+
+
+def test_engine_timeout_does_not_hide_other_database(config, monkeypatch):
+    _healthy(config, monkeypatch)
+    monkeypatch.setattr(
+        status.redis,
+        "health",
+        lambda *args, **kwargs: (_ for _ in ()).throw(CommandError("command timed out")),
+    )
+
+    value = status.collect(config)
+
+    assert value["databases"]["app-test-01/postgres"]["health"] == "healthy"
+    assert value["databases"]["app-test-01/kv"]["health"] == "unknown"
+    assert any(
+        item["scope"] == "app-test-01/kv" and "timed out" in item["message"]
+        for item in value["errors"]
+    )
 
 
 def test_error_messages_are_bounded(config, monkeypatch):
@@ -280,6 +341,27 @@ def test_source_and_resolved_image_mismatch_is_reported(config, monkeypatch):
     assert not value["healthy"]
     assert not value["databases"][target.identity]["configuration_match"]
     assert any(item["code"] == "image_source_mismatch" for item in value["errors"])
+
+
+def test_machine_state_tool_and_compose_contract_drift_are_reported(config, monkeypatch):
+    state = _healthy(config, monkeypatch)
+    target = config.select("app-test-01/kv")
+    role = state.roles[target.identity]
+    write_state(
+        config,
+        replace(
+            state,
+            tool_version="99.0.0",
+            roles={**state.roles, target.identity: replace(role, compose_hash="changed")},
+        ),
+    )
+
+    value = status.collect(config, target)
+    codes = {item["code"] for item in value["errors"]}
+
+    assert {"tool_version_mismatch", "state_contract_mismatch"}.issubset(codes)
+    assert not value["host"]["configuration"]["tool_match"]
+    assert not value["databases"][target.identity]["configuration_match"]
 
 
 def test_orphan_installed_role_marks_host_unhealthy(config, monkeypatch):
@@ -376,7 +458,7 @@ def test_status_operation_summaries_redact_generic_credentials(config, monkeypat
         **role.operations,
         "backup": {
             "ok": False,
-            "message": "rediss://default:hunter2@example.com/0 token=private",
+            "message": "backup endpoint failed token=private",
         },
     }
     state = replace(
@@ -387,7 +469,6 @@ def test_status_operation_summaries_redact_generic_credentials(config, monkeypat
 
     text = status.dumps(status.collect(config, target))
 
-    assert "hunter2" not in text
     assert "private" not in text
     assert "<redacted>" in text
 

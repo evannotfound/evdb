@@ -6,127 +6,101 @@ Define the concise human-owned host configuration, generated reproducibility loc
 
 ## Requirements
 
-### Requirement: Managed database catalog
-The source configuration for `montreal-01` SHALL list the 25 managed databases under `/home/ubuntu/databases`: 14 Postgres, 7 Dragonfly, and 4 Redis databases. Databases outside the managed directories SHALL remain out of scope and SHALL NOT be added automatically.
+### Requirement: Project role catalog
+Host configuration SHALL organize managed databases under project IDs. A project SHALL contain at most one `postgres` role and at most one `kv` role, and each database SHALL be addressed as `<project>/<role>`.
 
-#### Scenario: Initial config is complete
-- **WHEN** the checked-in host configuration is validated
-- **THEN** it contains all 25 managed databases with the expected engine counts
+#### Scenario: Project uses both database roles
+- **WHEN** `code-share-prod-01` contains Postgres and Dragonfly-backed KV settings
+- **THEN** configuration exposes exactly `code-share-prod-01/postgres` and `code-share-prod-01/kv`
 
-#### Scenario: Unmanaged host database is found
-- **WHEN** a database container outside the managed directories is inspected
-- **THEN** it is reported as outside the managed catalog and is not added automatically
+#### Scenario: Duplicate project role is configured
+- **WHEN** one project declares two Postgres roles or two KV roles
+- **THEN** validation fails before generated files or live services change
+
+### Requirement: Stable KV role and concrete engine
+The KV role SHALL record a concrete engine of `dragonfly` or `redis`. Creation SHALL default an omitted KV engine to Dragonfly and SHALL persist the resolved engine explicitly. Redis and Dragonfly SHALL remain distinct engines for runtime, backup, restore, and compatibility checks.
+
+#### Scenario: Default KV is created
+- **WHEN** the operator adds `example-prod-01/kv` without an engine option
+- **THEN** source records `engine: dragonfly` and generated Compose uses Dragonfly
+
+### Requirement: Per-database image sources
+Each database SHALL record its own primary image source and any enabled PgBouncer or HTTP sidecar image source. Creation MAY begin from built-in defaults but SHALL persist resolved source choices so later default changes do not alter existing databases.
+
+#### Scenario: One Postgres image changes
+- **WHEN** the operator updates the image source for one project's Postgres role
+- **THEN** no other project's source configuration or generated Compose changes
+
+### Requirement: Canonical host paths
+Source configuration SHALL live at `/etc/evdb/host.yml`, generated database assets under `/etc/evdb/projects/<project>/<role>`, dedicated Traefik assets under `/etc/evdb/traefik`, private secrets under `/etc/evdb/secrets`, mutable operational state under `/var/lib/evdb`, and data under `<data_root>/<project>/<role>/data`.
+
+#### Scenario: Postgres paths are derived
+- **WHEN** project `example-prod-01` has a Postgres role
+- **THEN** its Compose path is `/etc/evdb/projects/example-prod-01/postgres/compose.yaml` and its data path ends in `/example-prod-01/postgres/data`
+
+### Requirement: Machine-owned host state
+The system SHALL store resolved image digests, stable HTTP loopback ports, schema versions, and operation results in private machine-owned state under `/var/lib/evdb/state`. Operators SHALL NOT need to edit or commit this state.
+
+#### Scenario: New KV receives an HTTP port
+- **WHEN** an HTTP-enabled KV role is added
+- **THEN** evdb allocates an unused loopback port and preserves it across ordering changes and tool updates
+
+### Requirement: Command-owned atomic configuration
+Normal configuration changes SHALL occur through typed evdb commands. A command SHALL validate a complete candidate, write source and generated files atomically, retain one `/etc/evdb/host.previous.yml`, and append a secret-free activity record. It SHALL NOT retain user-selectable configuration releases.
+
+#### Scenario: Configuration write is interrupted
+- **WHEN** a process stops before the atomic replacement
+- **THEN** the prior complete host configuration remains readable and active
 
 ### Requirement: Single human-owned host configuration
-The system SHALL use one `config/<host>/host.yml` file as the only human-owned configuration for a managed host. It SHALL NOT require separate Postgres or KV source files.
+Each managed host SHALL have one readable `/etc/evdb/host.yml` containing host settings and every project database role. The host-local CLI SHALL be authoritative for normal changes; no workstation source file, separate Postgres/KV file, generated runtime copy, or active release SHALL be required to operate the host.
 
-#### Scenario: Operator opens host configuration
-- **WHEN** an operator reviews a managed host
-- **THEN** host defaults and every managed database are visible in one YAML file
+#### Scenario: Operator reviews a host
+- **WHEN** the operator opens `/etc/evdb/host.yml`
+- **THEN** host settings, projects, roles, engines, images, and explicit overrides are visible without reading machine state or Compose
 
 ### Requirement: Minimal database entries
-A normal database entry SHALL require only a name and one supported type: `postgres`, `redis`, or `dragonfly`. The system SHALL apply safe built-in defaults for omitted settings.
+A Postgres role SHALL require its project identity and persisted image source. A KV role SHALL require its project identity, persisted concrete engine, and image source; command creation defaults the engine to Dragonfly. Safe defaults SHALL supply PgBouncer, durability, HTTP, pool sizing, Dragonfly resources, and connection limits when no override is selected.
 
-#### Scenario: Minimal Postgres entry is loaded
-- **WHEN** an entry contains only `name: example-prod-01` and `type: postgres`
-- **THEN** the system derives a durable Postgres deployment with backups and PgBouncer enabled
+#### Scenario: Minimal Postgres role is created
+- **WHEN** the operator accepts creation defaults for `example-prod-01/postgres`
+- **THEN** source records an independently imaged durable Postgres role with backups and PgBouncer enabled
 
-#### Scenario: Minimal KV entry is loaded
-- **WHEN** an entry contains only a name and a Redis or Dragonfly type
-- **THEN** the system derives a durable KV deployment with backups and authenticated HTTP enabled
+#### Scenario: Minimal KV role is created
+- **WHEN** the operator accepts creation defaults for `example-prod-01/kv`
+- **THEN** source records a durable Dragonfly role with backups and authenticated HTTP enabled
 
 ### Requirement: Derived deployment values
-The system SHALL derive container names, Compose project names, data paths, domains, database defaults, backup behavior, HTTP behavior, and secret references from host defaults plus each concise database entry.
+The system SHALL derive type-qualified Compose project names, unique service and network aliases, data and generated-file paths, SNI domains, default settings, backup behavior, HTTP behavior, and secret-file paths from host settings plus each project role. Compose project identity SHALL remain distinct when one project has both roles.
 
-Only Traefik SHALL own host database ports 5432 and 6379. Derived database domains and HTTP loopback ports SHALL be unique, and standard KV HTTP domains SHALL use `<database>.kv-montreal-01.storage.evanovation.com`.
-
-#### Scenario: Deployment model is normalized
-- **WHEN** valid source configuration is loaded
-- **THEN** every value required by Compose, backup, restore, status, and deployment is present in the normalized model without being repeated in source YAML
-
-#### Scenario: Shared database listeners are derived
-- **WHEN** multiple databases use the shared Postgres or KV listener
-- **THEN** Traefik owns the host port and each database receives a unique domain and instance-specific backend route
-
-#### Scenario: Initial HTTP coverage is checked
-- **WHEN** the initial `montreal-01` configuration is validated
-- **THEN** all 11 KV databases derive enabled HTTP services with unique loopback ports and intended domains
+#### Scenario: Two roles share one project
+- **WHEN** one project has Postgres and KV
+- **THEN** generated project names are `evdb-<project>-postgres` and `evdb-<project>-kv` and Docker does not merge their Compose metadata
 
 ### Requirement: Explicit exceptional settings
-The source schema SHALL accept concise overrides only for behavior that differs from defaults, including cache mode, PgBouncer use, pool sizing, Dragonfly memory or threads, and HTTP enablement.
+Configuration SHALL accept typed overrides for KV durability mode, enabled HTTP, HTTP connections, PgBouncer use and sizing, Dragonfly memory and threads, and per-database images. Invalid settings for a role or concrete engine SHALL be rejected and omitted from its guided settings menu.
 
-#### Scenario: Postgres pooler is disabled
-- **WHEN** a Postgres entry sets `pooler: false`
-- **THEN** the normalized model disables PgBouncer for only that database
-
-#### Scenario: Cache mode is selected
-- **WHEN** an entry explicitly sets `mode: cache`
-- **THEN** the normalized model permits backups to be disabled for that entry
-
-### Requirement: Host-level image versions
-The operator SHALL configure each infrastructure image once at host level. Per-database image settings SHALL NOT be required.
-
-Each source image SHALL use an explicit non-`latest` tag or an immutable `@sha256` reference. Postgres, Redis, and Dragonfly source images SHALL also have a tagged positive integer engine major. Digest-only engine references and non-version engine tags SHALL be rejected, while infrastructure images MAY use digest-only references.
-
-#### Scenario: Postgres image is changed
-- **WHEN** the host-level Postgres image version changes
-- **THEN** every Postgres database inherits the new desired image
-
-#### Scenario: Engine tag has no major version
-- **WHEN** an engine source uses `postgres:stable`, `redis:0`, or a digest without a tagged major
-- **THEN** source validation fails before image resolution or release staging
-
-### Requirement: Generated reproducibility lock
-The system SHALL maintain a tool-owned, secret-free `host.lock.json` containing resolved platform image digests and stable allocated values. Generated Compose SHALL use locked image references rather than mutable source tags.
-
-#### Scenario: Image tag is resolved
-- **WHEN** plan or apply resolves a configured image tag
-- **THEN** the selected platform digest is written atomically to the lock and used by generated deployment artifacts
-
-#### Scenario: Image digest is configured
-- **WHEN** a source image already contains an immutable `@sha256` reference
-- **THEN** its digest is reused without registry resolution and generated artifacts contain one digest suffix
-
-#### Scenario: Existing HTTP assignment is loaded
-- **WHEN** a database already has an HTTP port in the lock
-- **THEN** normalization preserves that port regardless of database ordering or newly added entries
-
-### Requirement: Convention-based secret references
-Source configuration SHALL contain only the host 1Password vault and system item settings. Database password and token references SHALL be derived from database identity, and no secret value SHALL be accepted in source or lock files.
-
-#### Scenario: Database secret reference is derived
-- **WHEN** a database named `example-prod-01` is normalized
-- **THEN** its password reference targets the convention-based Postgres or KV item without a per-entry secret field
-
-#### Scenario: Secret value is committed
-- **WHEN** source or lock configuration contains a resolved password or token
-- **THEN** validation fails without printing the value
+#### Scenario: Redis receives Dragonfly threads
+- **WHEN** a Redis-backed KV role contains a Dragonfly thread override
+- **THEN** validation names the invalid field and no file or service changes
 
 ### Requirement: Machine-owned runtime and observed state
-The system SHALL keep normalized runtime JSON, active release facts, and live Docker observations outside human source YAML.
+Resolved digests, allocated ports, operation outcomes, installed tool version, generated Compose hashes, and live Docker observations SHALL remain outside `host.yml`. Live observations SHALL be recomputed and SHALL NOT become desired source fields.
 
-#### Scenario: Live image differs from desired image
-- **WHEN** the running image differs from the locked desired image
-- **THEN** plan reports drift without adding a `current` section to `host.yml`
+#### Scenario: Running image differs from installed Compose
+- **WHEN** Docker reports an image digest unlike the generated definition
+- **THEN** status reports that configuration differs without rewriting source configuration
 
 ### Requirement: Configuration validation
-Validation SHALL reject unsupported engine types, duplicate typed identities, unsafe names, colliding container names, Compose projects, domains, ports, or routes, invalid overrides, missing host requirements, and source-to-lock inconsistencies with concise field-specific errors.
+Validation SHALL reject unsafe project IDs, missing required environment suffixes, duplicate roles, unsupported KV engines, unsafe paths, colliding project/service/domain/port identities, unversioned, `latest`, or invalid image sources, invalid role-specific overrides, unsupported engine-major changes, and secret values in source or machine state. Explicit version tags SHALL be permitted only when they resolve to immutable digests in machine state.
 
-#### Scenario: Duplicate typed identity is configured
-- **WHEN** two entries have the same type and name
-- **THEN** validation fails and names the duplicate identity
-
-#### Scenario: Same product has two database types
-- **WHEN** Postgres and KV entries share a name
-- **THEN** both entries validate because their typed identities differ
-
-#### Scenario: HTTP port is reused
-- **WHEN** two managed HTTP services derive the same loopback address and port
-- **THEN** validation fails and names both databases
+#### Scenario: Project suffix is absent
+- **WHEN** a project ID does not end in `-dev-N`, `-test-N`, or `-prod-N`
+- **THEN** validation fails before candidate rendering
 
 ### Requirement: Old source schema is not supported
-The loader SHALL reject migration-only instance fields and old separate instance files rather than maintaining a compatibility layer.
+The loader SHALL reject the controller-owned `databases` list, engine-first identities, `current` or `target` fields, separate Postgres/KV files, checked-in `host.lock.json`, and migration-only release fields. Production conversion SHALL be performed only by the separate approved migration change.
 
-#### Scenario: Current and target fields are present
-- **WHEN** an entry contains `current` or `target`
-- **THEN** validation fails with guidance to use the concise schema
+#### Scenario: Controller source is supplied
+- **WHEN** configuration contains the old top-level `databases` list
+- **THEN** host setup or checking fails with guidance to use project roles

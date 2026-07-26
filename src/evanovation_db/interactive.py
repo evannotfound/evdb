@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -155,16 +156,27 @@ def settings(target: Database, *, input_fn=input, output=print) -> tuple[dict, t
     for name in names:
         current = _current(target, name)
         label = "default" if current == _default(target, name) else "custom"
-        try:
-            value = input_fn(f"{name} [{_display(current)} ({label})]: ").strip()
-        except EOFError:
-            return {}, ()
-        if not value:
-            continue
-        if value == "reset":
-            reset.append(name)
-        else:
-            values[name] = _parse(value, current)
+        while True:
+            try:
+                value = input_fn(f"{name} [{_display(current)} ({label})]: ").strip()
+            except EOFError:
+                return {}, ()
+            if not value:
+                break
+            if value == "reset":
+                reset.append(name)
+                break
+            try:
+                parsed = _parse(value, current)
+                if name == "mode" and parsed not in {"durable", "cache"}:
+                    raise ValueError
+                if name == "memory" and not re.fullmatch(r"[1-9][0-9]*(?:kb|mb|gb)", parsed):
+                    raise ValueError
+            except (TypeError, ValueError):
+                output("Invalid value")
+                continue
+            values[name] = parsed
+            break
     if not values and not reset:
         return {}, ()
     try:
@@ -308,7 +320,13 @@ def _default(target, name):
     settings = (
         Postgres(DEFAULT_IMAGES["postgres"], PgBouncer())
         if target.role == "postgres"
-        else KV(target.engine, DEFAULT_IMAGES[target.engine], http=HTTP())
+        else KV(
+            target.engine,
+            DEFAULT_IMAGES[target.engine],
+            http=HTTP(),
+            memory="256mb" if target.engine == "dragonfly" else None,
+            threads=1 if target.engine == "dragonfly" else None,
+        )
     )
     default = Database(target.project, target.role, settings, target.host, target.paths)
     return _current(default, name)
@@ -336,10 +354,10 @@ def _parse(value, current):
             return True
         if value.lower() in {"false", "no", "off", "0"}:
             return False
-        return value
+        raise ValueError("boolean value required")
     if isinstance(current, int):
         try:
             return int(value)
         except ValueError:
-            return value
+            raise ValueError("integer value required") from None
     return value

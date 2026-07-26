@@ -6,6 +6,7 @@
 evdb backup create app-prod-01/postgres
 evdb backup list app-prod-01/postgres
 evdb backup test app-prod-01/postgres latest
+evdb backup retention app-prod-01/postgres --dry-run
 evdb backup retention app-prod-01/postgres
 evdb backup prune postgres
 evdb backup repository-check postgres --rotate
@@ -45,6 +46,11 @@ The policy defaults to 7 daily, 4 weekly, and 12 monthly snapshots per durable p
 Retention runs without prune; prune is a separate monthly repository operation. Repository checks
 rotate through configured data subsets. All grouping uses stable host/project/role tags rather than
 mutable image metadata.
+
+Run and review `backup retention PROJECT/ROLE --dry-run` before enabling deletion for that role.
+evdb records approval for the exact repository, role tags, and retention policy; a changed
+repository or policy requires another reviewed dry run. Scheduled retention fails closed until the
+matching review exists.
 
 At least two newest uploaded local backups are retained, and unuploaded backups are never deleted
 automatically. A failed new upload remains separate from the most recent confirmed snapshot. A

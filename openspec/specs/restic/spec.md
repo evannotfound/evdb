@@ -21,11 +21,11 @@ Restic backup SHALL run with JSON output, parse JSON Lines by `message_type`, re
 - **THEN** upload is marked failed and the local backup is kept
 
 ### Requirement: Snapshot identity
-Every snapshot SHALL use stable host, engine, and database tags. Changing backup format details SHALL be recorded in `backup.json` rather than by changing tags used for retention groups.
+Every snapshot SHALL use stable host, project, and role tags. It SHALL additionally record concrete engine and backup identity metadata without using mutable image details as retention grouping keys. Changing backup format details SHALL be recorded in `backup.json` rather than by changing stable grouping tags.
 
 #### Scenario: Latest snapshot is queried
-- **WHEN** status checks one database
-- **THEN** it can find that database's latest snapshot without matching another database
+- **WHEN** status checks `example-prod-01/kv`
+- **THEN** it finds that role's latest snapshot without matching Postgres from the same project or KV from another project
 
 ### Requirement: Repository locking
 All Restic work for one repository SHALL use one host lock. Backup, status, retention, prune, and check commands SHALL NOT race each other.
@@ -42,11 +42,11 @@ The system SHALL keep existing repositories at format v1 and SHALL work with a p
 - **THEN** it reports the mismatch and does not continue with maintenance
 
 ### Requirement: Retention and prune
-The system SHALL support the policy of 7 daily, 4 weekly, and 12 monthly snapshots per database. Forget SHALL run weekly and prune SHALL run monthly. A dry run SHALL be reviewed before deletion is enabled for a repository.
+The system SHALL support the policy of 7 daily, 4 weekly, and 12 monthly snapshots per durable project/role. Forget SHALL run weekly and prune SHALL run monthly. A dry run SHALL be reviewed before deletion is enabled for a repository.
 
 #### Scenario: Weekly retention runs
 - **WHEN** the weekly job applies retention
-- **THEN** snapshots are grouped by stable database identity and prune does not run
+- **THEN** snapshots are grouped by stable host/project/role identity and prune does not run
 
 ### Requirement: Repository checks
 The system SHALL support weekly structure checks and deterministic rotating data checks using `n/t` subsets so all repository data is covered over time.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -15,6 +15,7 @@ from .engines import dragonfly, postgres, redis
 from .errors import BackupError
 from .files import finish, private_dir, read_json, require_file, require_space, write_json
 from .files import hash as file_hash
+from .images import validate_source
 from .lock import operation
 from .log import sanitize
 from .log import write as log_write
@@ -35,15 +36,6 @@ def create(
         raise BackupError(f"backups are disabled for cache database {database.identity}")
     if purpose not in {"scheduled", "manual", "safety"}:
         raise BackupError(f"invalid backup purpose: {purpose}")
-    current = state or load_state(config)
-    role = current.roles.get(database.identity)
-    if role is None or not role.installed:
-        raise BackupError(f"database is not installed: {database.identity}")
-    root = private_dir(config.paths.role_backups(database.project, database.role))
-    require_space(root, config.host.backup.min_free_gb)
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    partial = root / f"{run_id}.partial"
-    context = nullcontext() if lock_held else operation(config, database)
     started_at = time.monotonic()
     log_write(
         "backup_operation",
@@ -56,6 +48,33 @@ def create(
         result="started",
         purpose=purpose,
     )
+    try:
+        current = state or load_state(config)
+        role = current.roles.get(database.identity)
+        if role is None or not role.installed:
+            raise BackupError(f"database is not installed: {database.identity}")
+        root = private_dir(config.paths.role_backups(database.project, database.role))
+        require_space(root, config.host.backup.min_free_gb)
+    except BaseException as exc:
+        with suppress(Exception):
+            _error(config, database, "backup", "preflight", exc)
+        log_write(
+            "backup_operation",
+            host=config.host.id,
+            project=database.project,
+            role=database.role,
+            engine=database.engine,
+            command="backup create",
+            step="preflight",
+            result="failed",
+            purpose=purpose,
+            duration=round(time.monotonic() - started_at, 3),
+            error=str(exc),
+        )
+        raise
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    partial = root / f"{run_id}.partial"
+    context = nullcontext() if lock_held else operation(config, database)
     with context:
         private_dir(partial)
         started = datetime.now(timezone.utc).isoformat()
@@ -245,6 +264,38 @@ def select(config: Config, database: Database, value: str | None) -> dict[str, A
 
 
 def test(config: Config, database: Database, value: str | None = None) -> dict[str, Any]:
+    started = time.monotonic()
+    fields = {
+        "host": config.host.id,
+        "project": database.project,
+        "role": database.role,
+        "engine": database.engine,
+        "command": "backup test",
+    }
+    log_write("backup_operation", **fields, step="start", result="started")
+    try:
+        result = _test(config, database, value)
+    except BaseException as exc:
+        log_write(
+            "backup_operation",
+            **fields,
+            step="complete",
+            result="failed",
+            duration=round(time.monotonic() - started, 3),
+            error=str(exc),
+        )
+        raise
+    log_write(
+        "backup_operation",
+        **fields,
+        step="complete",
+        result="success",
+        duration=round(time.monotonic() - started, 3),
+    )
+    return result
+
+
+def _test(config: Config, database: Database, value: str | None = None) -> dict[str, Any]:
     from .restore import verify
 
     with operation(config, database, timeout=config.host.timeouts["restore"]):
@@ -361,6 +412,14 @@ def manifest_files(folder: str | Path, names: list[str]) -> list[dict[str, Any]]
 
 
 def manifest_check(folder: str | Path) -> dict[str, Any]:
+    return _manifest_check(folder, verify_files=True)
+
+
+def manifest_contract(folder: str | Path) -> dict[str, Any]:
+    return _manifest_check(folder, verify_files=False)
+
+
+def _manifest_check(folder: str | Path, *, verify_files: bool) -> dict[str, Any]:
     root = Path(folder)
     data = manifest_read(root)
     required = {
@@ -392,6 +451,38 @@ def manifest_check(folder: str | Path) -> dict[str, Any]:
         raise BackupError(f"invalid backup role or engine: {root}")
     if data["purpose"] not in {"scheduled", "manual", "safety"}:
         raise BackupError(f"invalid backup purpose: {root}")
+    expected_format = {
+        "postgres": "postgres-custom-v1",
+        "redis": "redis-rdb-v1",
+        "dragonfly": "dragonfly-dfs-v1",
+    }[data["engine"]]
+    if data["format"] != expected_format:
+        raise BackupError(f"backup format does not match engine: {root}")
+    if not all(
+        isinstance(data[name], str) and data[name]
+        for name in ("host", "project", "role", "source_image", "image")
+    ):
+        raise BackupError(f"invalid backup identity or image: {root}")
+    try:
+        validate_source(data["source_image"], "backup source image")
+    except Exception as exc:
+        raise BackupError(f"invalid backup source image: {root}") from exc
+    digest = data["image"].rsplit("@sha256:", 1)
+    if (
+        len(digest) != 2
+        or not digest[0]
+        or len(digest[1]) != 64
+        or any(character not in "0123456789abcdef" for character in digest[1])
+    ):
+        raise BackupError(f"invalid locked backup image: {root}")
+    if not all(isinstance(data[name], str) and data[name] for name in ("started", "finished")):
+        raise BackupError(f"invalid backup timestamps: {root}")
+    if not isinstance(data["version"], str) or not isinstance(data["facts"], dict):
+        raise BackupError(f"invalid backup version or facts: {root}")
+    if not isinstance(data["checks"], list) or not all(
+        isinstance(item, str) for item in data["checks"]
+    ):
+        raise BackupError(f"invalid backup checks: {root}")
     backup_id = data["backup"]
     if (
         not isinstance(backup_id, str)
@@ -417,20 +508,33 @@ def manifest_check(folder: str | Path) -> dict[str, Any]:
         if not isinstance(item, dict) or set(item) != {"name", "size", "sha256"}:
             raise BackupError(f"invalid backup file record: {root}")
         name = item["name"]
+        size = item["size"]
+        checksum = item["sha256"]
         path = PurePosixPath(name) if isinstance(name, str) else PurePosixPath("..")
-        if path.is_absolute() or ".." in path.parts or name in recorded:
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or name in recorded
+            or type(size) is not int
+            or size < 0
+            or not isinstance(checksum, str)
+            or len(checksum) != 64
+            or any(character not in "0123456789abcdef" for character in checksum)
+        ):
             raise BackupError(f"unsafe backup file record: {name}")
         recorded.add(name)
-        target = require_file(root / name)
-        if target.stat().st_size != item["size"] or file_hash(target) != item["sha256"]:
-            raise BackupError(f"backup file changed: {name}")
-    actual = {
-        str(path.relative_to(root))
-        for path in root.rglob("*")
-        if path.is_file() and path.name != MANIFEST
-    }
-    if actual - recorded:
-        raise BackupError(f"backup has unlisted file: {min(actual - recorded)}")
+        if verify_files:
+            target = require_file(root / name)
+            if target.stat().st_size != item["size"] or file_hash(target) != item["sha256"]:
+                raise BackupError(f"backup file changed: {name}")
+    if verify_files:
+        actual = {
+            str(path.relative_to(root))
+            for path in root.rglob("*")
+            if path.is_file() and path.name != MANIFEST
+        }
+        if actual - recorded:
+            raise BackupError(f"backup has unlisted file: {min(actual - recorded)}")
     return data
 
 

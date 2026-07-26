@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import Config, Database
 from .errors import ResticError
+from .files import write_text
 from .lock import lock
 from .log import sanitize
 from .log import write as log_write
@@ -37,12 +38,22 @@ def upload(config: Config, database: Database, folder: Path) -> str:
     )
     try:
         record = manifest_check(folder)
+        expected = {
+            "host": config.host.id,
+            "project": database.project,
+            "role": database.role,
+            "engine": database.engine,
+        }
+        for name, value in expected.items():
+            if record.get(name) != value:
+                raise ResticError(f"backup {name} does not match {value}")
         tags = [
             f"host:{config.host.id}",
             f"project:{database.project}",
             f"role:{database.role}",
             f"engine:{database.engine}",
             f"backup:{record['backup']}",
+            f"purpose:{record['purpose']}",
         ]
         args = ["backup", str(folder), "--json", "--host", config.host.id]
         for tag in tags:
@@ -84,6 +95,17 @@ def upload(config: Config, database: Database, folder: Path) -> str:
 
 
 def forget(config: Config, database: Database, *, dry_run: bool = True) -> Result:
+    command = "restic retention dry-run" if dry_run else "restic retention"
+    return _maintenance(
+        config,
+        database.role,
+        command,
+        lambda: _forget(config, database, dry_run=dry_run),
+        database=database,
+    )
+
+
+def _forget(config: Config, database: Database, *, dry_run: bool) -> Result:
     args = [
         "forget",
         "--keep-daily",
@@ -103,10 +125,31 @@ def forget(config: Config, database: Database, *, dry_run: bool = True) -> Resul
         args.append("--dry-run")
     with lock(_repo_lock(config, database.role), timeout=3600):
         _require_v1(config, database.role)
-        return _run(config, database.role, args)
+        review, signature = _retention_review(config, database)
+        if not dry_run:
+            try:
+                approved = review.read_text().strip()
+            except OSError:
+                approved = ""
+            if approved != signature:
+                raise ResticError(
+                    f"retention requires a reviewed dry run; run "
+                    f"evdb backup retention {database.identity} --dry-run"
+                )
+        result = _run(config, database.role, args)
+        return result
+
+
+def approve_retention(config: Config, database: Database) -> None:
+    review, signature = _retention_review(config, database)
+    write_text(review, signature + "\n", mode=0o600)
 
 
 def prune(config: Config, role: str) -> Result:
+    return _maintenance(config, role, "restic prune", lambda: _prune(config, role))
+
+
+def _prune(config: Config, role: str) -> Result:
     with lock(_repo_lock(config, role), timeout=3600):
         _require_v1(config, role)
         return _run(config, role, ["prune"], timeout=24 * 3600)
@@ -129,9 +172,45 @@ def check(
         if not 1 <= part <= total:
             raise ResticError(f"check part must be between 1 and {total}")
         args.append(f"--read-data-subset={part}/{total}")
+    return _maintenance(config, role, "restic check", lambda: _check(config, role, args))
+
+
+def _check(config: Config, role: str, args: list[str]) -> Result:
     with lock(_repo_lock(config, role), timeout=3600):
         _require_v1(config, role)
         return _run(config, role, args, timeout=24 * 3600)
+
+
+def _maintenance(config: Config, role: str, command: str, call, *, database=None) -> Result:
+    started = time.monotonic()
+    fields = {
+        "host": config.host.id,
+        "project": database.project if database else None,
+        "role": database.role if database else role,
+        "engine": database.engine if database else None,
+        "command": command,
+    }
+    log_write("restic_operation", **fields, step="start", result="started")
+    try:
+        result = call()
+    except BaseException as exc:
+        log_write(
+            "restic_operation",
+            **fields,
+            step="complete",
+            result="failed",
+            duration=round(time.monotonic() - started, 3),
+            error=str(exc),
+        )
+        raise
+    log_write(
+        "restic_operation",
+        **fields,
+        step="complete",
+        result="success",
+        duration=round(time.monotonic() - started, 3),
+    )
+    return result
 
 
 def check_part(config: Config, *, today: date | None = None) -> int:
@@ -290,7 +369,7 @@ def _run(
         command,
         timeout=timeout,
         env={"RCLONE_CONFIG": str(rclone)},
-        secrets=_protected_values(password, rclone),
+        secrets=(repo, *_protected_values(password, rclone)),
         check=check,
     )
 
@@ -365,6 +444,19 @@ def _repo_lock(config: Config, role: str) -> Path:
     repo = config.host.backup.repos[role]
     digest = hashlib.sha256(repo.encode()).hexdigest()[:16]
     return config.paths.locks / f"restic-{digest}.lock"
+
+
+def _retention_review(config: Config, database: Database) -> tuple[Path, str]:
+    data = {
+        "repository": config.host.backup.repos[database.role],
+        "tags": sorted(_tags(config, database)),
+        "retention": {
+            name: config.host.backup.retention[name] for name in ("daily", "weekly", "monthly")
+        },
+    }
+    signature = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+    path = config.paths.state / "retention-reviews" / f"{database.project}-{database.role}.reviewed"
+    return path, signature
 
 
 def _require_v1(config: Config, role: str) -> None:
