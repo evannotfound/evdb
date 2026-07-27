@@ -4,7 +4,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from evanovation_db import host
+from evdb import host
 
 
 def main() -> int:

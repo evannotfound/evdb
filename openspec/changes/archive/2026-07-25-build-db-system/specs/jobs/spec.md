@@ -4,11 +4,11 @@
 The CLI SHALL provide `backup <group> <instance>`, `restore-check <group> <instance>`, `status`, and `validate` commands, where group is `postgres` or `kv`. Commands SHALL use short option and function names that match the terms used by operators.
 
 #### Scenario: Named backup runs
-- **WHEN** an operator runs `evanovation-db backup postgres vercount-prod-01`
+- **WHEN** an operator runs `evdb backup postgres vercount-prod-01`
 - **THEN** only the Postgres instance is backed up and the command returns success only after its required checks and upload succeed
 
 #### Scenario: Product has Postgres and KV
-- **WHEN** an operator runs `evanovation-db backup kv vercount-prod-01`
+- **WHEN** an operator runs `evdb backup kv vercount-prod-01`
 - **THEN** the KV instance is selected without changing or backing up its Postgres instance
 
 ### Requirement: Safe command execution

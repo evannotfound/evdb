@@ -21,7 +21,7 @@ wheels = [
 ]
 
 [[package]]
-name = "evanovation-db"
+name = "evdb"
 source = { editable = "." }
 dependencies = [
     { name = "pyyaml" },

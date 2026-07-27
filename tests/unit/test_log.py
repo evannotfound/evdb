@@ -1,6 +1,6 @@
 import json
 
-from evanovation_db.log import sanitize, write
+from evdb.log import sanitize, write
 
 
 def test_structured_log_has_fields_and_redacts(capsys):

@@ -35,7 +35,7 @@ None. The repository has no archived main capability specs; these capabilities s
 
 ## Impact
 
-- Replaces the source configuration model and command syntax in `src/evanovation_db/config.py`, `src/evanovation_db/cli.py`, the checked-in Montreal configuration, tests, and documentation.
+- Replaces the source configuration model and command syntax in `src/evdb/config.py`, `src/evdb/cli.py`, the checked-in Montreal configuration, tests, and documentation.
 - Adds local SSH transport, 1Password item management, desired-versus-deployed planning, Compose lifecycle control, and deployment release manifests.
 - Changes Ansible roles and Compose rendering to consume normalized generated configuration rather than three human-authored inventory files.
 - Extends existing backup, Restic, status, and isolated restore code instead of replacing their validated data-handling paths.

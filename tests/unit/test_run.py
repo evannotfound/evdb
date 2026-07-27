@@ -4,8 +4,8 @@ import time
 
 import pytest
 
-from evanovation_db.errors import CommandError
-from evanovation_db.run import redact, run
+from evdb.errors import CommandError
+from evdb.run import redact, run
 
 
 def test_run_captures_output():

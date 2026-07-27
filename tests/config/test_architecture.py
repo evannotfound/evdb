@@ -1,7 +1,7 @@
 import ast
 from pathlib import Path
 
-from evanovation_db import cli
+from evdb import cli
 from tests.fixtures.containers import _guard
 
 ROOT = Path(__file__).parents[2]
@@ -15,12 +15,12 @@ REMOVED_MODULES = {
     "remote",
 }
 REMOVED_COMMANDS = {"apply", "backup-check", "plan", "promote", "releases", "rollback"}
-REMOVED_FILES = tuple(ROOT / "src/evanovation_db" / f"{name}.py" for name in REMOVED_MODULES)
+REMOVED_FILES = tuple(ROOT / "src/evdb" / f"{name}.py" for name in REMOVED_MODULES)
 REMOVED_TREES = (
     ROOT / "ansible",
     ROOT / "systemd",
-    ROOT / "src/evanovation_db/backup",
-    ROOT / "src/evanovation_db/restore",
+    ROOT / "src/evdb/backup",
+    ROOT / "src/evdb/restore",
 )
 PRODUCTION_CONFIG = "config/" + "montreal-01"
 

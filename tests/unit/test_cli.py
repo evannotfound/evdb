@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from evanovation_db import cli
-from evanovation_db.config import replace_role
-from evanovation_db.run import Result
+from evdb import cli
+from evdb.config import replace_role
+from evdb.run import Result
 
 
 @pytest.mark.parametrize(

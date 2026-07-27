@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from evanovation_db import backup, restic
-from evanovation_db.errors import ResticError
+from evdb import backup, restic
+from evdb.errors import ResticError
 from tests.fixtures.containers import require_binary
 
 DIGEST = "sha256:" + "a" * 64

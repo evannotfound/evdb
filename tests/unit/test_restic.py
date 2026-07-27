@@ -4,10 +4,10 @@ from datetime import date
 
 import pytest
 
-from evanovation_db import backup, restic
-from evanovation_db.config import resolve_state, write_state
-from evanovation_db.errors import ResticError
-from evanovation_db.run import Result
+from evdb import backup, restic
+from evdb.config import resolve_state, write_state
+from evdb.errors import ResticError
+from evdb.run import Result
 
 DIGEST = "sha256:" + "a" * 64
 

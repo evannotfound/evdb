@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-from evanovation_db import files
-from evanovation_db.errors import BackupError
-from evanovation_db.files import (
+from evdb import files
+from evdb.errors import BackupError
+from evdb.files import (
     finish,
     hash,
     private_dir,

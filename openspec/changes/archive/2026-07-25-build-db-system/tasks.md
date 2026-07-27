@@ -1,6 +1,6 @@
 ## 1. Project Setup
 
-- [x] 1.1 Add `pyproject.toml` for Python 3.10+, the `evanovation-db` command, Ruff, and pytest
+- [x] 1.1 Add `pyproject.toml` for Python 3.10+, the `evdb` command, Ruff, and pytest
 - [x] 1.2 Add the agreed `src`, `config`, `compose`, `ansible`, `systemd`, `tests`, and `docs` folders as real files need them
 - [x] 1.3 Add a Makefile with `check`, `plan`, `deploy-backup`, `deploy-db`, `backup`, `restore-check`, and `status` targets
 - [x] 1.4 Add README and AGENTS guidance covering scope, simple naming, no production writes, and development commands

@@ -32,7 +32,7 @@ None.
 
 ## Impact
 
-- Adds the `evanovation_db` Python package, configuration, tests, CI, documentation, Ansible roles, Compose templates, and systemd units.
+- Adds the `evdb` Python package, configuration, tests, CI, documentation, Ansible roles, Compose templates, and systemd units.
 - Uses Docker, Docker Compose, Traefik, Restic, rclone, Ansible, and the 1Password CLI at defined system boundaries.
 - Production Python uses the standard library. Pytest, Ruff, Ansible, and any config tooling remain development or controller dependencies.
 - Does not change production during this change. Read-only production facts may be used to build the checked-in config.

@@ -4,9 +4,9 @@ import os
 import uuid
 from dataclasses import replace
 
-from evanovation_db import backup, compose, restic, restore, secrets
-from evanovation_db.config import resolve_state, write_state
-from evanovation_db.engines import kv
+from evdb import backup, compose, restic, restore, secrets
+from evdb.config import resolve_state, write_state
+from evdb.engines import kv
 from tests.fixtures.containers import (
     REDIS_IMAGE,
     command,

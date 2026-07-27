@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from evanovation_db import cli
+from evdb import cli
 
 ROOT = Path(__file__).parents[2]
 README = (ROOT / "README.md").read_text()

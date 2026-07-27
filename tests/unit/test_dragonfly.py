@@ -2,9 +2,9 @@ from dataclasses import replace
 
 import pytest
 
-from evanovation_db.engines import dragonfly
-from evanovation_db.errors import BackupError, RestoreError
-from evanovation_db.run import Result
+from evdb.engines import dragonfly
+from evdb.errors import BackupError, RestoreError
+from evdb.run import Result
 
 
 def _target(config):

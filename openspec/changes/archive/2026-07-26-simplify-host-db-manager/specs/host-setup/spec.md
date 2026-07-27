@@ -4,7 +4,7 @@
 evdb SHALL be distributed as a versioned Python package installable through `uv`. Initial installation and host updates SHALL select an exact semantic version and SHALL NOT resolve an unbounded `latest` version.
 
 #### Scenario: Operator installs the first host version
-- **WHEN** the operator installs `evanovation-db==1.0.0`
+- **WHEN** the operator installs `evdb==1.0.0`
 - **THEN** the resulting package exposes one `evdb` executable with canonical setup and systemd assets
 
 ### Requirement: Idempotent host setup

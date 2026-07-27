@@ -48,7 +48,7 @@ This keeps the new system internally consistent without mixing development with 
 The code is grouped by real work rather than by framework layers:
 
 ```text
-src/evanovation_db/
+src/evdb/
   cli.py
   config.py
   docker.py
@@ -98,7 +98,7 @@ The Python config uses small dataclasses for values that are passed across modul
 Runtime state uses plain JSON files written atomically:
 
 ```text
-/var/lib/evanovation-db/
+/var/lib/evdb/
   backups/<instance>/<utc-time>/
   state/<instance>.json
   locks/
@@ -166,7 +166,7 @@ The current 7 daily, 4 weekly, and 12 monthly policy is preserved. Forget is wee
 
 Tests use only temporary local repositories. This change does not open or lock the OneDrive repositories.
 
-The rclone config is different from a normal static secret because rclone updates its OAuth token. Ansible seeds `/var/lib/evanovation-db/rclone/rclone.conf` only when absent, sets mode 0600, and leaves it alone afterward. Reconnect and escrow refresh are documented for the later production move.
+The rclone config is different from a normal static secret because rclone updates its OAuth token. Ansible seeds `/var/lib/evdb/rclone/rclone.conf` only when absent, sets mode 0600, and leaves it alone afterward. Reconnect and escrow refresh are documented for the later production move.
 
 ### Secrets and Compose
 
@@ -210,7 +210,7 @@ The repository records the intended domain and loopback port but never inspects 
 
 ### Releases and Ansible
 
-The `app` role installs a root-owned release at `/opt/evanovation-db/releases/<git-sha>` and changes `current` only after checks pass. The `base` role creates the service account and required directories. Other roles render only their own files.
+The `app` role installs a root-owned release at `/opt/evdb/releases/<git-sha>` and changes `current` only after checks pass. The `base` role creates the service account and required directories. Other roles render only their own files.
 
 The service account owns state and secret files and belongs to the Docker group. Documentation calls out that Docker access is root-equivalent.
 

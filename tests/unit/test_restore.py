@@ -3,10 +3,10 @@ from dataclasses import replace
 
 import pytest
 
-from evanovation_db import backup, restore
-from evanovation_db.config import resolve_state, write_state
-from evanovation_db.errors import BackupError, CommandError, RestoreError
-from evanovation_db.run import Result
+from evdb import backup, restore
+from evdb.config import resolve_state, write_state
+from evdb.errors import BackupError, CommandError, RestoreError
+from evdb.run import Result
 
 DIGEST = "sha256:" + "a" * 64
 

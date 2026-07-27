@@ -4,10 +4,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
-from evanovation_db import backup, compose, database, secrets
-from evanovation_db.config import dump, load_state, replace_role, resolve_state, write_state
-from evanovation_db.errors import CommandError, ConfigError, DatabaseError
-from evanovation_db.run import Result
+from evdb import backup, compose, database, secrets
+from evdb.config import dump, load_state, replace_role, resolve_state, write_state
+from evdb.errors import CommandError, ConfigError, DatabaseError
+from evdb.run import Result
 
 DIGEST = "sha256:" + "a" * 64
 

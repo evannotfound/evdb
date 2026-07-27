@@ -1,8 +1,8 @@
 import pytest
 
-from evanovation_db import docker
-from evanovation_db.errors import CommandError
-from evanovation_db.run import Result
+from evdb import docker
+from evdb.errors import CommandError
+from evdb.run import Result
 
 
 def test_exec_builds_argument_array(monkeypatch):

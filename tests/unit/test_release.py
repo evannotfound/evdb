@@ -5,9 +5,9 @@ import tarfile
 
 import pytest
 
-from evanovation_db import host
-from evanovation_db.errors import HostError
-from evanovation_db.run import Result
+from evdb import host
+from evdb.errors import HostError
+from evdb.run import Result
 
 
 def _archive(path, members=None):

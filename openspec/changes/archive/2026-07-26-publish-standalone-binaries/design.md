@@ -77,7 +77,7 @@ This avoids inventing a private command to extract assets from another executabl
 
 ### Use one source version and validate every release boundary
 
-`evanovation_db.__version__` will be the application version. Package metadata will derive from that
+`evdb.__version__` will be the application version. Package metadata will derive from that
 attribute, `evdb --version` will print it, and the release workflow will reject a tag other than
 `v<version>`. The installer and updater will run the downloaded executable and reject a mismatch
 before placing or activating it.

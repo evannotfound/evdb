@@ -2,12 +2,12 @@ from importlib.metadata import version
 
 import pytest
 
-from evanovation_db import __version__, cli, host, status
+from evdb import __version__, cli, host, status
 
 
 def test_version_is_consistent_with_package_cli_and_status(capsys):
     assert host.VERSION.fullmatch(__version__)
-    assert version("evanovation-db") == __version__
+    assert version("evdb") == __version__
     assert status._version() == __version__
 
     with pytest.raises(SystemExit) as caught:

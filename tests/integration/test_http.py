@@ -8,8 +8,8 @@ import urllib.request
 import uuid
 from dataclasses import replace
 
-from evanovation_db import compose, secrets
-from evanovation_db.config import resolve_state
+from evdb import compose, secrets
+from evdb.config import resolve_state
 from tests.fixtures.containers import (
     DRAGONFLY_IMAGE,
     HTTP_IMAGE,

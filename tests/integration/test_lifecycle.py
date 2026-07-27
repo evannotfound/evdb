@@ -3,10 +3,10 @@ from __future__ import annotations
 import uuid
 from dataclasses import replace
 
-from evanovation_db import compose, database, secrets
-from evanovation_db.config import dump, resolve_state, write_state
-from evanovation_db.engines import redis
-from evanovation_db.errors import DatabaseError
+from evdb import compose, database, secrets
+from evdb.config import dump, resolve_state, write_state
+from evdb.engines import redis
+from evdb.errors import DatabaseError
 from tests.fixtures.containers import REDIS_IMAGE, command, docker_exec, require_image, wait_exec
 
 DIGEST = REDIS_IMAGE.split("@", 1)[1]

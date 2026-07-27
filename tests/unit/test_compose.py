@@ -3,9 +3,9 @@ from dataclasses import replace
 
 import yaml
 
-from evanovation_db import compose
-from evanovation_db.config import replace_role, resolve_state
-from evanovation_db.run import Result
+from evdb import compose
+from evdb.config import replace_role, resolve_state
+from evdb.run import Result
 
 DIGEST = "sha256:" + "a" * 64
 
@@ -210,7 +210,7 @@ def test_existing_unowned_network_is_rejected(monkeypatch):
         lambda *args, **kwargs: Result(tuple(args[0]), 0, '[{"Labels": {}}]', ""),
     )
 
-    from evanovation_db.errors import ConfigError
+    from evdb.errors import ConfigError
 
     try:
         compose.ensure_network()

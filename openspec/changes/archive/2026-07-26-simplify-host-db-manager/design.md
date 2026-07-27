@@ -1,6 +1,6 @@
 ## Context
 
-The repository currently implements a workstation controller that owns source configuration, resolves 1Password values, compares desired state with a remote active release, sends a versioned JSON request over SSH, stages code and generated assets under `/opt/evanovation-db/releases`, health-gates affected Compose projects, and switches a `current` symlink. Backup and restore code then depends on that active release to find configuration, images, and Compose files.
+The repository currently implements a workstation controller that owns source configuration, resolves 1Password values, compares desired state with a remote active release, sends a versioned JSON request over SSH, stages code and generated assets under `/opt/evdb/releases`, health-gates affected Compose projects, and switches a `current` symlink. Backup and restore code then depends on that active release to find configuration, images, and Compose files.
 
 This is disproportionate to the actual topology. Each database and all of its persistent data live on one VPS. Backup schedules must continue when an operator workstation or future central monitor is offline. Database recovery means restoring verified data, not changing a host-wide software release. The current production host also already uses one Compose file per database directory; the proposed release system has not been deployed there.
 
@@ -187,7 +187,7 @@ A tool update does not regenerate Compose or restart databases. New code must co
 ### Package organization follows direct work
 
 ```text
-src/evanovation_db/
+src/evdb/
   cli.py
   interactive.py
   config.py

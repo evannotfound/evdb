@@ -1,7 +1,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
-UNITS = ROOT / "src/evanovation_db/units"
+UNITS = ROOT / "src/evdb/units"
 
 
 def test_package_contains_canonical_public_command_units():

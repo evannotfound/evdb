@@ -1,8 +1,8 @@
 from dataclasses import replace
 from pathlib import Path
 
-from evanovation_db import interactive
-from evanovation_db.config import DEFAULT_IMAGES, HTTP, KV, Paths, load, with_role
+from evdb import interactive
+from evdb.config import DEFAULT_IMAGES, HTTP, KV, Paths, load, with_role
 
 
 def _actions(calls):

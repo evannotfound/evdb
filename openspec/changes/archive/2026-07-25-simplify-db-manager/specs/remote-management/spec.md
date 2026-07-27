@@ -8,7 +8,7 @@ The system SHALL provide an `evdb` command that reads local source configuration
 - **THEN** the command connects to the host declared in `host.yml` and prints the remote status result locally
 
 ### Requirement: Safe SSH transport
-The controller SHALL use subprocess argument arrays and a fixed versioned remote command. Normal operations SHALL execute code and runtime configuration through `/opt/evanovation-db/current`. A separate `/opt/evanovation-db/host-runtime` mode SHALL read an atomically refreshed normalized runtime from `/opt/evanovation-db/host-runtime/runtime` only after explicit confirmation for first install or protocol upgrade. It SHALL NOT read preserved `/etc` legacy JSON, use a shell command string, or place secret values in SSH arguments.
+The controller SHALL use subprocess argument arrays and a fixed versioned remote command. Normal operations SHALL execute code and runtime configuration through `/opt/evdb/current`. A separate `/opt/evdb/host-runtime` mode SHALL read an atomically refreshed normalized runtime from `/opt/evdb/host-runtime/runtime` only after explicit confirmation for first install or protocol upgrade. It SHALL NOT read preserved `/etc` legacy JSON, use a shell command string, or place secret values in SSH arguments.
 
 #### Scenario: Remote operation is invoked
 - **WHEN** the controller sends an operation to the host

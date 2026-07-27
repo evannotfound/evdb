@@ -1,14 +1,14 @@
 ## ADDED Requirements
 
 ### Requirement: Versioned release
-Ansible SHALL install each build under `/opt/evanovation-db/releases/<git-sha>` and switch `/opt/evanovation-db/current` only after the release, config, and checks are complete.
+Ansible SHALL install each build under `/opt/evdb/releases/<git-sha>` and switch `/opt/evdb/current` only after the release, config, and checks are complete.
 
 #### Scenario: Release check fails
 - **WHEN** a new release cannot pass its install checks
 - **THEN** the current link remains on the prior release
 
 ### Requirement: Production paths
-Rendered config SHALL live under `/etc/evanovation-db`, secret files under `/etc/evanovation-db/secrets`, and local backup state under `/var/lib/evanovation-db`.
+Rendered config SHALL live under `/etc/evdb`, secret files under `/etc/evdb/secrets`, and local backup state under `/var/lib/evdb`.
 
 #### Scenario: Secret file is deployed
 - **WHEN** Ansible writes a resolved secret

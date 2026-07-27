@@ -4,9 +4,9 @@ from dataclasses import replace
 
 import pytest
 
-from evanovation_db import backup, restic
-from evanovation_db.config import load_state, replace_role, resolve_state, write_state
-from evanovation_db.errors import BackupError, ResticError
+from evdb import backup, restic
+from evdb.config import load_state, replace_role, resolve_state, write_state
+from evdb.errors import BackupError, ResticError
 
 DIGEST = "sha256:" + "a" * 64
 
@@ -198,7 +198,7 @@ def test_backup_test_attaches_result_to_exact_identities(config, monkeypatch, ca
 
     monkeypatch.setattr(backup, "operation", operation)
 
-    import evanovation_db.restore as restore
+    import evdb.restore as restore
 
     monkeypatch.setattr(
         restore,

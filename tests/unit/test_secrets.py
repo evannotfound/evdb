@@ -2,8 +2,8 @@ from urllib.parse import unquote, urlparse
 
 import pytest
 
-from evanovation_db.errors import ConfigError
-from evanovation_db.secrets import Credentials, credentials, ensure, protected, render
+from evdb.errors import ConfigError
+from evdb.secrets import Credentials, credentials, ensure, protected, render
 
 
 def test_credentials_are_generated_once_and_all_files_are_private(config):

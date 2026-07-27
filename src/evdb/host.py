@@ -662,7 +662,7 @@ def _units() -> tuple[Path, ...]:
     if getattr(sys, "frozen", False):
         root = Path(sys.executable).resolve().parent.parent / "units"
     else:
-        root = Path(str(files("evanovation_db").joinpath("units")))
+        root = Path(str(files("evdb").joinpath("units")))
     units = _unit_files(root)
     if not units:
         raise HostError(f"evdb release contains no systemd units: {root}")

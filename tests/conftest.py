@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from evanovation_db.config import Paths, load
+from evdb.config import Paths, load
 
 ROOT = Path(__file__).parents[1]
 FIXTURES = ROOT / "tests/fixtures/config"

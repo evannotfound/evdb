@@ -1,7 +1,7 @@
 import pytest
 
-from evanovation_db.errors import LockError
-from evanovation_db.lock import lock
+from evdb.errors import LockError
+from evdb.lock import lock
 
 
 def test_lock_blocks_second_holder(tmp_path):

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from evanovation_db import lock as lock_module
-from evanovation_db.config import (
+from evdb import lock as lock_module
+from evdb.config import (
     DEFAULT_HTTP_END,
     DEFAULT_HTTP_START,
     DEFAULT_RETENTION,
@@ -28,7 +28,7 @@ from evanovation_db.config import (
     write_config,
     write_state,
 )
-from evanovation_db.images import image_major, locked_image, validate_source
+from evdb.images import image_major, locked_image, validate_source
 
 ROOT = Path(__file__).parents[2]
 FIXTURES = ROOT / "tests/fixtures/config"
@@ -175,7 +175,7 @@ def test_round_trip_is_deterministic(tmp_path):
 
 def test_role_add_defaults_are_persisted_explicitly():
     config = load(FIXTURES / "postgres")
-    from evanovation_db.config import HTTP, KV
+    from evdb.config import HTTP, KV
 
     updated = with_role(
         config,

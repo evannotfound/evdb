@@ -4,9 +4,9 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
-from evanovation_db import backup, restore, secrets
-from evanovation_db.config import resolve_state, write_state
-from evanovation_db.engines import dragonfly, kv
+from evdb import backup, restore, secrets
+from evdb.config import resolve_state, write_state
+from evdb.engines import dragonfly, kv
 from tests.fixtures.containers import (
     DRAGONFLY_IMAGE,
     POSTGRES_IMAGE,

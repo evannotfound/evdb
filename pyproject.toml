@@ -3,7 +3,7 @@ requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "evanovation-db"
+name = "evdb"
 dynamic = ["version"]
 description = "Host-local database management for self-hosters"
 readme = "README.md"
@@ -19,16 +19,16 @@ dev = [
 ]
 
 [project.scripts]
-evdb = "evanovation_db.cli:main"
+evdb = "evdb.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-evanovation_db = ["units/*.service", "units/*.timer"]
+evdb = ["units/*.service", "units/*.timer"]
 
 [tool.setuptools.dynamic]
-version = {attr = "evanovation_db.__version__"}
+version = {attr = "evdb.__version__"}
 
 [tool.pytest.ini_options]
 addopts = "-ra --import-mode=importlib"

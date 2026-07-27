@@ -44,8 +44,8 @@ def test_release_builds_one_file_archives_with_checksums_and_units():
         "dist/evdb --version",
         'ASSET="evdb_linux_${{ matrix.arch }}.tar.gz"',
         "release/bin/evdb",
-        "src/evanovation_db/units/*.service",
-        "src/evanovation_db/units/*.timer",
+        "src/evdb/units/*.service",
+        "src/evdb/units/*.timer",
         "tar -czf",
         "sha256sum",
         "tools/check_release.py",
@@ -162,7 +162,7 @@ def test_release_note_failures_select_fallback_without_auto_approval():
     for step in (agent, fallback):
         assert 'gh release create "${GITHUB_REF_NAME}" release/*' in step["run"]
         assert "--verify-tag" in step["run"]
-        assert '--title "evdb ${GITHUB_REF_NAME#v}"' in step["run"]
+        assert '--title "${GITHUB_REF_NAME}"' in step["run"]
 
 
 def test_release_note_job_cannot_access_publication_or_release_assets():

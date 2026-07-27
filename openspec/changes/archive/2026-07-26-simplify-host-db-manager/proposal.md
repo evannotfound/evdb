@@ -37,7 +37,7 @@ The current unshipped manager wraps Docker Compose and database recovery in a co
 
 ## Impact
 
-- Reorganizes `src/evanovation_db` around `cli.py`, `interactive.py`, direct database/Compose/backup/restore/status modules, and concrete engine modules.
+- Reorganizes `src/evdb` around `cli.py`, `interactive.py`, direct database/Compose/backup/restore/status modules, and concrete engine modules.
 - Removes `controller.py`, `remote.py`, `planning.py`, `deployment.py`, `lifecycle.py`, `details.py`, the split restore promotion workflow, and the Ansible tree after their retained behavior is moved.
 - Replaces both installed command entry points with one host-local `evdb` command and changes configuration, generated files, state, service units, and documentation paths.
 - Preserves Docker Compose, Docker, Traefik, Restic, rclone, systemd, engine-native backup tools, and disposable integration testing.

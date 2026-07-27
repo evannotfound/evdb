@@ -2,10 +2,10 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime
 
-from evanovation_db import compose, secrets, status
-from evanovation_db.config import resolve_state, write_state
-from evanovation_db.errors import CommandError
-from evanovation_db.run import Result
+from evdb import compose, secrets, status
+from evdb.config import resolve_state, write_state
+from evdb.errors import CommandError
+from evdb.run import Result
 
 DIGEST = "sha256:" + "a" * 64
 

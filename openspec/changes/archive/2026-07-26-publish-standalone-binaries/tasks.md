@@ -1,6 +1,6 @@
 ## 1. Version and Binary Foundation
 
-- [x] 1.1 Make `evanovation_db.__version__` the single application version source and derive Python
+- [x] 1.1 Make `evdb.__version__` the single application version source and derive Python
   package metadata from it
 - [x] 1.2 Add a package `__main__` entry point and global `evdb --version` output
 - [x] 1.3 Add PyInstaller to the `uv` development dependencies and lock it without making it a runtime

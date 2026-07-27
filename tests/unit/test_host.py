@@ -5,16 +5,16 @@ from pathlib import Path
 
 import pytest
 
-from evanovation_db import backup, compose, host, status
-from evanovation_db.config import (
+from evdb import backup, compose, host, status
+from evdb.config import (
     Paths,
     dump,
     load_state,
     resolve_state,
     write_state,
 )
-from evanovation_db.errors import CommandError, ConfigError, HostError
-from evanovation_db.run import Result
+from evdb.errors import CommandError, ConfigError, HostError
+from evdb.run import Result
 
 DIGEST = "sha256:" + "a" * 64
 

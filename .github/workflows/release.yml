@@ -52,8 +52,8 @@ jobs:
           ASSET="evdb_linux_${{ matrix.arch }}.tar.gz"
           install -d -m 0755 release/bin release/units artifacts
           install -m 0755 dist/evdb release/bin/evdb
-          install -m 0644 src/evanovation_db/units/*.service release/units/
-          install -m 0644 src/evanovation_db/units/*.timer release/units/
+          install -m 0644 src/evdb/units/*.service release/units/
+          install -m 0644 src/evdb/units/*.timer release/units/
           (cd release && tar -czf "../artifacts/${ASSET}" bin/evdb units/*.service units/*.timer)
           tar -tzf "artifacts/${ASSET}"
           (cd artifacts && sha256sum "${ASSET}" > "${ASSET}.sha256")
@@ -177,7 +177,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >-
           gh release create "${GITHUB_REF_NAME}" release/*
-          --verify-tag --notes-file release-notes.md --title "evdb ${GITHUB_REF_NAME#v}"
+          --verify-tag --notes-file release-notes.md --title "${GITHUB_REF_NAME}"
       - name: Publish GitHub release with automatic notes
         if: steps.notes.outcome != 'success'
         env:
@@ -185,4 +185,4 @@ jobs:
         run: |
           echo "::notice::Agent release notes unavailable; using GitHub automatic notes"
           gh release create "${GITHUB_REF_NAME}" release/* \
-            --verify-tag --generate-notes --title "evdb ${GITHUB_REF_NAME#v}"
+            --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"

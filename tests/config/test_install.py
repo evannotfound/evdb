@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from evanovation_db import host
+from evdb import host
 
 ROOT = Path(__file__).parents[2]
 INSTALLER = ROOT / "install.sh"

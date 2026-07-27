@@ -50,7 +50,7 @@ integration-collect:
 	$(PYTEST) --collect-only -q tests/integration
 
 binary:
-	$(PYINSTALLER) --clean --noconfirm --onefile --name evdb --paths src src/evanovation_db/__main__.py
+	$(PYINSTALLER) --clean --noconfirm --onefile --name evdb --paths src src/evdb/__main__.py
 
 require-db:
 	@test -n "$(DB)" || (printf '%s\n' 'DB is required: DB=example-prod-01/postgres' >&2; exit 2)
