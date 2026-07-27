@@ -8,14 +8,21 @@ DESTDIR=${DESTDIR:-}
 ROOT="${DESTDIR}/opt/evdb"
 VERSIONS="${ROOT}/versions"
 STABLE="${DESTDIR}/usr/local/bin/evdb"
+CONFIG="${DESTDIR}/etc/evdb/host.yml"
 VERSION=${1:-}
 MAX_RELEASE_SIZE=${EVDB_MAX_RELEASE_SIZE:-268435456}
 STAGE=
 TARGET=
 CURRENT_TEMP=
+PREVIOUS_TEMP=
 STABLE_TEMP=
+UPGRADE=0
+OLD_CURRENT=
+OLD_PREVIOUS=
+PREVIOUS_EXISTS=0
 TARGET_CREATED=0
 CURRENT_CREATED=0
+PREVIOUS_CREATED=0
 STABLE_CREATED=0
 COMMITTED=0
 LOCK=
@@ -28,11 +35,20 @@ fail() {
 
 cleanup() {
     if [ "${COMMITTED}" -eq 0 ]; then
+        if [ "${PREVIOUS_CREATED}" -eq 1 ]; then
+            rm -f "${ROOT}/previous"
+            if [ "${PREVIOUS_EXISTS}" -eq 1 ]; then
+                ln -s "${OLD_PREVIOUS}" "${ROOT}/previous"
+            fi
+        fi
         if [ "${STABLE_CREATED}" -eq 1 ]; then
             rm -f "${STABLE}"
         fi
         if [ "${CURRENT_CREATED}" -eq 1 ]; then
             rm -f "${ROOT}/current"
+            if [ "${UPGRADE}" -eq 1 ]; then
+                ln -s "${OLD_CURRENT}" "${ROOT}/current"
+            fi
         fi
         if [ "${TARGET_CREATED}" -eq 1 ]; then
             rm -rf "${TARGET}"
@@ -40,6 +56,9 @@ cleanup() {
     fi
     if [ -n "${CURRENT_TEMP}" ]; then
         rm -f "${CURRENT_TEMP}"
+    fi
+    if [ -n "${PREVIOUS_TEMP}" ]; then
+        rm -f "${PREVIOUS_TEMP}"
     fi
     if [ -n "${STABLE_TEMP}" ]; then
         rm -f "${STABLE_TEMP}"
@@ -90,6 +109,35 @@ download() {
         fail "release download exceeds the size limit"
 }
 
+version_link() {
+    PATHNAME=$1
+    LABEL=$2
+    [ -L "${PATHNAME}" ] || fail "managed ${LABEL} link is invalid: ${PATHNAME}"
+    TARGET_LINK=$(readlink "${PATHNAME}") || fail "managed ${LABEL} link is unreadable: ${PATHNAME}"
+    case "${TARGET_LINK}" in
+        versions/*)
+            SELECTED=${TARGET_LINK#versions/}
+            case "${SELECTED}" in
+                */*) fail "managed ${LABEL} link is invalid: ${PATHNAME}" ;;
+            esac
+            ;;
+        "${VERSIONS}"/*)
+            SELECTED=${TARGET_LINK#"${VERSIONS}/"}
+            case "${SELECTED}" in
+                */*) fail "managed ${LABEL} link is invalid: ${PATHNAME}" ;;
+            esac
+            ;;
+        *) fail "managed ${LABEL} link points outside managed versions: ${PATHNAME}" ;;
+    esac
+    valid_version "${SELECTED}" || fail "managed ${LABEL} link does not select an exact version: ${PATHNAME}"
+    VERSION_DIR="${VERSIONS}/${SELECTED}"
+    [ -d "${VERSION_DIR}" ] && [ ! -L "${VERSION_DIR}" ] || \
+        fail "managed ${LABEL} version directory is invalid: ${VERSION_DIR}"
+    [ -x "${VERSION_DIR}/bin/evdb" ] && [ ! -L "${VERSION_DIR}/bin/evdb" ] || \
+        fail "managed ${LABEL} version has no executable evdb command: ${VERSION_DIR}"
+    printf '%s\n' "${TARGET_LINK}"
+}
+
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
@@ -121,7 +169,7 @@ if [ -L "${VERSIONS}" ] || { [ -e "${VERSIONS}" ] && [ ! -d "${VERSIONS}" ]; }; 
     fail "managed versions root is not a safe directory: ${VERSIONS}"
 fi
 
-for command in chmod curl dirname grep install ln mkdir mktemp mv rm rmdir sha256sum sort tar uniq wc; do
+for command in chmod curl dirname grep install ln mkdir mktemp mv readlink rm rmdir sha256sum sort tar uniq wc; do
     command -v "${command}" >/dev/null 2>&1 || fail "required command is missing: ${command}"
 done
 
@@ -137,9 +185,19 @@ fi
 LOCK_CREATED=1
 
 if [ -e "${ROOT}/current" ] || [ -L "${ROOT}/current" ]; then
-    fail "evdb is already installed; use evdb host update VERSION"
-fi
-if [ -e "${STABLE}" ] || [ -L "${STABLE}" ]; then
+    if [ -e "${CONFIG}" ] || [ -L "${CONFIG}" ]; then
+        fail "evdb is already configured; use evdb host update VERSION after fixing host config"
+    fi
+    UPGRADE=1
+    OLD_CURRENT=$(version_link "${ROOT}/current" "current")
+    if [ -e "${ROOT}/previous" ] || [ -L "${ROOT}/previous" ]; then
+        OLD_PREVIOUS=$(version_link "${ROOT}/previous" "previous")
+        PREVIOUS_EXISTS=1
+    fi
+    [ -L "${STABLE}" ] || fail "stable command path is invalid: ${STABLE}"
+    [ "$(readlink "${STABLE}")" = "${ROOT}/current/bin/evdb" ] || \
+        fail "stable command path is invalid: ${STABLE}"
+elif [ -e "${STABLE}" ] || [ -L "${STABLE}" ]; then
     fail "stable command path already exists: ${STABLE}"
 fi
 
@@ -245,22 +303,40 @@ TARGET="${VERSIONS}/${RESOLVED}"
 [ ! -e "${TARGET}" ] && [ ! -L "${TARGET}" ] || fail "version is already installed: ${RESOLVED}"
 install -d -m 0755 "$(dirname "${STABLE}")"
 CURRENT_TEMP="${ROOT}/.current.new.$$"
+PREVIOUS_TEMP="${ROOT}/.previous.new.$$"
 STABLE_TEMP="${STABLE}.new.$$"
 [ ! -e "${CURRENT_TEMP}" ] && [ ! -L "${CURRENT_TEMP}" ] || \
     fail "temporary current link already exists"
+[ ! -e "${PREVIOUS_TEMP}" ] && [ ! -L "${PREVIOUS_TEMP}" ] || \
+    fail "temporary previous link already exists"
 [ ! -e "${STABLE_TEMP}" ] && [ ! -L "${STABLE_TEMP}" ] || \
     fail "temporary stable link already exists"
 ln -s "versions/${RESOLVED}" "${CURRENT_TEMP}"
-ln -s "${ROOT}/current/bin/evdb" "${STABLE_TEMP}"
 TARGET_CREATED=1
 mv "${RELEASE}" "${TARGET}"
+if [ "${UPGRADE}" -eq 1 ]; then
+    ln -s "${OLD_CURRENT}" "${PREVIOUS_TEMP}"
+    PREVIOUS_CREATED=1
+    rm -f "${ROOT}/previous"
+    mv "${PREVIOUS_TEMP}" "${ROOT}/previous"
+    PREVIOUS_TEMP=
+else
+    ln -s "${ROOT}/current/bin/evdb" "${STABLE_TEMP}"
+fi
 CURRENT_CREATED=1
+rm -f "${ROOT}/current"
 mv "${CURRENT_TEMP}" "${ROOT}/current"
 CURRENT_TEMP=
-STABLE_CREATED=1
-mv "${STABLE_TEMP}" "${STABLE}"
-STABLE_TEMP=
+if [ "${UPGRADE}" -eq 0 ]; then
+    STABLE_CREATED=1
+    mv "${STABLE_TEMP}" "${STABLE}"
+    STABLE_TEMP=
+fi
 COMMITTED=1
 
-printf '%s\n' "Installed evdb ${RESOLVED}."
+if [ "${UPGRADE}" -eq 1 ]; then
+    printf '%s\n' "Upgraded evdb to ${RESOLVED}."
+else
+    printf '%s\n' "Installed evdb ${RESOLVED}."
+fi
 printf '%s\n' "Next: sudo evdb host setup"

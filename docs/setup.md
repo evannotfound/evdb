@@ -41,6 +41,9 @@ unexpected archive layout, and confirms that `evdb --version` matches the select
 the complete version before changing either managed link. Release assets use the stable names
 `evdb_linux_arm64.tar.gz` and `evdb_linux_amd64.tar.gz`.
 
+Rerunning the installer can replace an existing tool version only before `/etc/evdb/host.yml` exists.
+Once host configuration exists, repair any invalid config and use `sudo evdb host update VERSION`.
+
 ## Guided and explicit setup
 
 `sudo evdb host setup` opens a guided session when the initial configuration is absent. For explicit

@@ -172,9 +172,16 @@ it under `/opt/evdb/versions/<version>`, and establish `/opt/evdb/current` and
 - **WHEN** the installer receives exact version `1.2.3`
 - **THEN** it downloads only release tag `v1.2.3` and rejects an archive reporting any other version
 
-#### Scenario: Managed installation already exists
-- **WHEN** the installer finds an existing managed current version
-- **THEN** it leaves all versions and links unchanged and directs the operator to `evdb host update`
+#### Scenario: Unconfigured managed installation already exists
+- **WHEN** the installer finds an existing managed current version but no host configuration
+- **THEN** it verifies the existing managed links, stages the requested release, switches the active
+  tool version, records the prior active version as previous, and directs the operator to
+  `evdb host setup`
+
+#### Scenario: Configured managed installation already exists
+- **WHEN** the installer finds an existing managed current version and any host configuration entry
+- **THEN** it leaves all versions and links unchanged and directs the operator to fix configuration and
+  use `evdb host update`
 
 ### Requirement: Development and production tool boundary
 The repository SHALL continue to use `uv` and its lock file for development, checks, and release

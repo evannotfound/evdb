@@ -34,7 +34,7 @@ def _release(tmp_path, version="1.2.3", reported=None, extra=None):
     checksum.write_text(f"{hashlib.sha256(built.read_bytes()).hexdigest()}  {asset}\n")
 
     for folder in (releases / "latest/download", releases / f"download/v{version}"):
-        folder.mkdir(parents=True)
+        folder.mkdir(parents=True, exist_ok=True)
         shutil.copy2(built, folder / asset)
         shutil.copy2(checksum, folder / checksum.name)
     return releases, asset
@@ -130,18 +130,98 @@ def test_installer_rejects_pinned_version_mismatch_and_unexpected_archive_member
     assert not (destination / "opt/evdb/versions/1.2.3").exists()
 
 
-def test_installer_refuses_existing_managed_installation(tmp_path):
-    releases, _asset = _release(tmp_path)
-    destination, first = _run(tmp_path, releases)
+def test_installer_upgrades_existing_unconfigured_installation(tmp_path):
+    releases, _asset = _release(tmp_path, version="1.0.0")
+    destination, first = _run(tmp_path, releases, "1.0.0")
+    _release(tmp_path, version="1.1.0")
+
+    _destination, second = _run(tmp_path, releases, "1.1.0")
+
+    assert first.returncode == 0
+    assert second.returncode == 0, second.stderr
+    old = destination / "opt/evdb/versions/1.0.0"
+    new = destination / "opt/evdb/versions/1.1.0"
+    assert (destination / "opt/evdb/current").resolve() == new
+    assert (destination / "opt/evdb/previous").resolve() == old
+    assert (destination / "usr/local/bin/evdb").resolve() == new / "bin/evdb"
+    assert "Upgraded evdb to 1.1.0." in second.stdout
+    assert "Next: sudo evdb host setup" in second.stdout
+
+
+def test_installer_refuses_configured_installation_before_downloading(tmp_path):
+    releases, _asset = _release(tmp_path, version="1.0.0")
+    destination, first = _run(tmp_path, releases, "1.0.0")
+    config = destination / "etc/evdb/host.yml"
+    config.parent.mkdir(parents=True)
+    config.write_text("not: valid: yaml")
     current = destination / "opt/evdb/current"
     before = os.readlink(current)
 
-    _destination, second = _run(tmp_path, releases)
+    _destination, second = _run(tmp_path, tmp_path / "missing-releases", "1.1.0")
 
     assert first.returncode == 0
     assert second.returncode != 0
-    assert "use evdb host update VERSION" in second.stderr
+    assert "use evdb host update VERSION after fixing host config" in second.stderr
     assert os.readlink(current) == before
+    assert not (destination / "opt/evdb/versions/1.1.0").exists()
+
+
+def test_installer_refuses_dangling_host_config_symlink(tmp_path):
+    releases, _asset = _release(tmp_path, version="1.0.0")
+    destination, first = _run(tmp_path, releases, "1.0.0")
+    config = destination / "etc/evdb/host.yml"
+    config.parent.mkdir(parents=True)
+    config.symlink_to(destination / "missing-host.yml")
+
+    _destination, second = _run(tmp_path, tmp_path / "missing-releases", "1.1.0")
+
+    assert first.returncode == 0
+    assert second.returncode != 0
+    assert "use evdb host update VERSION after fixing host config" in second.stderr
+
+
+def test_installer_rejects_unsafe_existing_tool_links_before_downloading(tmp_path):
+    releases, _asset = _release(tmp_path, version="1.0.0")
+    destination, first = _run(tmp_path, releases, "1.0.0")
+    current = destination / "opt/evdb/current"
+    current.unlink()
+    current.symlink_to(destination / "outside")
+
+    _destination, second = _run(tmp_path, tmp_path / "missing-releases", "1.1.0")
+
+    assert first.returncode == 0
+    assert second.returncode != 0
+    assert "points outside managed versions" in second.stderr
+    assert not (destination / "opt/evdb/versions/1.1.0").exists()
+
+
+def test_installer_rolls_back_unconfigured_upgrade_when_current_link_fails(tmp_path):
+    releases, _asset = _release(tmp_path, version="1.0.0")
+    destination, first = _run(tmp_path, releases, "1.0.0")
+    _release(tmp_path, version="1.1.0")
+    current = destination / "opt/evdb/current"
+    before = os.readlink(current)
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    real_mv = shutil.which("mv")
+    wrapper = commands / "mv"
+    wrapper.write_text(
+        f'#!/bin/sh\ncase "$2" in */opt/evdb/current) exit 42;; esac\nexec "{real_mv}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+
+    _destination, second = _run(
+        tmp_path,
+        releases,
+        "1.1.0",
+        env_extra={"PATH": f"{commands}:{os.environ['PATH']}"},
+    )
+
+    assert first.returncode == 0
+    assert second.returncode != 0
+    assert os.readlink(current) == before
+    assert not (destination / "opt/evdb/previous").exists()
+    assert not (destination / "opt/evdb/versions/1.1.0").exists()
 
 
 @pytest.mark.parametrize(
