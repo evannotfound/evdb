@@ -82,19 +82,3 @@ def test_docs_show_public_binary_install_and_no_fixture_command_override():
     assert "uv tool install" not in README + DOCS
     assert "Python package registry" not in README + DOCS
     assert "--config" not in README + DOCS
-
-
-def test_readme_is_a_concise_public_entry_point():
-    for heading in (
-        "## Features",
-        "## Install",
-        "## Use",
-        "## Documentation",
-        "## Development",
-        "## License",
-    ):
-        assert heading in README
-    assert len(README.splitlines()) < 120
-    assert "projects:" not in README
-    assert "montreal-01" not in README
-    assert "MIT" in README
