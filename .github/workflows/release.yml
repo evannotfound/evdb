@@ -66,8 +66,75 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  publish:
+  notes:
     needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      available: ${{ steps.result.outputs.available }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node.js for release notes
+        id: node
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Install OpenCode for release notes
+        id: opencode
+        if: steps.node.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: npm install --global opencode-ai@1.18.6
+      - name: Generate release notes
+        id: generate
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          RELEASE_LLM_URL: ${{ secrets.RELEASE_LLM_URL }}
+          RELEASE_LLM_KEY: ${{ secrets.RELEASE_LLM_KEY }}
+          OPENCODE_CONFIG_CONTENT: >-
+            {"provider":{"openai":{"options":{"baseURL":"{env:RELEASE_LLM_URL}","apiKey":"{env:RELEASE_LLM_KEY}"},"models":{"gpt-5.6-sol":{"name":"gpt-5.6-sol","limit":{"context":353000,"output":128000},"variants":{"high":{"reasoningEffort":"high"}}}}}}}
+        run: |
+          test "${{ steps.node.outcome }}" = "success"
+          test "${{ steps.opencode.outcome }}" = "success"
+          test -n "${RELEASE_LLM_URL}"
+          test -n "${RELEASE_LLM_KEY}"
+          python3 tools/release_notes.py input "${GITHUB_REF_NAME}" release-input.md --target "${GITHUB_SHA}"
+          opencode run --pure --command changelog
+          python3 tools/release_notes.py check release-notes.md
+      - name: Upload agent release notes
+        id: upload
+        if: steps.generate.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: agent-release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 1
+      - name: Record release note availability
+        id: result
+        if: always()
+        env:
+          GENERATED: ${{ steps.generate.outcome }}
+          UPLOADED: ${{ steps.upload.outcome }}
+        run: |
+          if test "${GENERATED}" = "success" && test "${UPLOADED}" = "success"; then
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::Agent release notes unavailable; GitHub automatic notes will be used"
+          fi
+
+  publish:
+    needs: [build, notes]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -75,6 +142,9 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           pattern: release-*
@@ -86,9 +156,33 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: release/evdb_linux_*.tar.gz
-      - name: Publish GitHub release
+      - name: Download agent release notes
+        id: notes-download
+        if: needs.notes.outputs.available == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: agent-release-notes
+          path: .
+      - name: Validate agent release notes
+        id: notes
+        if: steps.notes-download.outcome == 'success'
+        continue-on-error: true
+        run: python3 tools/release_notes.py check release-notes.md
+      - name: Verify release tag is unchanged
+        run: test "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" = "${GITHUB_SHA}"
+      - name: Publish GitHub release with agent notes
+        if: steps.notes.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >-
           gh release create "${GITHUB_REF_NAME}" release/*
-          --verify-tag --generate-notes --title "evdb ${GITHUB_REF_NAME#v}"
+          --verify-tag --notes-file release-notes.md --title "evdb ${GITHUB_REF_NAME#v}"
+      - name: Publish GitHub release with automatic notes
+        if: steps.notes.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::notice::Agent release notes unavailable; using GitHub automatic notes"
+          gh release create "${GITHUB_REF_NAME}" release/* \
+            --verify-tag --generate-notes --title "evdb ${GITHUB_REF_NAME#v}"
