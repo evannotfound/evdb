@@ -81,14 +81,14 @@ def test_release_publishes_only_after_both_builds_with_provenance():
     assert "--verify-tag" in steps
 
 
-def test_release_note_agent_uses_full_history_and_exact_ci_dependencies():
+def test_release_notes_use_full_history_and_exact_ci_dependencies():
     notes = _workflow()["jobs"]["notes"]
     checkout = notes["steps"][0]
     node = next(step for step in notes["steps"] if step.get("id") == "node")
     opencode = next(step for step in notes["steps"] if step.get("id") == "opencode")
 
     assert notes["needs"] == "build"
-    assert notes["permissions"] == {"contents": "read"}
+    assert notes["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert checkout == {
         "uses": "actions/checkout@v7",
         "with": {"fetch-depth": "0", "persist-credentials": "false"},
@@ -118,7 +118,7 @@ def test_release_note_provider_uses_environment_interpolation_and_model_limits()
     assert model["variants"] == {"high": {"reasoningEffort": "high"}}
     assert generate["env"]["RELEASE_LLM_URL"] == "${{ secrets.RELEASE_LLM_URL }}"
     assert generate["env"]["RELEASE_LLM_KEY"] == "${{ secrets.RELEASE_LLM_KEY }}"
-    assert "GH_TOKEN" not in generate["env"]
+    assert generate["env"]["GH_TOKEN"] == "${{ github.token }}"
     assert "https://ai.evanovation.com" not in WORKFLOW.read_text()
 
 
@@ -131,7 +131,9 @@ def test_release_note_failures_select_fallback_without_auto_approval():
     result = next(step for step in notes["steps"] if step.get("id") == "result")
     download = next(step for step in publish["steps"] if step.get("id") == "notes-download")
     validate = next(step for step in publish["steps"] if step.get("id") == "notes")
-    agent = next(step for step in publish["steps"] if "with agent notes" in step.get("name", ""))
+    opencode_notes = next(
+        step for step in publish["steps"] if "with OpenCode notes" in step.get("name", "")
+    )
     fallback = next(
         step for step in publish["steps"] if "with automatic notes" in step.get("name", "")
     )
@@ -140,14 +142,13 @@ def test_release_note_failures_select_fallback_without_auto_approval():
     assert generate["timeout-minutes"] == "10"
     assert 'test -n "${RELEASE_LLM_URL}"' in generate["run"]
     assert 'test -n "${RELEASE_LLM_KEY}"' in generate["run"]
-    assert "tools/release_notes.py input" in generate["run"]
-    assert '--target "${GITHUB_SHA}"' in generate["run"]
-    assert "opencode run --pure --command changelog" in generate["run"]
-    assert "tools/release_notes.py check" in generate["run"]
+    assert "release-input.md" not in generate["run"]
+    assert 'opencode run --pure --command changelog "${GITHUB_REF_NAME}"' in generate["run"]
+    assert "python3 tools/release_notes.py release-notes.md" in generate["run"]
     assert "--auto" not in generate["run"]
     assert upload["if"] == "steps.generate.outcome == 'success'"
     assert upload["continue-on-error"] == "true"
-    assert upload["with"]["name"] == "agent-release-notes"
+    assert upload["with"]["name"] == "opencode-release-notes"
     assert result["if"] == "always()"
     assert "available=false" in result["run"]
     assert download["if"] == "needs.notes.outputs.available == 'true'"
@@ -160,22 +161,23 @@ def test_release_note_failures_select_fallback_without_auto_approval():
     assert "refs/tags/${GITHUB_REF_NAME}^{commit}" in verify_tag["run"]
     assert "${GITHUB_SHA}" in verify_tag["run"]
     assert "continue-on-error" not in verify_tag
-    assert agent["if"] == "steps.notes.outcome == 'success'"
+    assert opencode_notes["if"] == "steps.notes.outcome == 'success'"
     assert fallback["if"] == "steps.notes.outcome != 'success'"
-    assert "--notes-file release-notes.md" in agent["run"]
+    assert "--notes-file release-notes.md" in opencode_notes["run"]
     assert "--generate-notes" in fallback["run"]
-    for step in (agent, fallback):
+    for step in (opencode_notes, fallback):
         assert 'gh release create "${GITHUB_REF_NAME}" release/*' in step["run"]
         assert "--verify-tag" in step["run"]
         assert '--title "${GITHUB_REF_NAME}"' in step["run"]
 
 
-def test_release_note_job_cannot_access_publication_or_release_assets():
+def test_release_note_job_has_read_only_github_access_and_no_release_assets():
     jobs = _workflow()["jobs"]
     notes_text = "\n".join(str(step) for step in jobs["notes"]["steps"])
     publish_text = "\n".join(str(step) for step in jobs["publish"]["steps"])
 
-    assert "GH_TOKEN" not in notes_text
+    assert "${{ github.token }}" in notes_text
+    assert "${{ secrets.GITHUB_TOKEN }}" not in notes_text
     assert "release/*" not in notes_text
     assert "actions/download-artifact" not in notes_text
     assert "RELEASE_LLM_KEY" not in publish_text

@@ -3,7 +3,6 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).parents[2]
-AGENT = ROOT / ".opencode/agents/release-notes.md"
 COMMAND = ROOT / ".opencode/commands/changelog.md"
 
 
@@ -13,85 +12,53 @@ def _markdown(path):
     return yaml.safe_load(frontmatter), body.strip()
 
 
-def test_release_note_agent_has_bounded_model_and_tools():
-    config, body = _markdown(AGENT)
-
-    assert config["mode"] == "primary"
-    assert config["model"] == "openai/gpt-5.6-sol"
-    assert config["variant"] == "high"
-    assert config["steps"] == 40
-    assert config["tools"] == {
-        "webfetch": False,
-        "websearch": False,
-        "task": False,
-        "question": False,
-    }
-    assert "untrusted evidence" in body
-
-
-def test_release_note_agent_permissions_default_deny_and_allow_one_write():
-    config, _ = _markdown(AGENT)
-    permission = config["permission"]
-
-    assert permission["*"] == "deny"
-    assert permission["read"]["*"] == "allow"
-    assert permission["read"][".secrets/**"] == "deny"
-    assert permission["glob"] == "allow"
-    assert permission["grep"] == "allow"
-    assert permission["edit"] == {"*": "deny", "release-notes.md": "allow"}
-    assert permission["external_directory"] == "deny"
-    for name in ("webfetch", "websearch", "task", "question", "skill", "todowrite"):
-        assert permission[name] == "deny"
-
-
-def test_release_note_agent_denies_shell_access():
-    config, _ = _markdown(AGENT)
-
-    assert config["permission"]["bash"] == "deny"
-
-
-def test_changelog_command_uses_agent_range_and_grounding_rules():
+def test_changelog_command_uses_model_and_autonomous_repository_inspection():
     config, body = _markdown(COMMAND)
 
     assert config == {
         "description": "Generate repository-grounded notes for an evdb release",
-        "agent": "release-notes",
-        "subtask": False,
+        "model": "openai/gpt-5.6-sol",
+        "variant": "high",
     }
     for phrase in (
-        "release-input.md",
-        "authoritative candidate commit set",
-        "untrusted evidence",
-        "# Range patch` evidence",
-        "Do not run shell or Git",
+        "$ARGUMENTS",
+        "GitHub release metadata",
+        "latest non-draft release",
+        "Work autonomously",
+        "`gh`, Git commands",
+        "real diffs",
         "release-notes.md",
         "Write no other file",
         "do not publish",
     ):
         assert phrase in body
+    assert "release-input.md" not in body
+    assert "Do not run shell or Git" not in body
 
 
-def test_changelog_command_sets_plain_language_limits():
+def test_changelog_command_uses_clear_sections_and_change_driven_length():
     _, body = _markdown(COMMAND)
 
     for phrase in (
+        "`## Features`",
+        "`## Improvements`",
+        "`## Bugfixes`",
+        "`## Breaking changes`",
+        "Include only sections with at least one entry",
+        "each distinct notable change",
+        "Let the number of bullets reflect",
+        "There is no fixed bullet or word limit",
         "plain, direct Markdown",
-        "one natural sentence",
-        "no more than five bullets",
-        "150 words in the whole document",
-        "familiar words",
-        "natural sentence structure",
-        "complete thoughts",
-        "Do not force brevity",
-        "choppy, vague, or harder to understand",
-        "unnecessary jargon",
+        "No notable changes.",
     ):
         assert phrase in body
+    assert "no more than five bullets" not in body
+    assert "150 words" not in body
 
 
 def test_generated_release_note_files_are_ignored():
     ignored = (ROOT / ".gitignore").read_text().splitlines()
 
-    assert "/release-input.md" in ignored
+    assert "/release-input.md" not in ignored
     assert "/release-notes.md" in ignored
     assert not any(line.startswith(".opencode") for line in ignored)

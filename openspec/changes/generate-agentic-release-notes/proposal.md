@@ -1,24 +1,22 @@
 ## Why
 
 GitHub's automatic release notes expose raw pull request and commit metadata but do not reliably
-explain operator-visible changes, safety implications, or upgrade requirements. The release workflow
-should use the same repository-aware OpenCode agent pattern proven by OpenCode itself so each evdb
-release has concise notes grounded in the actual implementation.
+explain operator-visible changes, safety implications, or required action. The release workflow should
+let OpenCode investigate each release directly so its judgment is informed by the repository rather
+than constrained by a precomputed summary.
 
 ## What Changes
 
-- Generate release notes with a non-interactive OpenCode agent using the custom OpenAI-compatible
-  endpoint and `openai/gpt-5.6-sol` at high reasoning effort.
-- Give the agent a deterministic semantic-version commit range with hardened patches and allow it to
-  inspect relevant repository files before writing user-facing Markdown.
-- Restrict the release-note agent to repository reads and writing one generated notes file; deny all
-  shell commands, unrelated edits, external paths, and network tools.
-- Keep endpoint credentials in GitHub Actions secrets and inject release-only provider configuration
-  through environment interpolation without committing resolved credentials or changing developers'
-  normal OpenCode configuration.
-- Publish the generated file as the GitHub Release body when generation succeeds, and preserve
-  GitHub-generated notes as a non-blocking fallback when OpenCode, the endpoint, or output validation
-  fails.
+- Run a non-interactive OpenCode command using the custom OpenAI-compatible endpoint and
+  `openai/gpt-5.6-sol` at high reasoning effort.
+- Pass only the target release tag and let OpenCode use GitHub release metadata, Git, shell commands,
+  and repository tools to discover and inspect the relevant changes autonomously.
+- Configure the model on the command and use OpenCode's built-in agent instead of maintaining a
+  dedicated release-note agent or deterministic input file.
+- Write release notes under clear change categories, with the number of bullets determined by the
+  number of notable user-visible changes.
+- Publish validated OpenCode notes when generation succeeds and preserve GitHub-generated notes as a
+  non-blocking fallback when generation or validation fails.
 
 ## Capabilities
 
@@ -28,15 +26,15 @@ None.
 
 ### Modified Capabilities
 
-- `release-distribution`: Require repository-aware agentic release-note generation, constrained tool
-  access, secret-safe provider configuration, output validation, and deterministic fallback during
-  tagged release publication.
+- `release-distribution`: Require autonomous repository-aware release-note generation, secret-safe
+  provider configuration, output validation, and deterministic publication fallback.
 
 ## Impact
 
 - Changes `.github/workflows/release.yml` and its configuration tests.
-- Adds a release-note OpenCode agent and command under `.opencode/` plus a deterministic changelog
-  input helper under `tools/`.
+- Adds one autonomous command under `.opencode/` without a project-specific agent.
+- Keeps a small release-note output validator under `tools/` but removes generated release evidence.
 - Adds an exact OpenCode CLI release dependency to release CI only; installed evdb binaries and
   managed hosts remain independent of OpenCode, Node.js, Python, and model credentials.
-- Requires GitHub Actions secrets for the OpenAI-compatible base URL and API key.
+- Requires the existing model endpoint secrets and an ephemeral read-only GitHub token in the notes
+  job.

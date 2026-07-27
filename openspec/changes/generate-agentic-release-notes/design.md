@@ -1,134 +1,115 @@
 ## Context
 
-The tagged release workflow currently checks the source version, builds and validates ARM64 and
-AMD64 archives, attests them, and publishes a GitHub Release with `--generate-notes`. Those notes are
-derived from GitHub metadata and do not inspect the implementation, so they often emphasize commit
-mechanics instead of operator-visible behavior, compatibility, and data-safety effects.
+The tagged release workflow checks the source version, builds and validates ARM64 and AMD64 archives,
+attests them, and publishes a GitHub Release. GitHub-generated notes do not inspect implementation
+details, so they often emphasize commit mechanics instead of operator-visible behavior.
 
-OpenCode's own repository solves the same problem by giving a non-interactive OpenCode agent a
-deterministic release range, requiring it to inspect real diffs, and using the resulting Markdown as
-the release body. The available OpenAI-compatible endpoint supports tool calling and exposes
-`gpt-5.6-sol` with a 353,000-token context window and a `high` reasoning variant. Release automation
-must not expose its API key, broaden repository mutation, or add OpenCode to installed evdb hosts.
+The first release-note implementation generated a deterministic evidence file and used a dedicated
+OpenCode agent that could not run Git or shell commands. That boundary also prevented the model from
+following useful context, selecting investigative commands, or adapting its analysis to the release.
+The desired workflow is intentionally more autonomous: give OpenCode the target tag and normal tools,
+then let it decide how to inspect the repository.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Produce release notes grounded in the exact tagged source and actual diffs, using one natural opening
-  sentence, at most five bullets and 150 words, and plain language that stays clear rather than terse.
-- Run a real OpenCode agent that can investigate candidate commits before deciding what is notable.
-- Constrain the agent to repository reads, deterministic patch evidence, and one generated output.
-- Keep provider credentials out of source, process arguments, logs, generated notes, and artifacts.
+- Produce release notes grounded in actual diffs and relevant repository context.
+- Let OpenCode discover the previous non-draft release and investigate commits, pull requests, source,
+  configuration, and documentation with normal tools.
+- Use clear feature, improvement, bugfix, and breaking-change sections whose length reflects the
+  release rather than a fixed editorial limit.
+- Keep provider credentials out of source and retain a read-only boundary around GitHub access.
 - Fall back to GitHub automatic notes without blocking an otherwise valid release.
-- Cover the first release, which has no prior semantic-version tag.
+- Cover an initial release with no previous published release.
 
 **Non-Goals:**
 
-- Let the agent create tags, releases, commits, pull requests, or release assets.
-- Let the agent modify source, invoke builds or tests, access external directories, or use web tools.
+- Let the notes job publish releases or access built release assets.
 - Install OpenCode, Node.js, Python, or model credentials on managed database hosts.
-- Replace artifact checksums, attestations, version gates, or human review of release output.
+- Replace artifact checksums, attestations, version gates, or output validation.
 - Generate changelogs for untagged development builds.
 
 ## Decisions
 
-### Run OpenCode as the release-note editor
+### Run one autonomous OpenCode command
 
-Release CI will install an exact tested OpenCode CLI version, initially `opencode-ai@1.18.6`, and run
-a project command with the dedicated release-note agent. The agent will use
-`openai/gpt-5.6-sol` with the `high` variant and will write `release-notes.md`.
+Release CI installs the exact tested OpenCode CLI version and invokes `.opencode/commands/changelog.md`
+with the target tag as its argument. The command selects `openai/gpt-5.6-sol` with the `high` variant
+directly, so no project-specific release-note agent is needed. OpenCode uses its built-in default agent
+and may run `gh`, Git, shell commands, searches, and repository reads as needed.
 
-This is preferred over one direct Responses API call because OpenCode can use repository tools to
-verify commit messages against source changes. A direct completion would require sending a bounded
-preselected patch and could miss effects outside that selection. GitHub automatic notes remain the
-fallback rather than the primary editor.
+The command identifies the latest previous non-draft GitHub release, inspects the range through the
+target tag, and follows relevant implementation context before writing `release-notes.md`. Commit and
+pull request text provide context, but retained claims must be supported by the actual changes. For an
+initial release, the command summarizes the usable product instead of enumerating setup commits.
 
-### Separate deterministic range selection from agent judgment
+### Categorize notes by user-visible effect
 
-A standard-library development tool will validate the release tag, find the nearest prior reachable
-semantic-version tag, verify it still resolves to the immutable workflow event commit, and write a
-structured input containing the exact range, candidate commits, changed paths, and one cumulative
-range patch. It invokes hardened Git forms with subprocess argument arrays rather than a shell. For
-the first release it will include all commit metadata through the tagged commit and diff the empty
-tree to that commit, avoiding repeated historical churn. Release CI will fetch full history before
-running this tool.
+The output uses `Features`, `Improvements`, `Bugfixes`, and `Breaking changes` in that order and omits
+empty sections. Each distinct notable change receives one bullet. Commits that implement one feature
+are combined, while unrelated user-visible effects are separated even when they share a commit. There
+is no fixed bullet or word limit. A release with no notable user-visible changes contains exactly
+`No notable changes.` instead of empty categories.
 
-The agent command will treat this input as the authoritative candidate set and inspect the cumulative
-range patch for every retained claim. It cannot invoke Git or any shell, rebuild the range, or infer entries
-from unrelated history. It will omit internal-only work and produce only user-facing Markdown. This
-follows OpenCode's raw-input-plus-editor pattern while keeping range selection and diff collection
-deterministic and unit-testable.
+Required operator action belongs in the relevant bullet rather than a vague upgrade section. A short
+opening summary is optional when the release has a clear theme.
 
-### Use a dedicated least-privilege agent
+### Give GitHub read access without publication authority
 
-The release-note agent will permit repository read, glob, and grep operations. Edit permission will
-deny all paths except `release-notes.md`. All Bash access, external-directory access, web tools,
-questions, task delegation, and unrelated writes will be denied, and non-interactive execution will
-use `--pure` and will not use `--auto` or another permission bypass.
+The notes job keeps `contents: read` and `pull-requests: read`, checks out full history without
+persisted credentials, and passes its ephemeral job token as `GH_TOKEN`. OpenCode can therefore
+inspect releases and pull requests with `gh`, but the token cannot publish or modify repository
+contents. The notes job receives no release assets, OIDC permission, attestation permission, or
+write-scoped publication token.
 
-Repository files, commit messages, and patches will be identified as untrusted evidence rather than
-instructions. Generated input and output paths will be ignored by Git. The agent step will not receive
-`GITHUB_TOKEN`, so even a model or prompt failure cannot publish or mutate GitHub state.
-
-The alternative was to run the default build agent with broad permissions, as a trusted maintainer
-might do interactively. It was rejected because CI processes contributor-authored repository content
-and needs a much narrower authority boundary.
+Normal shell access intentionally broadens the trust boundary compared with the dedicated-agent
+design. Shell commands run in the OpenCode process environment and can inspect the model credential;
+this is an accepted consequence of unrestricted command access. The job remains disposable, external
+plugins are disabled with `--pure`, output containing an exact credential value is rejected, only
+`release-notes.md` is uploaded, and publication happens later in a separate write-scoped job.
 
 ### Inject provider configuration only for the release process
 
-The workflow will pass `RELEASE_LLM_URL` and `RELEASE_LLM_KEY` from GitHub Actions secrets. A
-release-scoped `OPENCODE_CONFIG_CONTENT` value will configure the built-in OpenAI provider with
-`baseURL: "{env:RELEASE_LLM_URL}"`, `apiKey: "{env:RELEASE_LLM_KEY}"`, the `gpt-5.6-sol` model
-limits, and its `high` reasoning variant.
+The workflow passes `RELEASE_LLM_URL` and `RELEASE_LLM_KEY` from GitHub Actions secrets. A
+release-scoped `OPENCODE_CONFIG_CONTENT` configures the built-in OpenAI provider with environment
+interpolation, the `gpt-5.6-sol` model limits, and its `high` reasoning variant. Resolved provider
+values are not committed or passed in command arguments.
 
-No resolved URL or key will be written to the worktree or OpenCode auth storage. Keeping provider
-configuration in the release environment avoids changing normal local OpenCode sessions or requiring
-the CI key-file pattern used on the operator's workstation.
+### Validate output and preserve publication fallback
 
-### Validate output and preserve deterministic publication
+After OpenCode exits, a small helper requires `release-notes.md` to be a regular, non-empty UTF-8 file
+within a conservative size limit. The notes job uploads valid output, and the publish job downloads and
+validates it again. Successful validation selects `gh release create --notes-file`; any setup,
+generation, transfer, or validation failure selects `--generate-notes` instead.
 
-After OpenCode exits, the helper will require a regular UTF-8 Markdown file with non-whitespace
-content and a conservative maximum size. A separate read-only job with no persisted checkout token,
-OIDC permission, release assets, or publication token will run OpenCode with external plugins disabled
-and upload validated notes. The publish job will revalidate a downloaded notes artifact. Successful
-validation makes `gh release create` use `--notes-file`; any installation, configuration, provider,
-generation, upload, download, or validation failure selects `--generate-notes` instead.
-
-Artifact assembly, attestation, and GitHub Release publication remain separate from the agent. Both
-publication branches use the same verified tag, title, installer, archives, checksums, and
-attestations. Immediately before publication, a mandatory full-history check verifies that the tag
-still resolves to the immutable workflow event commit; mismatch or cancellation blocks publication
-rather than selecting the notes fallback. The release job logs which note source it selected without
-printing model credentials.
+Artifact assembly, attestation, and release publication remain separate from note generation. Both
+publication paths use the same verified tag, title, installer, archives, checksums, and attestations.
+Immediately before publication, the workflow verifies that the tag still resolves to the immutable
+workflow event commit.
 
 ## Risks / Trade-offs
 
-- [Repository text attempts prompt injection] -> Mark all source evidence as untrusted, restrict tools
-  independently of the prompt, disable permission auto-approval, and withhold GitHub credentials.
-- [Git inspection invokes repository-defined helpers] -> Collect patches before the model runs using
-  subprocess argument arrays, `--no-ext-diff`, and `--no-textconv`; deny all agent shell access.
-- [The model omits or misstates a change] -> Supply exact candidate commits, require actual diff
-  inspection, prohibit unsupported claims, retain human review, and keep notes informational rather
-  than part of the artifact trust chain.
-- [Endpoint, model, or OpenCode is unavailable] -> Validate output and publish GitHub automatic notes
-  without blocking checked and attested binaries.
-- [Pinned OpenCode becomes stale] -> Keep the exact version visible in the workflow and update it only
-  after local command and permission tests pass.
-- [Full repository inspection adds release latency] -> Run one agent only after deterministic checks;
-  accept the bounded latency because releases are infrequent and the endpoint is unmetered.
+- **Autonomous commands inspect untrusted repository content.** The notes job is disposable and has
+  read-only GitHub authority, but normal shell access is an intentionally broader trust decision.
+- **The model selects the wrong range or misstates a change.** The prompt requires published-release
+  discovery and actual diff inspection; invalid or failed output falls back to GitHub notes.
+- **The endpoint, GitHub API, model, or OpenCode is unavailable.** Generation remains non-blocking and
+  the release uses GitHub automatic notes with unchanged verified assets.
+- **A pinned OpenCode version becomes stale.** Its exact version remains visible in the workflow and is
+  updated only with corresponding command and workflow tests.
+- **Repository investigation adds latency.** Releases are infrequent, and the notes job has a bounded
+  timeout.
 
 ## Migration Plan
 
-1. Add the deterministic input/validation tool, dedicated agent, and changelog command with local
-   fixture tests.
-2. Configure the repository's `RELEASE_LLM_URL` and `RELEASE_LLM_KEY` Actions secrets.
-3. Update and test the release workflow, including success and forced-fallback configurations.
-4. Generate and review `v0.1.0` notes locally against the custom endpoint before pushing the tag.
-5. Roll back by removing the OpenCode generation step and publishing with the existing
-   `--generate-notes`; no release artifacts, installed hosts, or persistent state require migration.
+1. Replace the deterministic command and dedicated agent with an autonomous command.
+2. Remove generated release evidence while retaining output validation.
+3. Give the notes job read-only GitHub metadata access and pass the target tag to OpenCode.
+4. Update tests and exercise generated-note and fallback publication paths.
+5. Roll back by publishing with `--generate-notes`; release artifacts and installed hosts require no
+   migration.
 
 ## Open Questions
 
-None. The endpoint, model ID, context limits, high reasoning variant, tool-call support, and
-fallback policy have been confirmed.
+None.
