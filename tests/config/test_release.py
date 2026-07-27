@@ -25,6 +25,11 @@ def test_release_checks_tag_and_repository_before_native_builds():
     check_steps = "\n".join(str(step) for step in jobs["check"]["steps"])
 
     assert jobs["check"]["runs-on"] == "ubuntu-22.04"
+    for name in ("check", "build"):
+        assert jobs[name]["steps"][0] == {
+            "uses": "actions/checkout@v7",
+            "with": {"fetch-depth": "0"},
+        }
     assert "uv sync --locked" in check_steps
     assert "uv run evdb --version" in check_steps
     assert "GITHUB_REF_NAME" in check_steps

@@ -220,3 +220,6 @@ __marimo__/
 # Generated release notes
 /release-input.md
 /release-notes.md
+
+# Generated package version
+/src/evdb/_version.py

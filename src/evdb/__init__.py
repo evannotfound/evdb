@@ -1,3 +1,3 @@
 """Host-local database management."""
 
-__version__ = "0.1.1"
+from ._version import __version__ as __version__

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=75", "setuptools-scm>=9.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -27,8 +27,8 @@ where = ["src"]
 [tool.setuptools.package-data]
 evdb = ["units/*.service", "units/*.timer"]
 
-[tool.setuptools.dynamic]
-version = {attr = "evdb.__version__"}
+[tool.setuptools_scm]
+version_file = "src/evdb/_version.py"
 
 [tool.pytest.ini_options]
 addopts = "-ra --import-mode=importlib"
