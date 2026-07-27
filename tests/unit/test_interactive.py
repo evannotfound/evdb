@@ -77,7 +77,7 @@ def test_invalid_choice_reprompts_and_eof_exits(config):
 def test_settings_reprompt_invalid_value_and_save_reset(tmp_path):
     root = Path(__file__).parents[2]
     config = load(
-        root / "tests/fixtures/config/kv",
+        root / "tests/fixtures/config/kv/host.yml",
         paths=Paths(tmp_path / "etc", tmp_path / "state", tmp_path / "opt"),
     )
     target = config.select("app-dev-01/kv")
@@ -114,7 +114,7 @@ def test_database_navigation_can_repeat_without_recursion(config):
 def test_dragonfly_settings_are_context_aware_and_save_once(tmp_path):
     root = Path(__file__).parents[2]
     config = load(
-        root / "tests/fixtures/config/kv",
+        root / "tests/fixtures/config/kv/host.yml",
         paths=Paths(tmp_path / "etc", tmp_path / "state", tmp_path / "opt"),
     )
     target = config.select("app-dev-01/kv")
