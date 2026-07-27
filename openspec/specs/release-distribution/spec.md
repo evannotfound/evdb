@@ -55,6 +55,106 @@ machine-owned tool state, and runtime status SHALL use the same exact semantic v
 - **WHEN** the operator runs `evdb --version`
 - **THEN** the command prints the exact version represented by the active release and exits successfully
 
+### Requirement: Autonomous repository-grounded release notes
+For each semantic-version release, the workflow SHALL attempt to generate the GitHub Release body with
+a non-interactive OpenCode command that receives the exact target tag. OpenCode SHALL identify the
+latest previous non-draft GitHub release, inspect actual changes through the target, use repository
+context as needed, describe user-visible behavior and required operator action, and omit internal-only
+work. The notes SHALL use clear feature, improvement, bugfix, and breaking-change sections, omit empty
+sections, and let the number of bullets reflect the number of distinct notable changes. If no notable
+user-visible changes remain, the notes SHALL instead contain exactly `No notable changes.`
+
+#### Scenario: OpenCode generates release notes
+- **WHEN** the configured model and repository tools complete successfully for a tagged release
+- **THEN** the workflow publishes the validated OpenCode-written Markdown as that GitHub Release's body
+
+#### Scenario: Initial release has no predecessor
+- **WHEN** GitHub has no previous non-draft release before the target tag
+- **THEN** OpenCode inspects history through the target and summarizes the initial usable product
+
+#### Scenario: Release has no notable user-visible changes
+- **WHEN** inspection finds only internal, test, CI, or documentation changes without user-visible
+  effects
+- **THEN** OpenCode writes `No notable changes.` without empty change sections
+
+### Requirement: Autonomous release investigation
+The changelog command SHALL configure its model directly and run without a dedicated project agent or
+generated evidence file. OpenCode SHALL be able to use GitHub metadata, Git, shell commands, repository
+search, and file reads to investigate the release. The notes job SHALL provide only read-scoped GitHub
+contents and pull-request authority, SHALL NOT receive release assets or publication permissions, and
+SHALL upload only the generated notes file.
+
+#### Scenario: OpenCode needs release context
+- **WHEN** the command needs to determine the release range or understand a user-visible effect
+- **THEN** it selects and runs the investigative commands needed instead of relying on a precomputed
+  commit list or patch
+
+#### Scenario: Notes generation attempts GitHub publication
+- **WHEN** a command attempts to create or modify a GitHub release from the notes job
+- **THEN** the job's read-only GitHub permission prevents publication
+
+### Requirement: Secret-safe model configuration
+Release CI SHALL obtain the OpenAI-compatible base URL and API key from GitHub Actions secrets and
+expose them to OpenCode through environment interpolation. It SHALL NOT place resolved credentials in
+source, command arguments, generated notes, artifacts, or installed evdb files. The notes job's
+ephemeral GitHub token SHALL be limited to read access.
+
+#### Scenario: OpenCode calls the configured model
+- **WHEN** the release workflow invokes `openai/gpt-5.6-sol` through the custom endpoint
+- **THEN** OpenCode resolves the endpoint and API key from the release environment without persisting
+  either value in the repository or release
+
+### Requirement: Release-note fallback
+OpenCode installation, provider access, GitHub inspection, generation, tool use, and output validation
+SHALL be non-blocking after the existing release safety gates pass. If any release-note stage fails or
+no valid notes file exists, the workflow SHALL publish the same checked and attested release artifacts
+with GitHub-generated notes and SHALL identify the selected fallback without exposing credentials.
+
+#### Scenario: Notes generation is unavailable
+- **WHEN** OpenCode cannot produce a valid release-note file
+- **THEN** the workflow publishes the release with GitHub automatic notes and unchanged verified assets
+
+#### Scenario: OpenCode output is invalid
+- **WHEN** the generated notes are missing, empty, non-UTF-8, unsafe as a regular file, or exceed the
+  configured size limit
+- **THEN** validation rejects the file and the workflow uses GitHub automatic notes
+
+#### Scenario: OpenCode output has invalid structure or exposes a credential
+- **WHEN** the generated notes use unsupported or empty change sections, order sections incorrectly,
+  or contain an exact release credential value
+- **THEN** validation rejects the file and the workflow uses GitHub automatic notes
+
+### Requirement: Release-only OpenCode dependency
+OpenCode, Node.js, provider configuration, and model credentials SHALL be release-CI dependencies only.
+Standalone archives, the public installer, installed commands, setup, status, scheduled jobs, and host
+updates SHALL remain operable without those dependencies.
+
+#### Scenario: Managed host installs OpenCode-authored release notes
+- **WHEN** an operator installs a release whose notes were generated by OpenCode
+- **THEN** installation and all host-local evdb operations require no OpenCode executable, Node.js, or
+  model credential
+
+### Requirement: Tag-derived application version
+The build system SHALL derive the evdb application and package version from Git metadata without a
+manually maintained release-version literal. An exact semantic-version release tag SHALL produce that
+exact release version, and built artifacts SHALL retain the resolved version without requiring Git or
+version-derivation tooling at runtime.
+
+#### Scenario: Exact tag is built
+- **WHEN** release CI builds tag `v1.2.3`
+- **THEN** package metadata, `evdb --version`, runtime status, and the standalone executable use version
+  `1.2.3`
+
+#### Scenario: Untagged development revision is built
+- **WHEN** a developer installs or builds evdb from a revision after the latest release tag
+- **THEN** the package reports an SCM-derived development version without modifying a tracked version
+  source file
+
+#### Scenario: Built artifact runs without repository metadata
+- **WHEN** a wheel, source archive, or standalone executable runs outside its original Git checkout
+- **THEN** it reports the version embedded during its build without invoking Git or a Python package
+  versioning tool
+
 ### Requirement: Public initial installer
 Each release SHALL include an installer that can be fetched anonymously from GitHub Releases. The
 installer SHALL detect the supported architecture, resolve the latest release by default or accept an
