@@ -6,10 +6,11 @@ evdb owns one `evdb-traefik` Compose project and one dedicated external Docker n
 only evdb service that publishes native host ports 5432 and 6379. Postgres, PgBouncer, Redis,
 Dragonfly, and HTTP sidecars use unique project/role service names and network aliases.
 
-Each database contributes a TLS `HostSNI` router for its derived domain. Postgres routes to
-PgBouncer when enabled and otherwise to Postgres. KV routes to its selected Redis-compatible
-engine. One project may have both roles because Compose project names remain distinct:
-`evdb-<project>-postgres` and `evdb-<project>-kv`.
+Each database contributes a TLS `HostSNI` router for its project domain:
+`<project>.<host.id>.<host.domain>`. Postgres routes to PgBouncer when enabled and otherwise to
+Postgres. KV routes to its selected Redis-compatible engine. One project may have both roles on the
+same hostname because native routes use separate entrypoints and Compose project names remain
+distinct: `evdb-<project>-postgres` and `evdb-<project>-kv`.
 
 Native Traefik uses a pinned image, concrete Docker healthcheck, and ACME DNS-01 resolver. The
 provider credential is a private host file, and persistent `acme.json` is mode `0600`. Dedicated
@@ -21,7 +22,8 @@ network it cannot prove evdb owns.
 HTTP defaults on for KV. Its pinned `serverless-redis-http` sidecar reads token and connection data
 from a private mode-`0600` environment file and binds only
 `127.0.0.1:<machine-assigned-port>:80`. The stable port is machine-owned state. A sidecar connects
-through the unique matching KV service identity, so another project cannot claim its backend.
+through the unique matching KV service identity, so another project cannot claim its backend. Its
+default public HTTPS contract uses the same project hostname as native database access.
 
 ## External HTTP boundary
 

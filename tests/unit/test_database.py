@@ -574,8 +574,12 @@ def test_info_includes_settings_live_version_health_and_postgres_url(config, mon
     assert value["source_image"] == "postgres:16"
     assert value["engine_version"] == "postgres (PostgreSQL) 16.4"
     assert value["health"] == "healthy"
+    assert value["host"] == "app-test-01.test-01.storage.example.com"
+    assert parsed.hostname == value["host"]
+    assert parsed.port == 5432
     assert unquote(parsed.username) == target.settings.user
     assert unquote(parsed.password) == password
+    assert parsed.path == f"/{target.settings.database}"
     assert parse_qs(parsed.query) == {"sslmode": ["require"]}
 
 
@@ -603,15 +607,20 @@ def test_info_includes_concrete_kv_http_credentials(config, monkeypatch):
     monkeypatch.setattr(backup, "history", lambda *args: [])
 
     value = database.info(config, target)
+    parsed = urlsplit(value["url"])
 
     assert value["engine"] == "redis"
     assert value["settings"]["mode"] == "cache"
     assert value["engine_version"] == "Redis server v=7.2.5"
     assert value["url"].startswith("rediss://default:")
-    assert unquote(urlsplit(value["url"]).password) == "private-value"
+    assert value["host"] == "app-test-01.test-01.storage.example.com"
+    assert parsed.hostname == value["host"]
+    assert parsed.port == 6379
+    assert parsed.path == "/0"
+    assert unquote(parsed.password) == "private-value"
     assert value["http"] == {
         "enabled": True,
-        "url": "https://app-test-01.kv-test-01.storage.example.com",
+        "url": "https://app-test-01.test-01.storage.example.com",
         "token": "private-value",
     }
 

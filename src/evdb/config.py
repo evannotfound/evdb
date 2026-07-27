@@ -232,7 +232,7 @@ class Database:
 
     @property
     def domain(self) -> str:
-        return f"{self.project}.{self.role}-{self.host.id}.{self.host.domain}"
+        return project_domain(self.project, self.host)
 
     @property
     def port(self) -> int:
@@ -665,7 +665,7 @@ def with_role(config: Config, project_id: str, role: str, settings: Postgres | K
     if role not in {"postgres", "kv"}:
         raise ConfigError(f"unsupported role: {role}")
     if role == "kv":
-        domain = settings.http.domain or f"{project_id}.kv-{config.host.id}.{config.host.domain}"
+        domain = settings.http.domain or project_domain(project_id, config.host)
         settings = replace(
             settings,
             http=replace(settings.http, domain=domain),
@@ -704,7 +704,7 @@ def replace_role(config: Config, database: Database, settings: Postgres | KV) ->
 
 def validate(config: Config) -> list[str]:
     errors: list[str] = []
-    seen_domains: dict[str, str] = {}
+    seen_routes: dict[tuple[str, int], str] = {}
     seen_http_domains: dict[str, str] = {}
     if not _NAME.fullmatch(config.host.id) or len(config.host.id) > 60:
         errors.append("host.id must be a safe lowercase name of at most 60 characters")
@@ -729,10 +729,11 @@ def validate(config: Config) -> list[str]:
             errors.append(f"{database.identity}: derived Compose project is too long")
         if len(database.domain) > 253 or not _DOMAIN.fullmatch(database.domain):
             errors.append(f"{database.identity}: derived domain is invalid")
-        previous = seen_domains.get(database.domain)
+        route = (database.domain, database.port)
+        previous = seen_routes.get(route)
         if previous:
-            errors.append(f"{database.identity}: domain collides with {previous}")
-        seen_domains[database.domain] = database.identity
+            errors.append(f"{database.identity}: native route collides with {previous}")
+        seen_routes[route] = database.identity
         if not database.data.is_absolute() or database.data == Path("/"):
             errors.append(f"{database.identity}: data path is unsafe")
         if database.role == "kv" and database.settings.engine not in {"redis", "dragonfly"}:
@@ -797,6 +798,10 @@ def require_valid(config: Config) -> None:
     errors = validate(config)
     if errors:
         raise ConfigError("config failed:\n- " + "\n- ".join(errors))
+
+
+def project_domain(project: str, host: Host) -> str:
+    return f"{project}.{host.id}.{host.domain}"
 
 
 def _config(data: dict[str, Any], paths: Paths) -> Config:
@@ -929,7 +934,7 @@ def _kv(value: Any, project: str, host: Host) -> KV:
     enabled = _bool(http.get("enabled", True), f"projects.{project}.kv.http.enabled")
     http_image = http.get("image", DEFAULT_IMAGES["http"])
     validate_source(http_image, f"projects.{project}.kv.http.image")
-    domain = http.get("domain") or f"{project}.kv-{host.id}.{host.domain}"
+    domain = http.get("domain") or project_domain(project, host)
     if domain is not None and (not isinstance(domain, str) or not _DOMAIN.fullmatch(domain)):
         raise ConfigError(f"projects.{project}.kv.http.domain must be a valid domain")
     return KV(

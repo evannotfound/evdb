@@ -132,7 +132,7 @@ def prepare_add(
         settings = KV(
             engine,
             DEFAULT_IMAGES[engine],
-            http=HTTP(domain=f"{project}.kv-{config.host.id}.{config.host.domain}"),
+            http=HTTP(),
             memory="256mb" if engine == "dragonfly" else None,
             threads=1 if engine == "dragonfly" else None,
         )

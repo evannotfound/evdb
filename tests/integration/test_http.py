@@ -9,7 +9,7 @@ import uuid
 from dataclasses import replace
 
 from evdb import compose, secrets
-from evdb.config import resolve_state
+from evdb.config import resolve_state, with_role
 from tests.fixtures.containers import (
     DRAGONFLY_IMAGE,
     HTTP_IMAGE,
@@ -57,6 +57,7 @@ def test_generated_http_compose_uses_private_secrets_and_isolates_backends(
             compose.write(target.compose, rendered)
             values[target.engine] = (target, password, token, rendered)
 
+            assert target.settings.http.domain == target.domain
             text = target.compose.read_text()
             assert password not in text and token not in text
             private = ("password", "http-token", "http.env")
@@ -99,18 +100,25 @@ def test_generated_http_compose_uses_private_secrets_and_isolates_backends(
 
 def _config(config, tmp_path):
     base = config.projects[0]
-    http = replace(base.kv.http, enabled=True, image=HTTP_IMAGE)
-    redis = replace(
-        base,
-        id=f"http-redis-{uuid.uuid4().hex[:8]}-test-01",
-        postgres=None,
-        kv=replace(base.kv, engine="redis", image="redis:7.2.5", mode="durable", http=http),
+    http = replace(base.kv.http, enabled=True, image=HTTP_IMAGE, domain=None)
+    redis_id = f"http-redis-{uuid.uuid4().hex[:8]}-test-01"
+    dragonfly_id = f"http-dragonfly-{uuid.uuid4().hex[:8]}-test-01"
+    selected = replace(
+        config,
+        host=replace(config.host, data_root=tmp_path / "data"),
+        projects=(),
     )
-    dragonfly = replace(
-        base,
-        id=f"http-dragonfly-{uuid.uuid4().hex[:8]}-test-01",
-        postgres=None,
-        kv=replace(
+    selected = with_role(
+        selected,
+        redis_id,
+        "kv",
+        replace(base.kv, engine="redis", image="redis:7.2.5", mode="durable", http=http),
+    )
+    selected = with_role(
+        selected,
+        dragonfly_id,
+        "kv",
+        replace(
             base.kv,
             engine="dragonfly",
             image=DRAGONFLY_IMAGE.split("@", 1)[0],
@@ -119,11 +127,6 @@ def _config(config, tmp_path):
             memory="256mb",
             threads=1,
         ),
-    )
-    selected = replace(
-        config,
-        host=replace(config.host, data_root=tmp_path / "data"),
-        projects=(redis, dragonfly),
     )
     return selected, tuple(selected.databases)
 

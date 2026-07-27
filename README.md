@@ -84,9 +84,12 @@ evdb database info notes-prod-01/kv
 evdb prints a complete TLS connection URL:
 
 ```text
-postgresql://default:<password>@<database-host>:5432/postgres?sslmode=require
-rediss://default:<password>@<database-host>:6379/0
+postgresql://default:<password>@notes-prod-01.example-01.storage.example.com:5432/postgres?sslmode=require
+rediss://default:<password>@notes-prod-01.example-01.storage.example.com:6379/0
 ```
+
+Postgres, Redis-compatible native access, and Redis over HTTPS use the same project hostname; the
+scheme and port select the protocol.
 
 Set it as `DATABASE_URL` or `REDIS_URL` and use the client your application already has.
 
@@ -111,6 +114,8 @@ Powered by [serverless-redis-http](https://github.com/hiett/serverless-redis-htt
 All Postgres databases can share port `5432`, and all Redis-compatible databases can share port `6379`.
 
 evdb uses TLS and the requested hostname SNI to route each connection to the correct database container.
+One project uses one public hostname, for example `notes-prod-01.example-01.storage.example.com`,
+with Postgres on `5432` and Redis-compatible KV on `6379`.
 
 ### Private credential storage
 

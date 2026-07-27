@@ -46,6 +46,9 @@ contains at most one `postgres` role and one `kv` role. The stable identity used
 backups, locks, status, and state is `project/role`. KV records either `dragonfly` or `redis` as its
 concrete engine.
 
+Public connection hostnames are project-level: `<project>.<host.id>.<host.domain>`. If a project has
+both roles, Postgres and KV share that hostname and are distinguished by scheme and port.
+
 ## Defaults and overrides
 
 New Postgres roles are durable, use port 5432, enable PgBouncer, and default to user `default` and

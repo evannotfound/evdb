@@ -22,9 +22,18 @@ def test_roles_render_as_separate_compose_projects(config):
     pg_data = compose.database(config, postgres, state)
     kv_data = compose.database(config, kv, state)
 
+    assert postgres.domain == "app-test-01.test-01.storage.example.com"
+    assert kv.domain == postgres.domain
     assert pg_data["name"] == "evdb-app-test-01-postgres"
     assert kv_data["name"] == "evdb-app-test-01-kv"
     assert set(pg_data["services"]).isdisjoint(kv_data["services"])
+    assert set(pg_data["services"]) == {
+        "evdb-app-test-01-postgres-primary",
+    }
+    assert set(kv_data["services"]) == {
+        "evdb-app-test-01-kv-primary",
+        "evdb-app-test-01-kv-http",
+    }
     assert all("@sha256:" in item["image"] for item in pg_data["services"].values())
     assert all("@sha256:" in item["image"] for item in kv_data["services"].values())
 
@@ -133,6 +142,7 @@ def test_http_sidecar_change_does_not_change_primary_contract(config):
 def test_native_routes_are_unique_and_use_sni_certificates(config):
     state = _state(config)
     routes = []
+    rules = []
     for target in config.databases:
         data = compose.database(config, target, state)
         labels = {
@@ -141,11 +151,17 @@ def test_native_routes_are_unique_and_use_sni_certificates(config):
             for key, value in service.get("labels", {}).items()
             if key.startswith("traefik.tcp.routers.")
         }
-        assert any(value == f"HostSNI(`{target.domain}`)" for value in labels.values())
+        router = f"{target.role}-{target.project}"
+        entrypoint = "postgres" if target.role == "postgres" else "kv"
+        rule = f"HostSNI(`{target.domain}`)"
+        assert labels[f"traefik.tcp.routers.{router}.entrypoints"] == entrypoint
+        assert labels[f"traefik.tcp.routers.{router}.rule"] == rule
         assert any(
             key.endswith(".tls.certresolver") and value == "evdb" for key, value in labels.items()
         )
+        rules.append(rule)
         routes.extend(labels)
+    assert rules == ["HostSNI(`app-test-01.test-01.storage.example.com`)" for _ in rules]
     assert len(routes) == len(set(routes))
 
 

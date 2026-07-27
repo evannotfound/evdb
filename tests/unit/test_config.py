@@ -46,8 +46,13 @@ def test_project_first_fixtures_cover_each_role_shape():
         "app-test-01/postgres",
         "app-test-01/kv",
     ]
-    assert combined.select("app-test-01/postgres").compose_project == "evdb-app-test-01-postgres"
-    assert combined.select("app-test-01/kv").compose_project == "evdb-app-test-01-kv"
+    combined_postgres = combined.select("app-test-01/postgres")
+    combined_kv = combined.select("app-test-01/kv")
+    assert combined_postgres.compose_project == "evdb-app-test-01-postgres"
+    assert combined_kv.compose_project == "evdb-app-test-01-kv"
+    assert combined_postgres.domain == "app-test-01.test-01.storage.example.com"
+    assert combined_kv.domain == combined_postgres.domain
+    assert combined_kv.settings.http.domain == combined_kv.domain
 
 
 def test_defaults_are_typed_and_concise():
@@ -66,6 +71,7 @@ def test_defaults_are_typed_and_concise():
     assert database.settings.threads == 1
     assert database.settings.http.enabled
     assert database.settings.http.connections == 20
+    assert database.settings.http.domain == "app-dev-01.test-01.storage.example.com"
 
 
 def test_select_requires_role_when_project_has_both():
@@ -189,6 +195,21 @@ def test_role_add_defaults_are_persisted_explicitly():
     assert data["image"].endswith(":v1.34.1")
     assert data["http"]["enabled"] is True
     assert data["http"]["image"].startswith("hiett/serverless-redis-http@sha256:")
+    assert data["http"]["domain"] == "queue-prod-01.test-01.storage.example.com"
+
+
+def test_explicit_http_domain_override_is_preserved():
+    config = load(FIXTURES / "postgres")
+    from evdb.config import HTTP, KV
+
+    updated = with_role(
+        config,
+        "queue-prod-01",
+        "kv",
+        KV("redis", "redis:7.2.5", http=HTTP(domain="queue.storage.example.com")),
+    )
+
+    assert updated.select("queue-prod-01/kv").settings.http.domain == "queue.storage.example.com"
 
 
 def test_replace_role_changes_only_selected_database():

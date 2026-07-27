@@ -21,7 +21,7 @@ from fixtures.containers import (  # noqa: E402
 )
 
 
-def test_traefik_tls_sni_isolates_two_postgres_and_two_kv_backends():
+def test_traefik_tls_sni_isolates_two_projects_with_shared_role_hostnames():
     for image in (POSTGRES_IMAGE, REDIS_IMAGE, TRAEFIK_IMAGE):
         require_image(image)
     names = {
@@ -32,10 +32,8 @@ def test_traefik_tls_sni_isolates_two_postgres_and_two_kv_backends():
         "traefik": unique_name("sni-traefik"),
     }
     domains = {
-        "pg1": "one.postgres.test",
-        "pg2": "two.postgres.test",
-        "kv1": "one.kv.test",
-        "kv2": "two.kv.test",
+        "one": "one.project.test",
+        "two": "two.project.test",
     }
 
     with (
@@ -45,7 +43,7 @@ def test_traefik_tls_sni_isolates_two_postgres_and_two_kv_backends():
             names["pg1"],
             env={"POSTGRES_USER": "default", "POSTGRES_HOST_AUTH_METHOD": "trust"},
             network_name=network_name,
-            labels=_labels("postgres", "pg1", domains["pg1"], network_name, 5432),
+            labels=_labels("postgres", "pg1", domains["one"], network_name, 5432),
             memory="1g",
         ),
         container(
@@ -53,7 +51,7 @@ def test_traefik_tls_sni_isolates_two_postgres_and_two_kv_backends():
             names["pg2"],
             env={"POSTGRES_USER": "default", "POSTGRES_HOST_AUTH_METHOD": "trust"},
             network_name=network_name,
-            labels=_labels("postgres", "pg2", domains["pg2"], network_name, 5432),
+            labels=_labels("postgres", "pg2", domains["two"], network_name, 5432),
             memory="1g",
         ),
         container(
@@ -61,14 +59,14 @@ def test_traefik_tls_sni_isolates_two_postgres_and_two_kv_backends():
             names["kv1"],
             ["redis-server", "--save", "", "--appendonly", "no"],
             network_name=network_name,
-            labels=_labels("redis", "kv1", domains["kv1"], network_name, 6379),
+            labels=_labels("kv", "kv1", domains["one"], network_name, 6379),
         ),
         container(
             REDIS_IMAGE,
             names["kv2"],
             ["redis-server", "--save", "", "--appendonly", "no"],
             network_name=network_name,
-            labels=_labels("redis", "kv2", domains["kv2"], network_name, 6379),
+            labels=_labels("kv", "kv2", domains["two"], network_name, 6379),
         ),
     ):
         for name in (names["pg1"], names["pg2"]):
@@ -116,18 +114,18 @@ def test_traefik_tls_sni_isolates_two_postgres_and_two_kv_backends():
                 "--providers.docker.exposedbydefault=false",
                 f"--providers.docker.network={network_name}",
                 "--entrypoints.postgres.address=:5432",
-                "--entrypoints.redis.address=:6379",
+                "--entrypoints.kv.address=:6379",
             ],
             mounts=[(Path("/var/run/docker.sock"), "/var/run/docker.sock", True)],
             network_name=network_name,
             publish=["127.0.0.1::5432", "127.0.0.1::6379"],
         ):
             postgres_port = _port(names["traefik"], "5432/tcp")
-            redis_port = _port(names["traefik"], "6379/tcp")
-            assert _postgres(domains["pg1"], postgres_port) == "postgres-one"
-            assert _postgres(domains["pg2"], postgres_port) == "postgres-two"
-            assert _redis(domains["kv1"], redis_port) == "redis-one"
-            assert _redis(domains["kv2"], redis_port) == "redis-two"
+            kv_port = _port(names["traefik"], "6379/tcp")
+            assert _postgres(domains["one"], postgres_port) == "postgres-one"
+            assert _postgres(domains["two"], postgres_port) == "postgres-two"
+            assert _redis(domains["one"], kv_port) == "redis-one"
+            assert _redis(domains["two"], kv_port) == "redis-two"
 
 
 def _labels(entrypoint: str, key: str, domain: str, network_name: str, port: int) -> dict:
