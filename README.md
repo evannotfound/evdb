@@ -23,7 +23,7 @@ postgresql://default:<password>@notes-prod-01.your-own-infra.com:5432/postgres?s
 
 Running a database container is easy. Operating it safely over time is not.
 
-evdb handles the parts that usually require scripts, configuration, and manual recovery work:
+evdb handles the hard parts for you:
 
 - TLS routing for Postgres, Dragonfly, and Redis
 - Separate credentials for every database
@@ -33,7 +33,7 @@ evdb handles the parts that usually require scripts, configuration, and manual r
 - Health checks and update recovery
 - Stable ports and connection details
 
-You keep control of the server and storage without building the surrounding database platform yourself.
+You keep control of the server and storage without the hassle of building the database infrastructure yourself.
 
 ## Installation
 
@@ -48,8 +48,8 @@ The host also requires:
 - Restic
 - rclone
 - systemd
-- DNS provider credentials
-- Free ports `5432` and `6379`
+- DNS provider credentials for SSL certificates
+- Ports `5432` and `6379` to be free
 
 Install the latest release:
 
@@ -57,8 +57,6 @@ Install the latest release:
 curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install.sh | sudo sh
 sudo evdb host setup
 ```
-
-The installer verifies the release checksum and installs an exact version.
 
 See [Host setup and updates](docs/setup.md) for pinned installations, unattended setup, and release security details.
 
@@ -70,7 +68,7 @@ Create a Postgres database:
 evdb database add notes-prod-01 postgres
 ```
 
-Or create a Redis-compatible database:
+Or create a key-value database (by default, we use [DragonflyDB](https://www.dragonflydb.io/), a performant Redis alternative. We also support Redis itself.):
 
 ```sh
 evdb database add notes-prod-01 kv
@@ -102,36 +100,23 @@ Applications connect directly to Postgres, Dragonfly, or Redis using their exist
 
 There is no evdb SDK, proxy protocol, or application dependency.
 
-### One identity per database
+### Serverless Redis
 
-Each database is addressed as:
+Besides a regular Redis `rediss://` connection URL, evdb also supports redis over https, just like Neon.
 
-```text
-<project>/postgres
-<project>/kv
-```
-
-A project can have Postgres, a Redis-compatible database, or both.
-
-Each database receives its own hostname, credentials, storage, container, and connection URL.
+Powered by [serverless-redis-http](https://github.com/hiett/serverless-redis-http), you can use Redis over HTTPS on serverless platforms such as [Vercel](https://vercel.com/evanovation).
 
 ### TLS hostname routing
 
 All Postgres databases can share port `5432`, and all Redis-compatible databases can share port `6379`.
 
-evdb uses TLS and the requested hostname to route each connection to the correct database container.
+evdb uses TLS and the requested hostname SNI to route each connection to the correct database container.
 
 ### Private credential storage
 
 Passwords are stored in private files on the host.
 
-They are kept out of:
-
-- Editable configuration
-- Internal state
-- Logs
-- Backup records
-- JSON output
+In the future, we are planning to support automatic upload and sync to a cloud secret store such as 1Password.
 
 ### Verified backups
 
@@ -160,9 +145,7 @@ Credentials and assigned ports remain stable. If a database deployment or evdb u
 
 Services such as Supabase, Neon, Amazon RDS, and ElastiCache run databases on infrastructure managed by the provider.
 
-evdb gives applications a similar interface: a standard connection URL. The difference is that the databases run on a Linux server you own or rent.
-
-evdb is MIT licensed and has no per-database or usage fees. You still pay for the server, DNS, and backup storage, and you remain responsible for the underlying host.
+evdb gives applications a similar interface: a standard connection URL. The difference is that the databases run on a Linux server you own. 
 
 evdb is not intended to reproduce every feature of a managed cloud service. It does not provide:
 
@@ -170,7 +153,7 @@ evdb is not intended to reproduce every feature of a managed cloud service. It d
 - Neon serverless scaling or database branching
 - AWS high availability or managed service-level agreements
 
-It is designed for small deployments where you want control of the infrastructure without maintaining your own collection of routing, backup, restore, and update scripts.
+It is designed for small deployments or projects where you want control of the infrastructure, low cost, and no managed infrastructure. 
 
 
 ## Usage
