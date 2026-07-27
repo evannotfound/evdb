@@ -102,9 +102,9 @@ There is no evdb SDK, proxy protocol, or application dependency.
 
 ### Serverless Redis
 
-Besides a regular Redis `rediss://` connection URL, evdb also supports redis over https, just like Neon.
+Besides a regular Redis `rediss://` connection URL, evdb also supports redis over https, just like [Upstash](https://upstash.com/).
 
-Powered by [serverless-redis-http](https://github.com/hiett/serverless-redis-http), you can use Redis over HTTPS on serverless platforms such as [Vercel](https://vercel.com/evanovation).
+Powered by [serverless-redis-http](https://github.com/hiett/serverless-redis-http), you can use Redis over HTTPS on serverless platforms such as [Vercel](https://vercel.com/evanovation). evdb's redis over https support is fully compatible with `@upstash/redis` client.
 
 ### TLS hostname routing
 
