@@ -11,9 +11,11 @@ from evdb.config import (
     DEFAULT_HTTP_START,
     DEFAULT_RETENTION,
     DEFAULT_TIMEOUTS,
+    STATE_VERSION,
     ConfigError,
     ImageState,
     MachineState,
+    Project,
     RoleState,
     append_activity,
     as_dict,
@@ -25,7 +27,6 @@ from evdb.config import (
     resolve_state,
     state_dict,
     with_role,
-    write_config,
     write_state,
 )
 from evdb.images import image_major, locked_image, validate_source
@@ -36,9 +37,9 @@ DIGEST = "sha256:" + "a" * 64
 
 
 def test_project_first_fixtures_cover_each_role_shape():
-    postgres = load(FIXTURES / "postgres")
-    kv = load(FIXTURES / "kv")
-    combined = load(FIXTURES / "combined")
+    postgres = load(FIXTURES / "postgres/host.yml")
+    kv = load(FIXTURES / "kv/host.yml")
+    combined = load(FIXTURES / "combined/host.yml")
 
     assert [item.identity for item in postgres.databases] == ["app-prod-01/postgres"]
     assert [item.identity for item in kv.databases] == ["app-dev-01/kv"]
@@ -56,7 +57,7 @@ def test_project_first_fixtures_cover_each_role_shape():
 
 
 def test_defaults_are_typed_and_concise():
-    config = load(FIXTURES / "kv")
+    config = load(FIXTURES / "kv/host.yml")
     database = config.select("app-dev-01/kv")
 
     assert config.host.backup.retention == DEFAULT_RETENTION
@@ -75,7 +76,7 @@ def test_defaults_are_typed_and_concise():
 
 
 def test_select_requires_role_when_project_has_both():
-    config = load(FIXTURES / "combined")
+    config = load(FIXTURES / "combined/host.yml")
 
     with pytest.raises(ConfigError) as caught:
         config.select("app-test-01")
@@ -97,9 +98,12 @@ def test_select_requires_role_when_project_has_both():
         ("duplicate-role.yml", "duplicate YAML key"),
     ],
 )
-def test_invalid_fixtures_fail_before_side_effects(name, message):
+def test_invalid_fixtures_fail_before_side_effects(tmp_path, name, message):
+    path = tmp_path / "host.yml"
+    path.write_text((FIXTURES / "invalid" / name).read_text())
+
     with pytest.raises(ConfigError, match=message):
-        load(FIXTURES / "invalid" / name)
+        load(path)
 
 
 @pytest.mark.parametrize("name", ["postgres.yml", "kv.yml", "host.lock.json"])
@@ -108,7 +112,15 @@ def test_old_side_files_are_rejected(tmp_path, name):
     (tmp_path / name).write_text("{}\n")
 
     with pytest.raises(ConfigError, match="old source layout"):
-        load(tmp_path)
+        load(tmp_path / "host.yml")
+
+
+def test_source_load_requires_exact_host_yml(tmp_path):
+    path = tmp_path / "host.yaml"
+    path.write_text((FIXTURES / "postgres/host.yml").read_text())
+
+    with pytest.raises(ConfigError, match="host.yml"):
+        load(path)
 
 
 @pytest.mark.parametrize(
@@ -147,6 +159,44 @@ def test_config_rejects_repository_credentials_and_overlong_host_label(config):
         require_valid(replace(config, host=replace(config.host, id="a" * 61)))
 
 
+def test_constructed_config_uses_complete_validation(config):
+    with pytest.raises(ConfigError, match="valid email"):
+        require_valid(
+            replace(
+                config,
+                host=replace(config.host, routing=replace(config.host.routing, acme_email="bad")),
+            )
+        )
+
+    with pytest.raises(ConfigError, match="non-empty postgres and kv"):
+        require_valid(
+            replace(
+                config,
+                host=replace(
+                    config.host,
+                    backup=replace(config.host.backup, repos={"postgres": "", "kv": "/tmp/kv"}),
+                ),
+            )
+        )
+
+    with pytest.raises(ConfigError, match="retention.daily"):
+        require_valid(
+            replace(
+                config,
+                host=replace(
+                    config.host,
+                    backup=replace(
+                        config.host.backup,
+                        retention={**DEFAULT_RETENTION, "daily": 0},
+                    ),
+                ),
+            )
+        )
+
+    with pytest.raises(ConfigError, match="postgres must be Postgres"):
+        require_valid(replace(config, projects=(Project("other-prod-01", postgres="bad"),)))
+
+
 def test_http_domains_must_be_unique_between_kv_roles(config):
     target = config.select("app-test-01/kv")
 
@@ -169,7 +219,7 @@ def test_paths_are_project_first_and_fully_injectable(config, paths):
 
 
 def test_round_trip_is_deterministic(tmp_path):
-    original = load(FIXTURES / "combined")
+    original = load(FIXTURES / "combined/host.yml")
     source = tmp_path / "host.yml"
     source.write_text(dump(original))
 
@@ -180,7 +230,7 @@ def test_round_trip_is_deterministic(tmp_path):
 
 
 def test_role_add_defaults_are_persisted_explicitly():
-    config = load(FIXTURES / "postgres")
+    config = load(FIXTURES / "postgres/host.yml")
     from evdb.config import HTTP, KV
 
     updated = with_role(
@@ -199,7 +249,7 @@ def test_role_add_defaults_are_persisted_explicitly():
 
 
 def test_explicit_http_domain_override_is_preserved():
-    config = load(FIXTURES / "postgres")
+    config = load(FIXTURES / "postgres/host.yml")
     from evdb.config import HTTP, KV
 
     updated = with_role(
@@ -213,7 +263,7 @@ def test_explicit_http_domain_override_is_preserved():
 
 
 def test_replace_role_changes_only_selected_database():
-    config = load(FIXTURES / "combined")
+    config = load(FIXTURES / "combined/host.yml")
     database = config.select("app-test-01/kv")
     changed = replace(database.settings, mode="durable")
 
@@ -229,12 +279,12 @@ def test_replace_role_changes_only_selected_database():
 def test_machine_state_round_trip_and_stable_port(config):
     role = RoleState(
         "redis",
-        {"primary": ImageState("redis:7.2.5", DIGEST, 7)},
+        {"primary": ImageState("redis:7.2.5", DIGEST)},
         http_port=14001,
         compose_hash="abc",
         installed=True,
     )
-    state = MachineState(1, config.host.id, {}, {"app-test-01/kv": role}, "1.0.0")
+    state = MachineState(STATE_VERSION, config.host.id, {}, {"app-test-01/kv": role}, "1.0.0")
 
     write_state(config, state)
     loaded = load_state(config)
@@ -372,22 +422,22 @@ def test_state_rejects_secrets(config):
     assert "do-not-print" not in str(caught.value)
 
 
-def test_atomic_config_write_keeps_one_previous_and_activity(config):
-    config.paths.source.parent.mkdir(parents=True)
-    config.paths.source.write_text("old\n")
-    database = config.select("app-test-01/kv")
+def test_machine_state_requires_current_writer_fields(config):
+    path = config.paths.machine_state
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": STATE_VERSION,
+                "host": config.host.id,
+                "images": {},
+                "roles": {},
+            }
+        )
+    )
 
-    write_config(config, command="database configure", database=database, changed=("mode",))
-
-    assert config.paths.previous.read_text() == "old\n"
-    assert config.paths.previous.stat().st_mode & 0o777 == 0o640
-    assert config.paths.source.stat().st_mode & 0o777 == 0o640
-    assert load(config.paths.source, paths=config.paths) == config
-    activity = json.loads(config.paths.activity.read_text())
-    assert activity["project"] == "app-test-01"
-    assert activity["role"] == "kv"
-    assert activity["changed"] == ["mode"]
-    assert "password" not in config.paths.activity.read_text().lower()
+    with pytest.raises(ConfigError, match="tool_version is required"):
+        load_state(config)
 
 
 def test_http_port_range_rejects_invalid_order(tmp_path):
@@ -404,9 +454,18 @@ def test_http_port_range_rejects_invalid_order(tmp_path):
 
 
 def test_config_source_contains_no_runtime_or_secret_fields():
-    data = as_dict(load(FIXTURES / "combined"))
+    data = as_dict(load(FIXTURES / "combined/host.yml"))
     text = json.dumps(data).lower()
 
     assert "digest" not in text
     assert "http_port" in text  # only the allocation range is human-owned
     assert not any(word in text for word in ("password", "token", "op://", "current", "target"))
+
+
+def test_secret_words_in_project_ids_are_allowed(config, tmp_path):
+    settings = config.select("app-test-01/postgres").settings
+    updated = with_role(config, "token-prod-01", "postgres", settings)
+    path = tmp_path / "host.yml"
+    path.write_text(dump(updated))
+
+    assert load(path).select("token-prod-01/postgres").project == "token-prod-01"

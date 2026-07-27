@@ -20,7 +20,7 @@ def paths(tmp_path):
 
 @pytest.fixture
 def config(tmp_path, paths):
-    source = load(FIXTURES / "combined", paths=paths)
+    source = load(FIXTURES / "combined/host.yml", paths=paths)
     host = replace(
         source.host,
         data_root=tmp_path / "data",

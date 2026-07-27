@@ -378,7 +378,7 @@ def _compatible(
         "backup image": image_major(record.get("image", "")),
         "backup engine": image_major(f"engine:{engine_version}"),
         "target source": image_major(database.image),
-        "target state": primary.major,
+        "target state": image_major(primary.source),
     }
     if any(value is None for value in majors.values()) or len(set(majors.values())) != 1:
         detail = ", ".join(f"{name}={value}" for name, value in majors.items())

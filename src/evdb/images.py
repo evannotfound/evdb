@@ -96,7 +96,7 @@ def state(source: str, resolver: Callable[..., str] = resolve):
     digest = source_digest(source) or resolver(source)
     if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
         raise ConfigError(f"image {source}: resolver returned an invalid digest")
-    return ImageState(source, digest, image_major(source))
+    return ImageState(source, digest)
 
 
 def compatible(current: str, candidate: str) -> bool:
