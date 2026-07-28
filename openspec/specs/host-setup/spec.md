@@ -2,7 +2,8 @@
 
 ## Purpose
 
-Define exact-version evdb installation, idempotent host setup, and recoverable host tool updates.
+Define exact-version evdb installation, idempotent host setup, recoverable host tool updates, and
+safe host uninstall.
 
 ## Requirements
 
@@ -89,3 +90,14 @@ Host setup and updates SHALL NOT invoke Ansible, generate inventory, depend on a
 #### Scenario: Fresh host setup succeeds
 - **WHEN** the exact package and documented prerequisites are present on a VPS
 - **THEN** `evdb host setup` can prepare the host without `ansible-playbook`
+
+### Requirement: Safe host uninstall
+`sudo evdb host uninstall` SHALL stop evdb timers, configured database Compose projects, orphaned evdb containers, Traefik, and the managed Docker network, then remove evdb systemd units and the installed evdb tool. By default it SHALL preserve local configuration, secrets, state, local backups, restore staging, and database data. `sudo evdb host uninstall --purge` SHALL explicitly delete those local managed files after the runtime is stopped. Uninstall SHALL NOT delete remote Restic repositories, DNS records, Docker images, or original external credential files.
+
+#### Scenario: Uninstall preserves local data by default
+- **WHEN** an operator runs `sudo evdb host uninstall`
+- **THEN** services and the installed tool are removed while `/etc/evdb`, `/var/lib/evdb`, and database data remain for reinstall
+
+#### Scenario: Purge deletes local managed data
+- **WHEN** an operator runs `sudo evdb host uninstall --purge`
+- **THEN** local managed config, secrets, state, backups, restore staging, and database data are deleted after services stop

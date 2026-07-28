@@ -11,8 +11,8 @@ evdb turns a Linux server into a platform for Postgres and Redis-compatible data
 Create a database, get a private TLS connection URL, and use it with any standard Postgres or Redis client. evdb handles the infrastructure around it: provisioning, routing, credentials, backups, health checks, restores, updates, and rollback.
 
 ```sh
-evdb database add notes-prod-01 postgres
-evdb database info notes-prod-01/postgres
+sudo evdb database add notes-prod-01 postgres
+sudo evdb database info notes-prod-01/postgres
 ```
 
 ```text
@@ -71,14 +71,14 @@ evdb database add notes-prod-01 postgres
 Or create a key-value database (by default, we use [DragonflyDB](https://www.dragonflydb.io/), a performant Redis alternative. We also support Redis itself.):
 
 ```sh
-evdb database add notes-prod-01 kv
+sudo evdb database add notes-prod-01 kv
 ```
 
 Retrieve its connection details:
 
 ```sh
-evdb database info notes-prod-01/postgres
-evdb database info notes-prod-01/kv
+sudo evdb database info notes-prod-01/postgres
+sudo evdb database info notes-prod-01/kv
 ```
 
 evdb prints a complete TLS connection URL:

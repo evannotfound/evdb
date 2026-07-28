@@ -70,6 +70,30 @@ canonical systemd units. It finishes with `evdb host check`.
 Setup is idempotent. Repeated setup does not replace database credentials or mutable rclone OAuth
 state, restart healthy databases, or change enabled timers.
 
+## Uninstall
+
+Default uninstall removes the runtime and installed tool while preserving local managed data:
+
+```sh
+sudo evdb host uninstall
+```
+
+It stops evdb timers, configured database Compose projects, orphaned evdb containers, Traefik, and the
+managed Docker network, then removes evdb systemd units and `/usr/local/bin/evdb` with `/opt/evdb`.
+It preserves `/etc/evdb`, `/var/lib/evdb`, `<data_root>`, remote Restic repositories, DNS records,
+Docker images, and original credential files such as `/root/evdb-dns.env` and the source rclone
+config. Reinstalling evdb can reuse the preserved host files.
+
+To delete local managed config, secrets, state, local backups, restore staging, and database data, use
+an explicit purge:
+
+```sh
+sudo evdb host uninstall --purge
+```
+
+Purge still does not delete remote Restic repositories, DNS records, Docker images, or original
+credential files.
+
 ## Version layout
 
 Each release archive contains one standalone executable and the canonical service and timer files:

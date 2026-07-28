@@ -293,9 +293,12 @@ def test_machine_state_round_trip_and_stable_port(config):
     assert loaded.roles["app-test-01/kv"].http_port == 14001
     assert json.loads(config.paths.machine_state.read_text()) == state_dict(state)
     assert json.loads(config.paths.machine_state.read_text())["version"] == 1
-    assert json.loads(config.paths.machine_state.read_text())["roles"]["app-test-01/kv"][
-        "images"
-    ]["primary"]["major"] == 7
+    assert (
+        json.loads(config.paths.machine_state.read_text())["roles"]["app-test-01/kv"]["images"][
+            "primary"
+        ]["major"]
+        == 7
+    )
     assert config.paths.machine_state.stat().st_mode & 0o777 == 0o600
 
 

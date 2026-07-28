@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path, PurePosixPath
@@ -516,6 +517,43 @@ def update(
         return result
 
 
+def uninstall(
+    config: Config,
+    *,
+    purge: bool = False,
+    yes: bool = False,
+    confirm=None,
+    unit_dir: str | Path = "/etc/systemd/system",
+) -> str:
+    _guard(config, config.paths.source)
+    preview = _uninstall_preview(config, purge)
+    if not yes and confirm is not None and not confirm(preview):
+        return "Cancelled"
+    if not yes and confirm is None:
+        raise HostError("confirmation is required")
+    started = time.monotonic()
+    _log(config, "host uninstall", started, "started")
+    try:
+        with operation(config, write=True):
+            unit_root = Path(unit_dir)
+            _disable_units(config)
+            _stop_databases(config)
+            _stop_traefik(config)
+            _remove_orphan_containers(config)
+            _remove_network(config)
+            _remove_units(unit_root)
+            _remove_tool(config.paths.tool)
+        if purge:
+            _purge(config)
+        _log(config, "host uninstall", started, "success")
+        return "Host uninstalled" + (
+            " and local data purged" if purge else "; local data preserved"
+        )
+    except Exception as exc:
+        _log(config, "host uninstall", started, "failed", exc)
+        raise
+
+
 def _initial(values: dict[str, Any], paths: Paths) -> Config:
     required = (
         "host_id",
@@ -543,7 +581,202 @@ def _guard(config: Config, source: Path) -> None:
     if config.host.id == "montreal-01" or "montreal-01" in source.parts:
         raise HostError("production migration for montreal-01 is a separate change")
     if config.paths.config == Path("/etc/evdb") and os.geteuid() != 0:
-        raise HostError("host setup and update require root")
+        raise HostError("host setup, update, and uninstall require root")
+
+
+def _uninstall_preview(config: Config, purge: bool) -> str:
+    lines = [
+        f"Host: {config.host.id}",
+        "Action: uninstall evdb host services and installed tool",
+        "Will stop evdb timers, databases, Traefik, and managed Docker networking",
+        "Will remove evdb systemd units and the installed evdb command",
+    ]
+    if purge:
+        lines.extend(
+            [
+                "Will delete local evdb config, secrets, state, local backups,",
+                "restore staging, and database data",
+                "Will not delete remote Restic repositories, DNS records,",
+                "Docker images, or original credential files",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Will preserve local config, secrets, state, local backups,",
+                "restore staging, and database data",
+                "Use --purge to delete local managed data",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _disable_units(config: Config) -> None:
+    timers = set(DEFAULT_TIMERS)
+    for database in config.databases:
+        if database.durable:
+            timers.add(_backup_timer(database.identity))
+    if timers:
+        run(["systemctl", "disable", "--now", *sorted(timers)], timeout=120, check=False)
+    services = [source.name for source in _units() if source.name.endswith(".service")]
+    if services:
+        run(["systemctl", "stop", *services], timeout=120, check=False)
+
+
+def _stop_databases(config: Config) -> None:
+    for database in config.databases:
+        if database.compose.exists():
+            run(
+                compose.command(
+                    database.compose, database.compose_project, "down", "--remove-orphans"
+                ),
+                timeout=config.host.timeouts["command"],
+                check=False,
+            )
+
+
+def _stop_traefik(config: Config) -> None:
+    path = config.paths.traefik / "compose.yaml"
+    if path.exists():
+        run(
+            compose.command(path, compose.TRAEFIK_PROJECT, "down", "--remove-orphans"),
+            timeout=config.host.timeouts["command"],
+            check=False,
+        )
+    if _container_owned(compose.TRAEFIK_CONTAINER, compose.TRAEFIK_PROJECT):
+        run(["docker", "rm", "--force", compose.TRAEFIK_CONTAINER], timeout=60, check=False)
+
+
+def _remove_orphan_containers(config: Config) -> None:
+    known = {database.compose_project for database in config.databases} | {compose.TRAEFIK_PROJECT}
+    result = run(
+        [
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            f"label={compose.CONTRACT_LABEL}",
+            "--format",
+            "{{.ID}}",
+        ],
+        timeout=60,
+        check=False,
+    )
+    if result.code != 0:
+        return
+    for container in result.out.splitlines():
+        labels = _container_labels(container)
+        project = labels.get("com.docker.compose.project", "")
+        if project.startswith("evdb-") and project not in known:
+            run(["docker", "rm", "--force", container], timeout=60, check=False)
+
+
+def _remove_network(config: Config) -> None:
+    result = run(["docker", "network", "inspect", compose.NETWORK], timeout=30, check=False)
+    if result.code != 0:
+        return
+    try:
+        labels = json.loads(result.out)[0].get("Labels", {}) or {}
+    except (json.JSONDecodeError, IndexError, TypeError) as exc:
+        raise HostError("evdb Docker network inspection failed") from exc
+    if labels.get(compose.NETWORK_LABEL) != "true":
+        raise HostError("existing evdb Docker network is not owned by evdb")
+    run(["docker", "network", "rm", compose.NETWORK], timeout=60, check=False)
+
+
+def _remove_units(unit_root: Path) -> None:
+    changed = False
+    for source in _units():
+        path = unit_root / source.name
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            changed = True
+    for path in (
+        unit_root / "evdb-backup@.service.d" / DATA_DROPIN,
+        unit_root / "evdb-backup-test.service.d" / DATA_DROPIN,
+    ):
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            changed = True
+        _remove_empty_parent(path.parent, unit_root)
+    for marker in unit_root.glob(f"evdb-backup@*.timer.d/{TIMER_MARKER}"):
+        marker.unlink()
+        changed = True
+        _remove_empty_parent(marker.parent, unit_root)
+    if changed:
+        run(["systemctl", "daemon-reload"], timeout=60)
+
+
+def _remove_empty_parent(path: Path, stop: Path) -> None:
+    if path == stop or not path.exists():
+        return
+    with suppress(OSError):
+        path.rmdir()
+
+
+def _remove_tool(tool: Path) -> None:
+    stable = _stable_path(tool)
+    if stable is not None and (stable.exists() or stable.is_symlink()):
+        target = _link_target(stable)
+        expected = tool / "current/bin/evdb"
+        if target is None or target.resolve(strict=False) != expected.resolve(strict=False):
+            raise HostError(f"stable command path is not managed by evdb: {stable}")
+        stable.unlink()
+    _safe_remove_tree(tool, "tool root")
+
+
+def _purge(config: Config) -> None:
+    for path, label in (
+        (config.paths.config, "config root"),
+        (config.paths.state, "state root"),
+        (config.host.data_root, "data root"),
+    ):
+        _safe_remove_tree(path, label)
+    _remove_service_account(config.paths)
+
+
+def _safe_remove_tree(path: Path, label: str) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink():
+        raise HostError(f"refusing to remove symlinked {label}: {path}")
+    resolved = path.resolve(strict=False)
+    if resolved == Path("/") or len(resolved.parts) < 3:
+        raise HostError(f"refusing to remove unsafe {label}: {path}")
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _remove_service_account(paths: Paths) -> None:
+    if paths.config != Path("/etc/evdb"):
+        return
+    user = run(["getent", "passwd", "evdb"], timeout=30, check=False)
+    if user.code == 0:
+        fields = user.out.strip().split(":")
+        if len(fields) >= 7 and fields[5] == str(paths.state):
+            run(["userdel", "evdb"], timeout=60, check=False)
+    group = run(["getent", "group", "evdb"], timeout=30, check=False)
+    if group.code == 0:
+        run(["groupdel", "evdb"], timeout=60, check=False)
+
+
+def _container_owned(name: str, project: str) -> bool:
+    labels = _container_labels(name)
+    return labels.get("com.docker.compose.project") == project and bool(
+        labels.get(compose.CONTRACT_LABEL)
+    )
+
+
+def _container_labels(name: str) -> dict[str, str]:
+    result = run(["docker", "inspect", name], timeout=30, check=False)
+    if result.code != 0:
+        return {}
+    try:
+        return json.loads(result.out)[0].get("Config", {}).get("Labels", {}) or {}
+    except json.JSONDecodeError, IndexError, TypeError:
+        return {}
 
 
 def _directories(config: Config) -> None:

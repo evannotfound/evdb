@@ -93,7 +93,7 @@ def parser() -> argparse.ArgumentParser:
     live_restore.add_argument("backup", nargs="?")
     live_restore.add_argument("--yes", action="store_true")
 
-    host = commands.add_parser("host", help="check, set up, or update this host")
+    host = commands.add_parser("host", help="check, set up, update, or uninstall this host")
     host_commands = host.add_subparsers(dest="host_command", required=True)
     host_check = host_commands.add_parser("check")
     host_check.add_argument("--json", action="store_true")
@@ -111,6 +111,9 @@ def parser() -> argparse.ArgumentParser:
     update = host_commands.add_parser("update")
     update.add_argument("version", nargs="?")
     update.add_argument("--yes", action="store_true")
+    uninstall = host_commands.add_parser("uninstall")
+    uninstall.add_argument("--purge", action="store_true")
+    uninstall.add_argument("--yes", action="store_true")
     return result
 
 
@@ -175,7 +178,7 @@ def main(
                 output(_host_setup(source, values, False, input_fn, output))
                 return 0
         config = load(args.config)
-        if _mutating(args):
+        if _mutating(args) and not _uninstalling(args):
             require_no_orphans(config)
         if args.command is None:
             return interactive.run(
@@ -269,6 +272,9 @@ def _dispatch_command(
             value = host.check(config)
             output(status.dumps(value) if args.json else status.render(value))
             return 0 if value["healthy"] else 1
+        if args.host_command == "uninstall":
+            output(_host_uninstall(config, args.purge, args.yes, input_fn, output))
+            return 0
         version = _required(args.version, "version", "1.2.3", input_fn)
         output(_host_update(config, version, args.yes, input_fn, output))
         return 0
@@ -662,6 +668,17 @@ def _host_update(config, version, yes, input_fn, output):
     )
 
 
+def _host_uninstall(config, purge, yes, input_fn, output):
+    from . import host
+
+    return host.uninstall(
+        config,
+        purge=purge,
+        yes=yes,
+        confirm=lambda text: _confirm(text, False, input_fn, output),
+    )
+
+
 def _required(value, name, example, input_fn):
     if value:
         return value
@@ -705,7 +722,7 @@ def _require_host_access(source: Path, args) -> None:
     if not _canonical(source) or _host_access_allowed():
         return
     if args.command is None or (
-        args.command == "host" and args.host_command in {"setup", "update"}
+        args.command == "host" and args.host_command in {"setup", "update", "uninstall"}
     ):
         raise Error("host access requires root; run sudo evdb")
     try:
@@ -731,6 +748,10 @@ def _canonical(source: Path) -> bool:
     )
 
 
+def _uninstalling(args) -> bool:
+    return args.command == "host" and args.host_command == "uninstall"
+
+
 def _mutating(args) -> bool:
     if args.command is None or args.command in {"restore"}:
         return True
@@ -739,7 +760,7 @@ def _mutating(args) -> bool:
     if args.command == "backup":
         return args.backup_command != "list"
     if args.command == "host":
-        return args.host_command in {"setup", "update"}
+        return args.host_command in {"setup", "update", "uninstall"}
     return False
 
 

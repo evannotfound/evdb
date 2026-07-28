@@ -31,6 +31,7 @@ from evdb.run import Result
         (["host", "check"], "host", "check"),
         (["host", "setup"], "host", "setup"),
         (["host", "update", "1.2.3"], "host", "update"),
+        (["host", "uninstall", "--purge"], "host", "uninstall"),
     ],
 )
 def test_grouped_parser_contract(argv, command, subcommand):
@@ -277,6 +278,29 @@ def test_keyboard_interrupt_reports_cancelled_without_traceback(monkeypatch):
 
     assert code == 130
     assert output == ["Cancelled"]
+
+
+def test_host_uninstall_forwards_purge_and_yes(config, monkeypatch):
+    monkeypatch.setattr(cli, "_canonical", lambda source: True)
+    monkeypatch.setattr(cli, "_host_access_allowed", lambda: True)
+    monkeypatch.setattr(cli, "load", lambda path: config)
+    calls = []
+
+    def uninstall(config, purge, yes, input_fn, output):
+        calls.append((config.host.id, purge, yes, input_fn is not None, output is not None))
+        return "Host uninstalled and local data purged"
+
+    monkeypatch.setattr(cli, "_host_uninstall", uninstall)
+    output = []
+
+    code = cli.main(
+        ["--config", str(config.paths.source), "host", "uninstall", "--purge", "--yes"],
+        output=output.append,
+    )
+
+    assert code == 0
+    assert calls == [(config.host.id, True, True, True, True)]
+    assert output == ["Host uninstalled and local data purged"]
 
 
 def test_restore_forwards_exact_backup_and_yes_to_domain(config, monkeypatch):

@@ -235,6 +235,59 @@ def test_setup_waits_for_native_infrastructure_health(config, tmp_path, monkeypa
     assert sleeps == [1]
 
 
+def test_uninstall_preserves_local_data_and_removes_runtime(config, tmp_path, monkeypatch):
+    units = tmp_path / "systemd"
+    _installed_host(config, units)
+    calls = _mock_uninstall_run(config, monkeypatch, orphan_project="evdb-old-kv")
+
+    result = host.uninstall(config, yes=True, unit_dir=units)
+
+    assert result == "Host uninstalled; local data preserved"
+    assert config.paths.config.exists()
+    assert config.paths.state.exists()
+    assert config.host.data_root.exists()
+    assert not config.paths.tool.exists()
+    assert not any(units.glob("evdb-*.service"))
+    assert not any(units.glob("evdb-*.timer"))
+    assert (
+        compose.command(
+            config.paths.traefik / "compose.yaml",
+            compose.TRAEFIK_PROJECT,
+            "down",
+            "--remove-orphans",
+        )
+        in calls
+    )
+    assert ["docker", "rm", "--force", "orphan-1"] in calls
+    assert ["docker", "network", "rm", compose.NETWORK] in calls
+
+
+def test_uninstall_purge_removes_local_managed_data(config, tmp_path, monkeypatch):
+    units = tmp_path / "systemd"
+    _installed_host(config, units)
+    calls = _mock_uninstall_run(config, monkeypatch)
+
+    result = host.uninstall(config, purge=True, yes=True, unit_dir=units)
+
+    assert result == "Host uninstalled and local data purged"
+    assert not config.paths.config.exists()
+    assert not config.paths.state.exists()
+    assert not config.host.data_root.exists()
+    assert not config.paths.tool.exists()
+    assert not any(call[0] in {"userdel", "groupdel"} for call in calls)
+
+
+def test_uninstall_refuses_unowned_network(config, tmp_path, monkeypatch):
+    units = tmp_path / "systemd"
+    _installed_host(config, units)
+    _mock_uninstall_run(config, monkeypatch, network_owned=False)
+
+    with pytest.raises(HostError, match="Docker network is not owned"):
+        host.uninstall(config, yes=True, unit_dir=units)
+
+    assert config.paths.tool.exists()
+
+
 def test_setup_checks_prerequisites_ports_and_writable_roots_before_mutation(
     paths, tmp_path, monkeypatch
 ):
@@ -483,6 +536,53 @@ def _systemctl(args, timer_state):
         name = args[2]
         timer_state[name] = (timer_state.get(name, (False, False))[0], args[1] == "start")
     return Result(tuple(args), 0, "", "")
+
+
+def _installed_host(config, units):
+    config.paths.source.parent.mkdir(parents=True)
+    config.paths.source.write_text(dump(config))
+    config.paths.state.mkdir(parents=True)
+    config.host.data_root.mkdir(parents=True)
+    (config.paths.tool / "versions/1.0.0/bin").mkdir(parents=True)
+    (config.paths.tool / "versions/1.0.0/bin/evdb").write_text("evdb")
+    (config.paths.traefik).mkdir(parents=True)
+    (config.paths.traefik / "compose.yaml").write_text("name: evdb-traefik\n")
+    for database in config.databases:
+        database.compose.parent.mkdir(parents=True)
+        database.compose.write_text(f"name: {database.compose_project}\n")
+        database.data.mkdir(parents=True, exist_ok=True)
+    host._install_units(units)
+
+
+def _mock_uninstall_run(config, monkeypatch, *, orphan_project=None, network_owned=True):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        del kwargs
+        calls.append(args)
+        if args[0] == "systemd-escape":
+            return Result(tuple(args), 0, _escaped_timer(args[-1]) + "\n", "")
+        if args[:3] == ["docker", "network", "inspect"]:
+            labels = {compose.NETWORK_LABEL: "true" if network_owned else "false"}
+            return Result(tuple(args), 0, json.dumps([{"Labels": labels}]), "")
+        if args[:2] == ["docker", "inspect"]:
+            name = args[2]
+            if name == compose.TRAEFIK_CONTAINER:
+                project = compose.TRAEFIK_PROJECT
+            elif name == "orphan-1":
+                project = orphan_project
+            else:
+                return Result(tuple(args), 1, "", "not found")
+            labels = {"com.docker.compose.project": project, compose.CONTRACT_LABEL: "hash"}
+            return Result(tuple(args), 0, json.dumps([{"Config": {"Labels": labels}}]), "")
+        if args[:2] == ["docker", "ps"]:
+            return Result(tuple(args), 0, "orphan-1\n" if orphan_project else "", "")
+        if args[0] == "getent":
+            return Result(tuple(args), 1, "", "not found")
+        return Result(tuple(args), 0, "", "")
+
+    monkeypatch.setattr(host, "run", fake_run)
+    return calls
 
 
 def test_exact_update_uses_candidate_units_preserves_timers_and_cleans_versions(
