@@ -279,7 +279,7 @@ def test_replace_role_changes_only_selected_database():
 def test_machine_state_round_trip_and_stable_port(config):
     role = RoleState(
         "redis",
-        {"primary": ImageState("redis:7.2.5", DIGEST)},
+        {"primary": ImageState("redis:7.2.5", DIGEST, 7)},
         http_port=14001,
         compose_hash="abc",
         installed=True,
@@ -292,6 +292,10 @@ def test_machine_state_round_trip_and_stable_port(config):
     assert loaded == state
     assert loaded.roles["app-test-01/kv"].http_port == 14001
     assert json.loads(config.paths.machine_state.read_text()) == state_dict(state)
+    assert json.loads(config.paths.machine_state.read_text())["version"] == 1
+    assert json.loads(config.paths.machine_state.read_text())["roles"]["app-test-01/kv"][
+        "images"
+    ]["primary"]["major"] == 7
     assert config.paths.machine_state.stat().st_mode & 0o777 == 0o600
 
 
@@ -437,6 +441,44 @@ def test_machine_state_requires_current_writer_fields(config):
     )
 
     with pytest.raises(ConfigError, match="tool_version is required"):
+        load_state(config)
+
+
+def test_machine_state_requires_released_v1_image_shape(config):
+    path = config.paths.machine_state
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": STATE_VERSION,
+                "host": config.host.id,
+                "tool_version": "1.0.0",
+                "images": {"traefik": {"source": "traefik:v3.7.8", "digest": DIGEST}},
+                "roles": {},
+            }
+        )
+    )
+
+    with pytest.raises(ConfigError, match="machine state.images.traefik.major is required"):
+        load_state(config)
+
+
+def test_machine_state_rejects_future_versions(config):
+    path = config.paths.machine_state
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": STATE_VERSION + 1,
+                "host": config.host.id,
+                "tool_version": "1.0.0",
+                "images": {},
+                "roles": {},
+            }
+        )
+    )
+
+    with pytest.raises(ConfigError, match="unsupported machine state version"):
         load_state(config)
 
 

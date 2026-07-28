@@ -39,7 +39,9 @@ Source configuration SHALL live at `/etc/evdb/host.yml`, generated database asse
 - **THEN** its Compose path is `/etc/evdb/projects/example-prod-01/postgres/compose.yaml` and its data path ends in `/example-prod-01/postgres/data`
 
 ### Requirement: Machine-owned host state
-The system SHALL store resolved image digests, stable HTTP loopback ports, schema versions, generated Compose hashes, installed flags, installed tool version, and operation results in private machine-owned state under `/var/lib/evdb/state`. Operators SHALL NOT need to edit or commit this state. State loading SHALL require the complete current writer-owned schema for the recorded version and SHALL reject missing or malformed fields instead of synthesizing compatibility defaults. Image engine majors SHALL be derived from each image source when needed rather than stored as independent state.
+The system SHALL store resolved image digests, image source majors for the released v1 state contract, stable HTTP loopback ports, schema versions, generated Compose hashes, installed flags, installed tool version, and operation results in private machine-owned state under `/var/lib/evdb/state`. Operators SHALL NOT need to edit or commit this state. State loading SHALL require the complete writer-owned schema for the recorded supported version and SHALL reject missing or malformed fields instead of synthesizing compatibility defaults. Runtime engine compatibility checks SHALL derive majors from image sources rather than trusting stored major state.
+
+Future state-version bumps SHALL provide explicit sequential migrations from every supported released version. Candidate update checks SHALL be able to read old supported state without modifying it, and writers SHALL emit only the current state version after activation.
 
 #### Scenario: New KV receives an HTTP port
 - **WHEN** an HTTP-enabled KV role is added

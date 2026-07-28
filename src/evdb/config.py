@@ -21,7 +21,7 @@ from .images import state as resolve_image
 CONFIG_DIR = Path("/etc/evdb")
 STATE_DIR = Path("/var/lib/evdb")
 TOOL_DIR = Path("/opt/evdb")
-STATE_VERSION = 2
+STATE_VERSION = 1
 DEFAULT_RETENTION = {"daily": 7, "weekly": 4, "monthly": 12, "data_parts": 12}
 DEFAULT_TIMEOUTS = {
     "command": 300,
@@ -285,6 +285,7 @@ class Config:
 class ImageState:
     source: str
     digest: str
+    major: int | None
 
     @property
     def image(self) -> str:
@@ -1082,17 +1083,20 @@ def _machine_state(value: Any) -> MachineState:
 
 def _image_state(value: Any, name: str) -> ImageState:
     data = _mapping(value, name)
-    _only(data, {"source", "digest"}, name)
+    _only(data, {"source", "digest", "major"}, name)
     source = _required_string(data, "source", name)
     validate_source(source, f"{name}.source")
     digest = _required_string(data, "digest", name)
     if source_digest(f"image@{digest}", f"{name}.digest") != digest:
         raise ConfigError(f"{name}.digest is invalid")
-    return ImageState(source, digest)
+    major = _required(data, "major", name)
+    if major is not None and (type(major) is not int or major < 1):
+        raise ConfigError(f"{name}.major must be a positive integer or null")
+    return ImageState(source, digest, major)
 
 
 def _image_state_dict(value: ImageState) -> dict[str, Any]:
-    return {"source": value.source, "digest": value.digest}
+    return {"source": value.source, "digest": value.digest, "major": value.major}
 
 
 class _UniqueLoader(yaml.SafeLoader):
