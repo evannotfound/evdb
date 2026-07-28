@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import sys
 import time
 from contextlib import suppress
@@ -127,6 +128,7 @@ def main(
     args = parser().parse_args(argv)
     try:
         source = Path(args.config)
+        _require_host_access(source, args)
         if _mutating(args) and not _canonical(source):
             raise Error(
                 f"alternate --config is read-only; mutating commands require "
@@ -183,6 +185,9 @@ def main(
                 output=output,
             )
         return _dispatch(config, args, input_fn, output, terminal_output=terminal_output)
+    except KeyboardInterrupt:
+        output("Cancelled")
+        return 130
     except (Error, OSError, ValueError) as exc:
         error(f"evdb: {exc}")
         return 1
@@ -694,6 +699,30 @@ def _confirm(text, yes, input_fn, output):
 
 def _tty() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _require_host_access(source: Path, args) -> None:
+    if not _canonical(source) or _host_access_allowed():
+        return
+    if args.command is None or (
+        args.command == "host" and args.host_command in {"setup", "update"}
+    ):
+        raise Error("host access requires root; run sudo evdb")
+    try:
+        blocked = source.parent.exists() and not os.access(source.parent, os.X_OK)
+    except OSError:
+        blocked = True
+    if blocked or source.exists() or os.path.lexists(source):
+        raise Error("host access requires root; run sudo evdb")
+
+
+def _host_access_allowed() -> bool:
+    if os.geteuid() == 0:
+        return True
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name == "evdb"
+    except KeyError:
+        return False
 
 
 def _canonical(source: Path) -> bool:

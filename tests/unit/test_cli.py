@@ -108,6 +108,7 @@ def test_database_info_rejects_injected_output_even_when_stdout_is_terminal(conf
 
 def test_non_tty_initial_setup_names_missing_option_and_example(paths, monkeypatch):
     monkeypatch.setattr(cli, "_canonical", lambda source: True)
+    monkeypatch.setattr(cli, "_host_access_allowed", lambda: True)
     monkeypatch.setattr(cli, "_tty", lambda: False)
     errors = []
 
@@ -241,6 +242,41 @@ def test_non_tty_restore_requires_explicit_backup_with_example(config, monkeypat
     assert code == 1
     assert "backup is required" in errors[0]
     assert "latest" in errors[0]
+
+
+def test_canonical_host_access_requires_root_before_setup_prompt(monkeypatch):
+    monkeypatch.setattr(cli, "_canonical", lambda source: True)
+    monkeypatch.setattr(cli, "_host_access_allowed", lambda: False)
+    errors = []
+
+    code = cli.main([], output=lambda value: None, error=errors.append)
+
+    assert code == 1
+    assert errors == ["evdb: host access requires root; run sudo evdb"]
+
+
+def test_service_user_may_read_canonical_host(config, monkeypatch):
+    monkeypatch.setattr(cli, "_canonical", lambda source: True)
+    monkeypatch.setattr(cli, "_host_access_allowed", lambda: True)
+    monkeypatch.setattr(cli, "load", lambda path: config)
+    monkeypatch.setattr(cli.status, "collect", lambda *args: {"healthy": True, "errors": []})
+    output = []
+
+    code = cli.main(["status", "--json"], output=output.append)
+
+    assert code == 0
+    assert output
+
+
+def test_keyboard_interrupt_reports_cancelled_without_traceback(monkeypatch):
+    monkeypatch.setattr(cli, "_canonical", lambda source: False)
+    monkeypatch.setattr(cli, "load", lambda path: (_ for _ in ()).throw(KeyboardInterrupt()))
+    output = []
+
+    code = cli.main(["--config", "/tmp/host.yml", "status"], output=output.append)
+
+    assert code == 130
+    assert output == ["Cancelled"]
 
 
 def test_restore_forwards_exact_backup_and_yes_to_domain(config, monkeypatch):
