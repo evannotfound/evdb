@@ -1,12 +1,12 @@
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from evdb.config import Paths, load
+from evdb.config import load
+from evdb.models import Paths
 
 ROOT = Path(__file__).parents[1]
-FIXTURES = ROOT / "tests/fixtures/config"
+FIXTURE = ROOT / "tests/fixtures/config"
 
 
 @pytest.fixture
@@ -14,20 +14,19 @@ def paths(tmp_path):
     return Paths(
         config=tmp_path / "etc/evdb",
         state=tmp_path / "var/lib/evdb",
-        tool=tmp_path / "opt/evdb",
     )
 
 
 @pytest.fixture
-def config(tmp_path, paths):
-    source = load(FIXTURES / "combined/host.yml", paths=paths)
-    host = replace(
-        source.host,
-        data_root=tmp_path / "data",
-        backup=replace(
-            source.host.backup,
-            repos={"postgres": str(tmp_path / "pg-repo"), "kv": str(tmp_path / "kv-repo")},
-            min_free_gb=0,
-        ),
-    )
-    return replace(source, host=host)
+def config(paths, tmp_path):
+    paths.config.mkdir(parents=True)
+    text = (FIXTURE / "config.yml").read_text()
+    text = text.replace("/srv/evdb-test", str(tmp_path / "data"))
+    text = text.replace("/tmp/evdb-repository", str(tmp_path / "repository"))
+    paths.source.write_text(text)
+    paths.source.chmod(0o640)
+    paths.secrets.write_bytes((FIXTURE / "secrets.yml").read_bytes())
+    paths.secrets.chmod(0o600)
+    paths.rclone.write_bytes((FIXTURE / "rclone.conf").read_bytes())
+    paths.rclone.chmod(0o600)
+    return load(paths.source, paths=paths)

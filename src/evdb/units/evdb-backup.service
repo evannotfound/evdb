@@ -1,0 +1,17 @@
+[Unit]
+Description=Back up all durable evdb databases
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=evdb
+Group=evdb
+ExecStart=/usr/local/bin/evdb backup create --all
+TimeoutStartSec=12h
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+CPUSchedulingPolicy=idle
+PrivateTmp=true
+NoNewPrivileges=true

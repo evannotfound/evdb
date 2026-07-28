@@ -1,209 +1,193 @@
 from __future__ import annotations
 
-import sys
+import shutil
+import socket
+import ssl
 import time
-from pathlib import Path
+import uuid
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
+import pytest
+import yaml
 
-from fixtures.containers import (  # noqa: E402
-    POSTGRES_IMAGE,
-    REDIS_IMAGE,
-    TRAEFIK_IMAGE,
-    command,
-    container,
-    docker_exec,
-    network,
-    port_bindings,
-    require_image,
-    unique_name,
-    wait_exec,
-)
+from evdb.run import run
+
+REDIS_IMAGE = "redis:7.2.5"
+TRAEFIK_IMAGE = "traefik:v3.7.8"
 
 
-def test_traefik_tls_sni_isolates_two_projects_with_shared_role_hostnames():
-    for image in (POSTGRES_IMAGE, REDIS_IMAGE, TRAEFIK_IMAGE):
-        require_image(image)
-    names = {
-        "pg1": unique_name("sni-pg1"),
-        "pg2": unique_name("sni-pg2"),
-        "kv1": unique_name("sni-kv1"),
-        "kv2": unique_name("sni-kv2"),
-        "traefik": unique_name("sni-traefik"),
+def test_traefik_tls_sni_isolates_two_disposable_redis_backends(tmp_path):
+    _require_docker()
+    if shutil.which("openssl") is None:
+        pytest.fail("openssl is required for the Traefik integration")
+    suffix = uuid.uuid4().hex[:12]
+    network = f"evdb-traefik-it-{suffix}"
+    proxy = f"evdb-traefik-it-proxy-{suffix}"
+    hosts = {
+        f"alpha-{suffix}.test.invalid": (f"evdb-traefik-it-alpha-{suffix}", "alpha"),
+        f"beta-{suffix}.test.invalid": (f"evdb-traefik-it-beta-{suffix}", "beta"),
     }
-    domains = {
-        "one": "one.project.test",
-        "two": "two.project.test",
-    }
+    containers = [name for name, _value in hosts.values()]
+    containers.append(proxy)
+    created_network = False
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    dynamic = tmp_path / "dynamic.yml"
+    hostnames = tuple(hosts)
+    run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            f"/CN={hostnames[0]}",
+            "-addext",
+            f"subjectAltName=DNS:{hostnames[0]},DNS:{hostnames[1]}",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+        ],
+        timeout=60,
+    )
+    dynamic.write_text(
+        yaml.safe_dump(
+            {
+                "tls": {
+                    "certificates": [{"certFile": "/config/cert.pem", "keyFile": "/config/key.pem"}]
+                },
+                "tcp": {
+                    "routers": {
+                        value: {
+                            "entryPoints": ["redis"],
+                            "rule": f"HostSNI(`{hostname}`)",
+                            "service": value,
+                            "tls": {},
+                        }
+                        for hostname, (_container, value) in hosts.items()
+                    },
+                    "services": {
+                        value: {"loadBalancer": {"servers": [{"address": f"{container}:6379"}]}}
+                        for container, value in hosts.values()
+                    },
+                },
+            },
+            sort_keys=False,
+        )
+    )
 
-    with (
-        network() as network_name,
-        container(
-            POSTGRES_IMAGE,
-            names["pg1"],
-            env={"POSTGRES_USER": "default", "POSTGRES_HOST_AUTH_METHOD": "trust"},
-            network_name=network_name,
-            labels=_labels("postgres", "pg1", domains["one"], network_name, 5432),
-            memory="1g",
-        ),
-        container(
-            POSTGRES_IMAGE,
-            names["pg2"],
-            env={"POSTGRES_USER": "default", "POSTGRES_HOST_AUTH_METHOD": "trust"},
-            network_name=network_name,
-            labels=_labels("postgres", "pg2", domains["two"], network_name, 5432),
-            memory="1g",
-        ),
-        container(
-            REDIS_IMAGE,
-            names["kv1"],
-            ["redis-server", "--save", "", "--appendonly", "no"],
-            network_name=network_name,
-            labels=_labels("kv", "kv1", domains["one"], network_name, 6379),
-        ),
-        container(
-            REDIS_IMAGE,
-            names["kv2"],
-            ["redis-server", "--save", "", "--appendonly", "no"],
-            network_name=network_name,
-            labels=_labels("kv", "kv2", domains["two"], network_name, 6379),
-        ),
-    ):
-        for name in (names["pg1"], names["pg2"]):
-            wait_exec(name, ["pg_isready", "-U", "default", "-d", "postgres"])
-        for name in (names["kv1"], names["kv2"]):
-            wait_exec(name, ["redis-cli", "PING"])
-        _retry(
+    try:
+        run(["docker", "network", "create", network], timeout=60)
+        created_network = True
+        for container, value in hosts.values():
+            run(
+                [
+                    "docker",
+                    "run",
+                    "--detach",
+                    "--name",
+                    container,
+                    "--network",
+                    network,
+                    REDIS_IMAGE,
+                ],
+                timeout=600,
+            )
+            _redis_set(container, value)
+        run(
             [
                 "docker",
-                "exec",
-                names["pg1"],
-                "psql",
-                "-U",
-                "default",
-                "-d",
-                "postgres",
-                "-c",
-                "CREATE TABLE IF NOT EXISTS route(value text); "
-                "TRUNCATE route; INSERT INTO route VALUES ('postgres-one')",
+                "run",
+                "--detach",
+                "--name",
+                proxy,
+                "--network",
+                network,
+                "--publish",
+                "127.0.0.1::8443/tcp",
+                "--volume",
+                f"{tmp_path}:/config:ro",
+                TRAEFIK_IMAGE,
+                "--entrypoints.redis.address=:8443",
+                "--providers.file.filename=/config/dynamic.yml",
+                "--providers.file.watch=false",
             ],
+            timeout=600,
         )
-        _retry(
-            [
-                "docker",
-                "exec",
-                names["pg2"],
-                "psql",
-                "-U",
-                "default",
-                "-d",
-                "postgres",
-                "-c",
-                "CREATE TABLE IF NOT EXISTS route(value text); "
-                "TRUNCATE route; INSERT INTO route VALUES ('postgres-two')",
-            ],
+        port = int(
+            run(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    '{{(index (index .NetworkSettings.Ports "8443/tcp") 0).HostPort}}',
+                    proxy,
+                ],
+                timeout=30,
+            ).out.strip()
         )
-        docker_exec(names["kv1"], ["redis-cli", "SET", "route", "redis-one"])
-        docker_exec(names["kv2"], ["redis-cli", "SET", "route", "redis-two"])
 
-        with container(
-            TRAEFIK_IMAGE,
-            names["traefik"],
-            [
-                "--providers.docker=true",
-                "--providers.docker.exposedbydefault=false",
-                f"--providers.docker.network={network_name}",
-                "--entrypoints.postgres.address=:5432",
-                "--entrypoints.kv.address=:6379",
-            ],
-            mounts=[(Path("/var/run/docker.sock"), "/var/run/docker.sock", True)],
-            network_name=network_name,
-            publish=["127.0.0.1::5432", "127.0.0.1::6379"],
-        ):
-            postgres_port = _port(names["traefik"], "5432/tcp")
-            kv_port = _port(names["traefik"], "6379/tcp")
-            assert _postgres(domains["one"], postgres_port) == "postgres-one"
-            assert _postgres(domains["two"], postgres_port) == "postgres-two"
-            assert _redis(domains["one"], kv_port) == "redis-one"
-            assert _redis(domains["two"], kv_port) == "redis-two"
+        assert {hostname: _tls_get(port, hostname) for hostname in hosts} == {
+            hostname: value for hostname, (_container, value) in hosts.items()
+        }
+    finally:
+        for container in reversed(containers):
+            run(["docker", "rm", "--force", "--volumes", container], timeout=120, check=False)
+        if created_network:
+            run(["docker", "network", "rm", network], timeout=60, check=False)
 
 
-def _labels(entrypoint: str, key: str, domain: str, network_name: str, port: int) -> dict:
-    return {
-        "traefik.enable": "true",
-        "traefik.docker.network": network_name,
-        f"traefik.tcp.routers.{key}.entrypoints": entrypoint,
-        f"traefik.tcp.routers.{key}.rule": f"HostSNI(`{domain}`)",
-        f"traefik.tcp.routers.{key}.tls": "true",
-        f"traefik.tcp.services.{key}.loadbalancer.server.port": str(port),
-    }
+def _redis_set(container: str, value: str) -> None:
+    deadline = time.monotonic() + 30
+    while True:
+        result = run(
+            ["docker", "exec", container, "redis-cli", "SET", "route", value],
+            timeout=10,
+            check=False,
+        )
+        if result.code == 0 and result.out.strip() == "OK":
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail(result.err.strip() or f"Redis did not become ready: {container}")
+        time.sleep(0.2)
 
 
-def _port(name: str, key: str) -> int:
-    bindings = port_bindings(name)[key] or []
-    assert len(bindings) == 1
-    assert bindings[0]["HostIp"] == "127.0.0.1"
-    return int(bindings[0]["HostPort"])
-
-
-def _postgres(domain: str, port: int) -> str:
-    result = _retry(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            "host",
-            "--add-host",
-            f"{domain}:127.0.0.1",
-            POSTGRES_IMAGE,
-            "psql",
-            f"postgresql://default@{domain}:{port}/postgres?sslmode=require",
-            "-X",
-            "-A",
-            "-t",
-            "-c",
-            "SELECT value FROM route",
-        ]
-    )
-    return result.stdout.strip()
-
-
-def _redis(domain: str, port: int) -> str:
-    result = _retry(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            "host",
-            "--add-host",
-            f"{domain}:127.0.0.1",
-            REDIS_IMAGE,
-            "redis-cli",
-            "--tls",
-            "--insecure",
-            "--sni",
-            domain,
-            "-h",
-            domain,
-            "-p",
-            str(port),
-            "--raw",
-            "GET",
-            "route",
-        ]
-    )
-    return result.stdout.strip()
-
-
-def _retry(args: list[str]):
-    deadline = time.monotonic() + 60
-    result = None
+def _tls_get(port: int, hostname: str) -> str:
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    deadline = time.monotonic() + 30
+    error: Exception | None = None
     while time.monotonic() < deadline:
-        result = command(args, check=False, timeout=30)
-        if result.returncode == 0:
-            return result
-        time.sleep(0.5)
-    assert result is not None
-    raise AssertionError(result.stderr or result.stdout)
+        try:
+            with (
+                socket.create_connection(("127.0.0.1", port), timeout=2) as plain,
+                context.wrap_socket(plain, server_hostname=hostname) as secure,
+            ):
+                secure.sendall(b"*2\r\n$3\r\nGET\r\n$5\r\nroute\r\n")
+                with secure.makefile("rb") as source:
+                    size = source.readline()
+                    if not size.startswith(b"$"):
+                        raise ValueError(f"unexpected Redis response: {size!r}")
+                    value = source.read(int(size[1:]))
+                    if source.read(2) != b"\r\n":
+                        raise ValueError("incomplete Redis response")
+                    return value.decode()
+        except (OSError, ssl.SSLError, UnicodeError, ValueError) as exc:
+            error = exc
+            time.sleep(0.2)
+    pytest.fail(f"Traefik TLS route for {hostname} did not become ready: {error}")
+
+
+def _require_docker() -> None:
+    if socket.gethostname().split(".", 1)[0] == "montreal-01":
+        pytest.skip("disposable Docker tests are forbidden on montreal-01")
+    if shutil.which("docker") is None:
+        pytest.skip("Docker is unavailable")
+    result = run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=30, check=False)
+    if result.code:
+        pytest.skip(f"Docker daemon is unavailable: {result.err.strip() or result.out.strip()}")

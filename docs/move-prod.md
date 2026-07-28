@@ -1,31 +1,11 @@
 # Production migration boundary
 
-Production conversion is a separate OpenSpec change. Do not execute production migration while
-implementing or testing the host-local manager.
+Production conversion is a separate OpenSpec change. The `simplify-v1` implementation and validation
+must not mutate `montreal-01` or attempt to convert its pre-v1 files.
 
-That change must inventory every live project, concrete engine, image, Compose identity, data path,
-native domain, HTTP endpoint, credential file, timer, cron entry, Restic repository, and external
-proxy route. It must resolve project/role naming collisions and compare all live facts with the
-proposed host source before mutation.
+Repository development and CI use disposable containers, temporary host paths, synthetic credentials,
+and local Restic repositories only. The guarded VPS workflow may target an explicitly approved
+non-production host and rejects `montreal-01` before any copy, remote command, or link change.
 
-The migration requires reviewed recovery points and explicit ownership boundaries:
-
-1. Confirm a fresh checked backup, exact Restic snapshot, and recent isolated backup test for every
-   durable role.
-2. Record current Compose, data, listener, DNS, external HTTP route, credential, and schedule state.
-3. Define the dedicated native Traefik cutover without taking ports from an existing listener.
-4. Define credential import without writing secrets to Git, command arguments, logs, or migration
-   artifacts.
-5. Stage one role at a time, preserving concrete engine, major version, data, and public contracts.
-6. Prove native SNI and loopback HTTP isolation before moving another role.
-7. Enable packaged timers only after backup, status, and restore checks pass.
-8. Keep prior files, schedules, routes, and every migration safety backup until observation and
-   rollback windows close.
-
-The production rollback must restore prior service definitions, routing ownership, and schedule
-state without moving or deleting database data. The external HTTP proxy owner handles its own
-route, certificate, and DNS recovery. Repository format upgrades, prune, engine migration, secret
-rotation, and old-file deletion do not belong in the cutover.
-
-Repository development and CI must not load, validate, or invoke commands against the production
-configuration. They use disposable temporary paths and local test repositories only.
+The future production change owns inventory, naming, data compatibility, credential import, routing,
+scheduling, and cutover procedures. None of those procedures are part of the v1 development workflow.

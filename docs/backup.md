@@ -4,55 +4,50 @@
 
 ```sh
 evdb backup create app-prod-01/postgres
+evdb backup create --all
 evdb backup list app-prod-01/postgres
-evdb backup test app-prod-01/postgres latest
-evdb backup retention app-prod-01/postgres --dry-run
-evdb backup retention app-prod-01/postgres
-evdb backup prune postgres
-evdb backup repository-check postgres --rotate
 ```
 
 `backup create` runs on the authoritative host for one durable project/role. It reports a remote
 recovery point only after engine validation, manifest hashing, and Restic upload all succeed.
-Cache-mode KV rejects backup creation.
+Cache-mode KV has backups disabled. `backup create --all` processes every durable role sequentially,
+continues after an individual failure, and exits nonzero if any role failed.
 
 Each run starts in a private `<time>.partial` folder under
 `/var/lib/evdb/backups/<project>/<role>`. Completion requires nonempty engine files, size and
 SHA-256 checks, and a valid `backup.json`; only then is the folder renamed. The record includes
-host, project, role, concrete engine, source and locked image, engine version, format, timestamps,
-purpose, content facts, files, checks, and upload result.
+host, project, role, concrete engine, configured image, engine version, format, timestamps, purpose,
+files, checks, hashes, and upload state.
 
 Postgres stores globals and one custom archive for every connectable non-template database. Redis
 waits for a successful new BGSAVE and checks the RDB. Dragonfly creates one uniquely named native
 DFS generation, copies its summary and every numbered shard, and removes only those temporary
-source files. Backup records contain bounded facts and hashes, not raw sampled values or
-credentials.
+source files. Backup records contain bounded facts and hashes, not credentials.
 
-## History and testing
+## One host repository
 
-`backup list` merges local folders and stable Restic snapshots in reverse time order. Every row
-shows purpose, local and remote availability, snapshot identity, and that exact backup's latest
-verification. A remote-only backup remains visible after local retention.
+`/etc/evdb/config.yml` defines one Restic repository for the host. All snapshots use host, project,
+role, concrete engine, backup, and purpose tags. `evdb init` checks that repository and initializes a
+missing format-v1 repository through rclone before enabling automatic backups. Restic creates an
+absent remote path as part of initialization; no separate remote-directory command is required.
 
-`backup test` selects an exact local backup or Restic snapshot, verifies its identity and hashes,
-and restores it into an isolated same-engine container with no live mounts, routes, aliases, or
-published ports. Postgres checks restored catalogs. Redis and Dragonfly compare database and key
-counts, key types, sampled hashes, and TTL behavior. Temporary resources are removed after success,
-failure, timeout, or interruption; live data never changes.
+`backup list` merges valid local folders and matching tagged Restic snapshots in reverse chronological
+order. Each item shows purpose, local and remote availability, backup ID, and snapshot ID. A
+remote-only snapshot remains visible after local cleanup.
 
-## Retention and failures
+## Scheduling and limits
 
-The policy defaults to 7 daily, 4 weekly, and 12 monthly snapshots per durable project/role.
-Retention runs without prune; prune is a separate monthly repository operation. Repository checks
-rotate through configured data subsets. All grouping uses stable host/project/role tags rather than
-mutable image metadata.
+`evdb init` installs and automatically enables one persistent randomized daily timer. Its service runs
+`evdb backup create --all` at low CPU and I/O priority, so databases added later are included without
+new unit instances.
 
-Run and review `backup retention PROJECT/ROLE --dry-run` before enabling deletion for that role.
-evdb records approval for the exact repository, role tags, and retention policy; a changed
-repository or policy requires another reviewed dry run. Scheduled retention fails closed until the
-matching review exists.
+All but the two newest uploaded local backups are cleaned up. Incomplete and failed-upload local
+backups remain available for diagnosis. Remote snapshots are never deleted by evdb v1 and therefore
+grow indefinitely.
 
-At least two newest uploaded local backups are retained, and unuploaded backups are never deleted
-automatically. A failed new upload remains separate from the most recent confirmed snapshot. A
-failed backup test remains attached to its selected backup. One role's failure does not overwrite
-another role's result or stop independent scheduled work.
+Recovery uses `backup list`, Restic, and the matching Postgres, Redis, or Dragonfly tools manually.
+Backup manifests retain the engine, image, file, size, and hash information needed for that work.
+
+Backup output replaces exact managed credential values and their required encoded forms. Repository
+URLs, rclone remote names, local paths, image references, backup IDs, snapshot IDs, and unrelated
+Restic output remain visible.

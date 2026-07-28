@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -10,6 +11,12 @@ from pathlib import Path
 from typing import IO
 
 from .errors import CommandError
+
+_ANSI = re.compile(
+    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"
+    r"|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)"
+    r"|\x1b[@-_]"
+)
 
 
 @dataclass(frozen=True)
@@ -24,7 +31,16 @@ def redact(text: str, secrets: Sequence[str] = ()) -> str:
     result = text
     for secret in sorted((item for item in secrets if item), key=len, reverse=True):
         result = result.replace(secret, "<redacted>")
-    return result
+    return clean(result)
+
+
+def clean(text: str) -> str:
+    text = _ANSI.sub("", text)
+    return "".join(
+        character
+        for character in text
+        if character in "\n\t" or not (ord(character) < 32 or 0x7F <= ord(character) <= 0x9F)
+    )
 
 
 def run(

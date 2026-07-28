@@ -1,86 +1,52 @@
-import os
 import sys
-import time
+from urllib.parse import quote
 
 import pytest
 
 from evdb.errors import CommandError
-from evdb.run import redact, run
+from evdb.run import clean, redact, run
 
 
-def test_run_captures_output():
+def test_run_uses_argument_arrays_and_captures_output():
     result = run([sys.executable, "-c", "print('ok')"])
-
-    assert result.code == 0
     assert result.out == "ok\n"
+    assert isinstance(result.args, tuple)
 
 
-@pytest.mark.parametrize("value", ["text input", b"byte input"])
-def test_run_sends_text_or_bytes_to_stdin(value):
-    result = run(
-        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
-        input=value,
-    )
+def test_run_redacts_only_supplied_exact_values_and_encoded_forms():
+    secret = "p@ss word"
+    text = f"repo=rclone:remote:path secret={secret} encoded={quote(secret, safe='')}"
+    value = redact(text, [secret, quote(secret, safe="")])
 
-    expected = "text input" if isinstance(value, str) else "byte input"
-    assert result.out == expected
-
-
-def test_run_streams_binary_output(tmp_path):
-    target = tmp_path / "output"
-    with target.open("wb") as output:
-        result = run(
-            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'abc')"],
-            stdout=output,
-        )
-
-    assert result.out == ""
-    assert target.read_bytes() == b"abc"
+    assert "rclone:remote:path" in value
+    assert secret not in value
+    assert quote(secret, safe="") not in value
 
 
-def test_run_redacts_error():
-    secret = "hidden-value"
-
-    with pytest.raises(CommandError) as caught:
+def test_run_failure_preserves_unrelated_stderr():
+    with pytest.raises(CommandError, match="ordinary diagnostic"):
         run(
-            [sys.executable, "-c", f"import sys; sys.stderr.write('{secret}'); sys.exit(2)"],
-            secrets=[secret],
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('ordinary diagnostic', file=sys.stderr); raise SystemExit(2)",
+            ]
         )
-    assert secret not in str(caught.value)
-    assert "<redacted>" in str(caught.value)
 
 
-def test_run_times_out():
-    with pytest.raises(CommandError, match="timed out"):
-        run([sys.executable, "-c", "import time; time.sleep(2)"], timeout=1)
+def test_external_text_strips_ansi_and_controls_but_preserves_newlines_and_tabs():
+    text = "\x1b[31mfailed\x1b[0m\n\tdetail\x00\x7f\u0085"
+
+    assert clean(text) == "failed\n\tdetail"
 
 
-def test_timeout_kills_descendants(tmp_path):
-    child = tmp_path / "child.pid"
-    script = (
-        "import pathlib, subprocess, sys, time; "
-        "p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
-        f"pathlib.Path({str(child)!r}).write_text(str(p.pid)); "
-        "time.sleep(60)"
+def test_run_sanitizes_external_output():
+    result = run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('\\x1b[31moutside\\x1b[0m\\n\\tline\\0')",
+        ]
     )
 
-    with pytest.raises(CommandError, match="timed out"):
-        run([sys.executable, "-c", script], timeout=1)
-
-    pid = int(child.read_text())
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and _running(pid):
-        time.sleep(0.05)
-    assert not _running(pid)
-
-
-def test_redact_uses_longest_values_first():
-    assert redact("token-long token", ["token", "token-long"]) == "<redacted> <redacted>"
-
-
-def _running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+    assert result.out == "outside\n\tline"

@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import json
-import secrets as random
-import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 from .. import docker
-from ..config import Config, Database, MachineState
-from ..errors import BackupError, CommandError, RestoreError
-from ..run import run
+from ..errors import BackupError, CommandError, ConfigError
+from ..models import Database, Postgres
 
 DATABASE_SQL = (
     "SELECT json_build_object('name',datname,'owner',pg_get_userbyid(datdba))::text "
@@ -23,34 +20,104 @@ OBJECT_SQL = (
 )
 
 
-def health(
-    container: str,
-    *,
-    user: str = "default",
-    database: str = "postgres",
-    timeout: int = 10,
-) -> bool:
+def validate(settings: Postgres) -> None:
+    from ..config import validate_image
+
+    if not isinstance(settings, Postgres):
+        raise ConfigError("postgres settings are invalid")
+    validate_image(settings.image, "postgres image")
+    pool = settings.pgbouncer
+    validate_image(pool.image, "pgbouncer image")
+    if type(pool.enabled) is not bool:
+        raise ConfigError("pgbouncer.enabled must be a boolean")
+    for name in ("max_clients", "pool_size", "reserve_size"):
+        if type(getattr(pool, name)) is not int or getattr(pool, name) < 1:
+            raise ConfigError(f"pgbouncer.{name} must be positive")
+
+
+def files(database: Database) -> dict[str, str]:
+    password = database.credentials.password
+    values = {"postgres-password": password + "\n"}
+    if database.settings.pgbouncer.enabled:
+
+        def quoted(value: str) -> str:
+            return '"' + value.replace('"', '""') + '"'
+
+        values["pgbouncer-users"] = f"{quoted('default')} {quoted(password)}\n"
+        pool = database.settings.pgbouncer
+        values["pgbouncer.ini"] = (
+            "[databases]\n"
+            f"* = host={database.service('primary')} port=5432\n\n"
+            "[pgbouncer]\n"
+            "listen_addr = 0.0.0.0\n"
+            "listen_port = 5432\n"
+            "auth_type = plain\n"
+            "auth_file = /run/secrets/pgbouncer-users\n"
+            f"max_client_conn = {pool.max_clients}\n"
+            f"default_pool_size = {pool.pool_size}\n"
+            f"reserve_pool_size = {pool.reserve_size}\n"
+            "ignore_startup_parameters = extra_float_digits\n"
+        )
+    return values
+
+
+def services(database: Database) -> dict[str, Any]:
+    primary = database.service("primary")
+    generated = database.generated
+    service: dict[str, Any] = {
+        "image": database.settings.image,
+        "container_name": primary,
+        "restart": "unless-stopped",
+        "environment": {
+            "POSTGRES_USER": "default",
+            "POSTGRES_DB": "postgres",
+            "POSTGRES_PASSWORD_FILE": "/run/secrets/postgres-password",
+        },
+        "volumes": [
+            f"{database.data}:/var/lib/postgresql/data",
+            f"{generated / 'postgres-password'}:/run/secrets/postgres-password:ro",
+        ],
+        "networks": {docker.NETWORK: {"aliases": [primary]}},
+    }
+    values = {primary: service}
+    route = service
+    if database.settings.pgbouncer.enabled:
+        pool = database.service("pgbouncer")
+        uid, gid = _owner(generated)
+        values[pool] = {
+            "image": database.settings.pgbouncer.image,
+            "container_name": pool,
+            "restart": "unless-stopped",
+            "user": f"{uid}:{gid}",
+            "command": ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"],
+            "depends_on": [primary],
+            "healthcheck": docker.healthcheck(
+                ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "default"]
+            ),
+            "volumes": [
+                f"{generated / 'pgbouncer.ini'}:/etc/pgbouncer/pgbouncer.ini:ro",
+                f"{generated / 'pgbouncer-users'}:/run/secrets/pgbouncer-users:ro",
+            ],
+            "networks": {docker.NETWORK: {"aliases": [pool]}},
+        }
+        route = values[pool]
+    route["labels"] = docker.route(database, 5432)
+    return values
+
+
+def health(database: Database, *, timeout: int = 10) -> bool:
     result = docker.exec(
-        container,
-        ["pg_isready", "-U", user, "-d", database],
+        database.service("primary"),
+        ["pg_isready", "-U", "default", "-d", "postgres"],
         timeout=timeout,
         check=False,
     )
-    return result.code == 0
-
-
-def pool_health(
-    container: str,
-    password: str,
-    *,
-    user: str = "default",
-    database: str = "postgres",
-    timeout: int = 10,
-) -> bool:
-    environment = {"PGPASSWORD": password, "PGCONNECT_TIMEOUT": "5"}
+    if result.code != 0 or not database.settings.pgbouncer.enabled:
+        return result.code == 0
+    environment = {"PGPASSWORD": database.credentials.password, "PGCONNECT_TIMEOUT": "5"}
     try:
         result = docker.exec(
-            container,
+            database.service("pgbouncer"),
             [
                 "psql",
                 "-X",
@@ -63,15 +130,15 @@ def pool_health(
                 "-p",
                 "5432",
                 "-U",
-                user,
+                "default",
                 "-d",
-                database,
+                "postgres",
                 "-c",
                 "SELECT 1",
             ],
             env=environment,
+            secrets=(database.credentials.password,),
             timeout=timeout,
-            secrets=[password],
             check=False,
         )
     except CommandError:
@@ -79,23 +146,28 @@ def pool_health(
     return result.code == 0 and result.out.strip() == "1"
 
 
-def backup(
-    config: Config,
-    database: Database,
-    folder: Path,
-    run_id: str,
-    state: MachineState,
-) -> dict[str, Any]:
-    del config, run_id
-    container = _container(database)
-    user = database.settings.user
-    rows = _psql(container, user, "postgres", DATABASE_SQL).splitlines()
+def info(database: Database) -> dict[str, Any]:
+    version = _psql(database.service("primary"), "postgres", "SHOW server_version", timeout=10)
+    pool = database.settings.pgbouncer
+    return {
+        "version": version,
+        "username": "default",
+        "database": "postgres",
+        "pgbouncer": pool.enabled,
+        "max_clients": pool.max_clients,
+        "pool_size": pool.pool_size,
+        "reserve_size": pool.reserve_size,
+    }
+
+
+def backup(database: Database, folder: Path, _run_id: str) -> dict[str, Any]:
+    container = database.service("primary")
+    rows = _psql(container, "postgres", DATABASE_SQL, timeout=120).splitlines()
     databases = [json.loads(row) for row in rows]
     if not databases:
         raise BackupError(f"{database.identity}: no databases found")
-    database_dir = folder / "databases"
-    database_dir.mkdir(mode=0o700)
-    files = []
+    (folder / "databases").mkdir(mode=0o700)
+    names = []
     objects = {}
     for item in databases:
         name = item["name"]
@@ -104,137 +176,38 @@ def backup(
         with target.open("wb") as output:
             docker.exec(
                 container,
-                ["pg_dump", "-Fc", "--no-password", "-U", user, "-d", name],
+                ["pg_dump", "-Fc", "--no-password", "-U", "default", "-d", name],
                 stdout=output,
                 timeout=7200,
             )
         target.chmod(0o600)
-        _check_archive(state.roles[database.identity].images["primary"].image, target)
-        objects[name] = int(_psql(container, user, name, OBJECT_SQL))
-        files.append(relative)
+        _check_archive(database.image, target)
+        objects[name] = int(_psql(container, name, OBJECT_SQL, timeout=120))
+        names.append(relative)
     globals_file = folder / "globals.sql"
     with globals_file.open("wb") as output:
         docker.exec(
             container,
-            ["pg_dumpall", "--globals-only", "--no-password", "-U", user],
+            ["pg_dumpall", "--globals-only", "--no-password", "-U", "default"],
             stdout=output,
             timeout=1800,
         )
-    globals_file.chmod(0o600)
-    if globals_file.stat().st_size == 0:
+    if not globals_file.stat().st_size:
         raise BackupError(f"{database.identity}: globals.sql is empty")
-    files.append("globals.sql")
-    version = _psql(container, user, "postgres", "SHOW server_version")
+    globals_file.chmod(0o600)
+    names.append("globals.sql")
     return {
         "format": "postgres-custom-v1",
-        "version": version,
+        "version": _psql(container, "postgres", "SHOW server_version", timeout=120),
         "databases": [item["name"] for item in databases],
         "owners": {item["name"]: item["owner"] for item in databases},
         "objects": objects,
-        "files": files,
+        "files": names,
     }
 
 
-def restore(
-    config: Config,
-    database: Database,
-    folder: Path,
-    name: str,
-    work: Path,
-    state: MachineState,
-    record: dict[str, Any],
-) -> dict[str, Any]:
-    del config
-    if work.exists() and (not work.is_dir() or any(work.iterdir())):
-        raise RestoreError("Postgres restore candidate directory is not empty")
-    work.mkdir(mode=0o700, exist_ok=True)
-    password = random.token_urlsafe(32)
-    image = state.roles[database.identity].images["primary"].image
-    docker.start(
-        image,
-        name,
-        mounts=[(work, "/var/lib/postgresql/data", False)],
-        env={
-            "POSTGRES_USER": "restore_admin",
-            "POSTGRES_PASSWORD": password,
-            "POSTGRES_INITDB_ARGS": "--auth-host=scram-sha-256",
-        },
-        memory="2g",
-        network="none",
-        timeout=300,
-        secrets=[password],
-    )
-    _wait(name)
-    docker.copy(folder / "globals.sql", f"{name}:/tmp/globals.sql")
-    docker.exec(
-        name,
-        [
-            "psql",
-            "-X",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-U",
-            "restore_admin",
-            "-d",
-            "postgres",
-            "-f",
-            "/tmp/globals.sql",
-        ],
-        timeout=600,
-    )
-    restored = {}
-    owners = record.get("facts", {}).get("owners", {})
-    for archive in sorted((folder / "databases").glob("*.dump")):
-        db_name = unquote(archive.stem)
-        owner = owners.get(db_name, "restore_admin")
-        remote = f"/tmp/{archive.name}"
-        docker.copy(archive, f"{name}:{remote}")
-        if db_name != "postgres":
-            docker.exec(
-                name,
-                [
-                    "createdb",
-                    "-U",
-                    "restore_admin",
-                    "-T",
-                    "template0",
-                    "-O",
-                    owner,
-                    db_name,
-                ],
-                timeout=120,
-            )
-        elif owner != "restore_admin":
-            escaped = owner.replace('"', '""')
-            docker.exec(
-                name,
-                [
-                    "psql",
-                    "-X",
-                    "-v",
-                    "ON_ERROR_STOP=1",
-                    "-U",
-                    "restore_admin",
-                    "-d",
-                    "postgres",
-                    "-c",
-                    f'ALTER DATABASE postgres OWNER TO "{escaped}"',
-                ],
-            )
-        docker.exec(
-            name,
-            ["pg_restore", "--exit-on-error", "-U", "restore_admin", "-d", db_name, remote],
-            timeout=7200,
-        )
-        restored[db_name] = int(_psql(name, "restore_admin", db_name, OBJECT_SQL))
-    expected = record.get("facts", {}).get("objects", {})
-    if expected and restored != expected:
-        raise RestoreError(f"Postgres object counts differ: {restored} != {expected}")
-    return {"databases": sorted(restored), "objects": restored}
-
-
-def _psql(container: str, user: str, database: str, sql: str) -> str:
-    result = docker.exec(
+def _psql(container: str, database: str, sql: str, *, timeout: int) -> str:
+    return docker.exec(
         container,
         [
             "psql",
@@ -244,20 +217,21 @@ def _psql(container: str, user: str, database: str, sql: str) -> str:
             "-v",
             "ON_ERROR_STOP=1",
             "-U",
-            user,
+            "default",
             "-d",
             database,
             "-c",
             sql,
         ],
-        timeout=120,
-    )
-    return result.out.strip()
+        timeout=timeout,
+    ).out.strip()
 
 
 def _check_archive(image: str, archive: Path) -> None:
-    if not archive.is_file() or archive.stat().st_size == 0:
+    if not archive.is_file() or not archive.stat().st_size:
         raise BackupError(f"{archive.name} is empty")
+    from ..run import run
+
     run(
         [
             "docker",
@@ -276,19 +250,9 @@ def _check_archive(image: str, archive: Path) -> None:
     )
 
 
-def _wait(name: str, timeout: int = 120) -> None:
-    deadline = time.monotonic() + timeout
-    ready = 0
-    while time.monotonic() < deadline:
-        if health(name, user="restore_admin"):
-            ready += 1
-            if ready == 2:
-                return
-        else:
-            ready = 0
-        time.sleep(1)
-    raise RestoreError("Postgres restore container did not become ready")
-
-
-def _container(database: Database) -> str:
-    return f"evdb-{database.project}-{database.role}-primary"
+def _owner(path: Path) -> tuple[int, int]:
+    current = path
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    details = current.stat()
+    return details.st_uid, details.st_gid

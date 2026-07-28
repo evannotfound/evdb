@@ -1,794 +1,388 @@
-import json
 from dataclasses import replace
-from urllib.parse import parse_qs, unquote, urlsplit
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from evdb import backup, compose, database, secrets
-from evdb.config import dump, load_state, replace_role, resolve_state, write_state
-from evdb.errors import CommandError, ConfigError, DatabaseError
-from evdb.run import Result
-
-DIGEST = "sha256:" + "a" * 64
+import evdb.config as config_module
+from evdb import backup, database
+from evdb.config import load, write
+from evdb.errors import CommandError, DatabaseError
 
 
-def _prepare(config, monkeypatch):
-    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
-    state = resolve_state(config, resolver=lambda source: DIGEST)
-    roles = {name: replace(role, installed=True) for name, role in state.roles.items()}
-    state = replace(state, roles=roles)
-    config.paths.source.parent.mkdir(parents=True, exist_ok=True)
-    config.paths.source.write_text(dump(config))
-    write_state(config, state)
-    for target in config.databases:
-        secrets.ensure(config, target, generate=lambda: "private-value")
-        compose.write(target.compose, compose.database(config, target, state))
-    return state
-
-
-def test_add_defaults_kv_to_dragonfly_and_commits_once(config, monkeypatch):
-    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
+def _runtime(monkeypatch):
     calls = []
+    monkeypatch.setattr(database.docker, "validate_compose", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
-    )
-
-    change = database.prepare_add(
-        config,
-        "queue-prod-01",
-        "kv",
-        resolver=lambda source: DIGEST,
-        generate=lambda: "private-value",
-    )
-    result = database.commit(change, check_health=lambda *args, **kwargs: None)
-
-    added = change.after.select("queue-prod-01/kv")
-    assert added.engine == "dragonfly"
-    assert (added.settings.memory, added.settings.threads) == ("256mb", 1)
-    assert result["status"] == "healthy"
-    assert len([args for args in calls if "up" in args and "-d" in args]) == 1
-    assert all("--remove-orphans" in args for args in calls if "up" in args)
-    assert load_state(change.after).roles[added.identity].installed
-    assert "engine: dragonfly" in change.after.paths.source.read_text()
-    assert result["credential"] == "generated"
-
-
-def test_add_postgres_accepts_supplied_initial_password(config, monkeypatch):
-    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
-    monkeypatch.setattr(database, "run", lambda args, **kwargs: Result(tuple(args), 0, "", ""))
-
-    change = database.prepare_add(
-        config,
-        "pg-prod-01",
-        "postgres",
-        resolver=lambda source: DIGEST,
-        initial_password='p w "quoted" \\ slash',
-    )
-    files = {item.path.name: item.content for item in change.secret_files}
-
-    assert change.credential == "supplied"
-    assert "Credential: supplied" in change.preview()
-    assert 'p w "quoted" \\ slash' not in change.preview().replace("supplied", "")
-    assert files["password"] == 'p w "quoted" \\ slash\n'
-    assert files["pgbouncer-users"] == '"default" "p w ""quoted"" \\ slash"\n'
-
-    result = database.commit(change, check_health=lambda *args, **kwargs: None)
-
-    assert result["status"] == "healthy"
-    assert result["credential"] == "supplied"
-    persisted = (
-        change.after.paths.source.read_text()
-        + change.after.paths.machine_state.read_text()
-        + change.after.paths.activity.read_text()
-        + json.dumps(result)
-    )
-    assert 'p w "quoted" \\ slash' not in persisted
-
-
-@pytest.mark.parametrize("value", ["", "line\nbreak", "carriage\rreturn", "nul\0byte"])
-def test_add_rejects_invalid_initial_password(config, monkeypatch, value):
-    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
-
-    with pytest.raises(ConfigError, match="database password"):
-        database.prepare_add(
-            config,
-            "pg-prod-01",
-            "postgres",
-            resolver=lambda source: DIGEST,
-            initial_password=value,
-        )
-
-
-def test_matching_postgres_add_accepts_same_password_and_rejects_rotation(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-
-    same = database.prepare_add(
-        config,
-        "app-test-01",
-        "postgres",
-        state=state,
-        resolver=lambda source: DIGEST,
-        initial_password="private-value",
-    )
-
-    assert same.noop
-
-    with pytest.raises(DatabaseError, match="password rotation"):
-        database.prepare_add(
-            config,
-            "app-test-01",
-            "postgres",
-            state=state,
-            resolver=lambda source: DIGEST,
-            initial_password="different-value",
-        )
-
-
-def test_initial_password_is_only_valid_for_postgres(config, monkeypatch):
-    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
-
-    with pytest.raises(DatabaseError, match="only valid for Postgres"):
-        database.prepare_add(
-            config,
-            "queue-prod-01",
-            "kv",
-            resolver=lambda source: DIGEST,
-            initial_password="private-value",
-        )
-
-
-def test_matching_add_is_idempotent(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-
-    change = database.prepare_add(
-        config,
-        "app-test-01",
-        "kv",
-        state=state,
-        resolver=lambda source: DIGEST,
-    )
-
-    assert change.noop
-    assert database.commit(change) == {
-        "database": "app-test-01/kv",
-        "changed": [],
-        "status": "unchanged",
-    }
-
-
-def test_configure_previews_and_uses_one_restart_after_safety_backup(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    calls = []
-    monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
-    )
-    backups = []
-
-    def backup_create(*args, **kwargs):
-        backups.append((args, kwargs))
-        current = load_state(config)
-        role = current.roles["app-test-01/postgres"]
-        write_state(
-            config,
-            replace(
-                current,
-                roles={
-                    **current.roles,
-                    "app-test-01/postgres": replace(
-                        role,
-                        operations={"backup": {"backup": "safety", "ok": True}},
-                    ),
-                },
-            ),
-        )
-        return {"snapshot": "snapshot-1"}
-
-    change = database.prepare_configure(
-        config,
-        "app-test-01/postgres",
-        {"image": "postgres:16.1", "max_clients": 30},
-        state=state,
-        resolver=lambda source: DIGEST,
-    )
-
-    assert "image" in change.preview()
-    assert "max_clients" in change.preview()
-    assert change.safety_backup
-    result = database.commit(
-        change,
-        backup_create=backup_create,
-        check_health=lambda *args, **kwargs: None,
-    )
-
-    assert result["safety_snapshot"] == "snapshot-1"
-    assert backups[0][1] == {"purpose": "safety", "lock_held": True}
-    assert len([args for args in calls if "up" in args and "-d" in args]) == 1
-    assert all("--remove-orphans" in args for args in calls if "up" in args)
-    operations = load_state(change.after).roles[change.database.identity].operations
-    assert operations["backup"]["backup"] == "safety"
-    assert change.after.paths.source.stat().st_mode & 0o777 == 0o640
-    assert change.after.paths.previous.stat().st_mode & 0o777 == 0o640
-    assert change.database.compose.stat().st_mode & 0o777 == 0o640
-    assert change.after.paths.machine_state.stat().st_mode & 0o777 == 0o600
-
-
-def test_safety_backup_without_snapshot_aborts_before_install(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    source = config.paths.source.read_bytes()
-    calls = []
-    monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
-    )
-    change = database.prepare_configure(
-        config,
-        "app-test-01/postgres",
-        {"image": "postgres:16.1"},
-        state=state,
-        resolver=lambda value: DIGEST,
-    )
-
-    with pytest.raises(DatabaseError, match="confirmed snapshot"):
-        database.commit(change, backup_create=lambda *args, **kwargs: {"snapshot": None})
-
-    assert config.paths.source.read_bytes() == source
-    assert not calls
-    activity = json.loads(config.paths.activity.read_text())
-    assert activity["result"] == "failed"
-    assert activity["command"] == "database configure"
-
-
-def test_snapshot_preparation_failure_records_confirmed_activity(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    change = database.prepare_configure(
-        config,
-        "app-test-01/kv",
-        {"http_connections": 44},
-        state=state,
-        resolver=lambda value: DIGEST,
-    )
-    monkeypatch.setattr(
-        database,
-        "_snapshot",
-        lambda paths: (_ for _ in ()).throw(OSError("snapshot unavailable")),
-    )
-
-    with pytest.raises(OSError, match="snapshot unavailable"):
-        database.commit(change)
-
-    activity = json.loads(config.paths.activity.read_text())
-    assert activity["result"] == "failed"
-    assert activity["command"] == "database configure"
-
-
-def test_service_contracts_limit_safety_backup_to_primary_changes(config, monkeypatch):
-    target = config.select("app-test-01/kv")
-    durable = replace_role(config, target, replace(target.settings, mode="durable"))
-    state = _prepare(durable, monkeypatch)
-    target = durable.select(target.identity)
-    before = compose.database(durable, target, state)
-    primary_name = "evdb-app-test-01-kv-primary"
-
-    sidecar = database.prepare_configure(
-        durable,
-        target.identity,
-        {"http_connections": target.settings.http.connections + 1},
-        state=state,
-        resolver=lambda source: DIGEST,
-    )
-    primary = database.prepare_configure(
-        durable,
-        target.identity,
-        {"mode": "cache"},
-        state=state,
-        resolver=lambda source: DIGEST,
-    )
-
-    assert not sidecar.safety_backup
-    assert before["services"][primary_name] == sidecar.compose_data["services"][primary_name]
-    assert primary.safety_backup
-    assert before["services"][primary_name] != primary.compose_data["services"][primary_name]
-    sidecar.cancel()
-    primary.cancel()
-
-
-def test_http_disable_and_reenable_preserves_port_and_reads_or_creates_token(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    target = config.select("app-test-01/kv")
-    port = state.roles[target.identity].http_port
-    calls = []
-    monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
-    )
-
-    disabled = database.prepare_configure(
-        config,
-        target.identity,
-        {"http": False},
-        state=state,
-        resolver=lambda source: DIGEST,
-    )
-    database.commit(disabled, check_health=lambda *args, **kwargs: None)
-    disabled_config = disabled.after
-    disabled_state = load_state(disabled_config)
-    token_path = secrets.path(disabled_config, disabled.database, "http-token")
-
-    assert disabled_state.roles[target.identity].http_port == port
-    assert token_path.read_text().strip() == "private-value"
-
-    existing = database.prepare_configure(
-        disabled_config,
-        target.identity,
-        {"http": True},
-        state=disabled_state,
-        resolver=lambda source: DIGEST,
-        generate=lambda: "unused-token",
-    )
-    existing_token = next(item for item in existing.secret_files if item.path.name == "http-token")
-    assert existing.after_state.roles[target.identity].http_port == port
-    assert existing_token.content == "private-value\n"
-    existing.cancel()
-
-    token_path.unlink()
-    generated = database.prepare_configure(
-        disabled_config,
-        target.identity,
-        {"http": True},
-        state=disabled_state,
-        resolver=lambda source: DIGEST,
-        generate=lambda: "new-http-token",
-    )
-    generated_token = next(
-        item for item in generated.secret_files if item.path.name == "http-token"
-    )
-    assert generated.after_state.roles[target.identity].http_port == port
-    assert generated_token.content == "new-http-token\n"
-    assert not token_path.exists()
-
-    database.commit(generated, check_health=lambda *args, **kwargs: None)
-    assert token_path.read_text().strip() == "new-http-token"
-    assert all("--remove-orphans" in args for args in calls if "up" in args)
-
-
-def test_major_and_engine_specific_changes_fail_before_compose(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-
-    with pytest.raises(DatabaseError, match="major changes"):
-        database.prepare_configure(
-            config,
-            "app-test-01/kv",
-            {"image": "redis:8"},
-            state=state,
-            resolver=lambda source: DIGEST,
-        )
-    with pytest.raises(DatabaseError, match="only valid for dragonfly"):
-        database.prepare_configure(
-            config,
-            "app-test-01/kv",
-            {"threads": 4},
-            state=state,
-            resolver=lambda source: DIGEST,
-        )
-
-
-def test_failed_candidate_restores_exact_files_and_prior_health(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    source = config.paths.source.read_bytes()
-    target = config.select("app-test-01/kv")
-    prior_compose = target.compose.read_bytes()
-    calls = []
-    monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
-    )
-    checks = 0
-
-    def health(*args, **kwargs):
-        nonlocal checks
-        checks += 1
-        if checks == 1:
-            raise DatabaseError("candidate unhealthy")
-
-    change = database.prepare_configure(
-        config,
-        target.identity,
-        {"http_connections": 33},
-        state=state,
-        resolver=lambda source: DIGEST,
-    )
-
-    with pytest.raises(DatabaseError, match="prior service recovered"):
-        database.commit(change, check_health=health)
-
-    assert config.paths.source.read_bytes() == source
-    assert target.compose.read_bytes() == prior_compose
-    assert checks == 2
-    assert not change.transaction.exists()
-    assert len([args for args in calls if "up" in args and "-d" in args]) == 2
-    assert all("--remove-orphans" in args for args in calls if "up" in args)
-
-
-def test_interrupted_candidate_restores_prior_files_and_health(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    source = config.paths.source.read_bytes()
-    target = config.select("app-test-01/kv")
-    prior_compose = target.compose.read_bytes()
-    monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: Result(tuple(args), 0, "", ""),
-    )
-    checks = 0
-
-    def health(*args, **kwargs):
-        nonlocal checks
-        checks += 1
-        if checks == 1:
-            raise KeyboardInterrupt()
-
-    change = database.prepare_configure(
-        config,
-        target.identity,
-        {"http_connections": 33},
-        state=state,
-        resolver=lambda source: DIGEST,
-    )
-
-    with pytest.raises(DatabaseError, match="prior service recovered"):
-        database.commit(change, check_health=health)
-
-    assert config.paths.source.read_bytes() == source
-    assert target.compose.read_bytes() == prior_compose
-    assert checks == 2
-    assert not change.transaction.exists()
-
-
-def test_failed_recovery_preserves_diagnostics(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: Result(tuple(args), 0, "", ""),
-    )
-    change = database.prepare_configure(
-        config,
-        "app-test-01/kv",
-        {"http_connections": 34},
-        state=state,
-        resolver=lambda source: DIGEST,
-    )
-
-    with pytest.raises(DatabaseError, match="recovery failed"):
-        database.commit(
-            change,
-            check_health=lambda *args, **kwargs: (_ for _ in ()).throw(DatabaseError("unhealthy")),
-        )
-
-    assert change.transaction.is_dir()
-    assert (change.transaction / "transaction.json").is_file()
-
-
-def test_preview_fingerprint_blocks_changed_source(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    change = database.prepare_configure(
-        config,
-        "app-test-01/kv",
-        {"http_connections": 35},
-        state=state,
-        resolver=lambda source: DIGEST,
-    )
-    config.paths.source.write_text(config.paths.source.read_text() + "\n")
-
-    with pytest.raises(DatabaseError, match="changed after preview"):
-        database.commit(change, check_health=lambda *args, **kwargs: None)
-
-
-def test_orphaned_installed_role_blocks_mutation_without_deleting_it(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    orphan = replace(state.roles["app-test-01/kv"], installed=True)
-    state = replace(state, roles={**state.roles, "old-prod-01/kv": orphan})
-
-    with pytest.raises(ConfigError, match="removal is unsupported"):
-        database.prepare_configure(
-            config,
-            "app-test-01/kv",
-            {"http_connections": 40},
-            state=state,
-            resolver=lambda source: DIGEST,
-        )
-
-    assert "old-prod-01/kv" in state.roles
-
-
-def test_lifecycle_uses_only_the_selected_compose_project(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    target = config.select("app-test-01/kv")
-    calls = []
-    monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "bounded logs\n", ""),
+        database.docker,
+        "up",
+        lambda path, project, **kwargs: calls.append(("up", Path(path), project)),
     )
     monkeypatch.setattr(database, "health", lambda *args, **kwargs: None)
-
-    database.start(config, target, state=state)
-    database.stop(config, target, state=state)
-    database.restart(config, target, state=state)
-    text = database.logs(config, target, lines=20)
-
-    assert text == "bounded logs\n"
-    assert all(target.compose_project in args for args in calls)
-    assert not any("app-test-01-postgres" in args for args in calls)
-    assert calls[-1][-4:] == ["logs", "--no-color", "--tail", "20"]
+    return calls
 
 
-def test_add_failure_stops_candidate_before_cleanup_and_removes_empty_assets(config, monkeypatch):
-    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
-    calls = []
+def test_add_persists_source_credentials_and_generated_files_before_start(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    monkeypatch.setattr(database.random, "token_urlsafe", lambda size: "generated-value")
 
-    def fake_run(args, **kwargs):
-        calls.append(args)
-        if "up" in args and "-d" in args:
-            raise CommandError("start failed")
-        if args[-1] == "stop":
-            assert change.database.compose.is_file()
-        return Result(tuple(args), 0, "", "")
+    updated = database.add(config, "queue-prod-01", "kv")
 
-    monkeypatch.setattr(database, "run", fake_run)
-    change = database.prepare_add(
+    target = updated.select("queue-prod-01/kv")
+    loaded = load(updated.paths.source, paths=updated.paths)
+    assert loaded.select(target.identity).engine == "dragonfly"
+    assert loaded.select(target.identity).credentials.password == "generated-value"
+    assert target.compose.is_file()
+    assert (target.generated / "dragonfly.flags").is_file()
+    assert calls == [("up", target.compose, target.compose_project)]
+
+
+def test_failed_creation_leaves_readable_source_and_generated_files(config, monkeypatch):
+    monkeypatch.setattr(database.random, "token_urlsafe", lambda size: "generated-value")
+    monkeypatch.setattr(database.docker, "validate_compose", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        database.docker,
+        "up",
+        lambda *args, **kwargs: (_ for _ in ()).throw(CommandError("compose failed")),
+    )
+
+    with pytest.raises(CommandError, match="compose failed"):
+        database.add(config, "new-prod-01", "postgres")
+
+    loaded = load(config.paths.source, paths=config.paths)
+    target = loaded.select("new-prod-01/postgres")
+    assert target.compose.is_file()
+    assert (target.generated / "postgres-password").is_file()
+
+
+def test_start_rerenders_current_source_before_compose(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    calls = _runtime(monkeypatch)
+
+    database.start(config, target)
+
+    assert target.compose.is_file()
+    assert calls[0][0] == "up"
+    assert target.image in target.compose.read_text()
+
+
+def test_configure_writes_and_invokes_compose_once(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    target = config.select("app-test-01/kv")
+
+    updated = database.configure(
         config,
-        "new-prod-01",
-        "postgres",
-        resolver=lambda source: DIGEST,
-        generate=lambda: "private-value",
+        target,
+        {"http_connections": 40, "mode": "cache"},
     )
 
-    with pytest.raises(DatabaseError, match="candidate services stopped"):
-        database.commit(change, check_health=lambda *args, **kwargs: None)
-
-    assert any(args[-1:] == ["stop"] for args in calls)
-    assert not change.database.compose.exists()
-    assert not change.database.data.exists()
+    changed = updated.select(target.identity)
+    assert changed.settings.http.connections == 40
+    assert changed.settings.mode == "cache"
+    assert len(calls) == 1
 
 
-def test_add_failure_preserves_nonempty_transaction_data(config, monkeypatch):
-    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
-    change = database.prepare_add(
-        config,
-        "new-prod-01",
-        "postgres",
-        resolver=lambda source: DIGEST,
-        generate=lambda: "private-value",
-    )
+def test_logs_are_bounded_and_pass_exact_credentials_for_redaction(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    target.compose.parent.mkdir(parents=True)
+    target.compose.write_text("services: {}\n")
+    seen = {}
 
-    def fake_run(args, **kwargs):
-        if "up" in args and "-d" in args:
-            (change.database.data / "created-by-engine").write_text("diagnostic")
-            raise CommandError("start failed")
-        return Result(tuple(args), 0, "", "")
+    def logs(path, project, lines, **kwargs):
+        seen.update(lines=lines, secrets=kwargs["secrets"])
+        return "repository visible; local-kv-password\n"
 
-    monkeypatch.setattr(database, "run", fake_run)
+    monkeypatch.setattr(database.docker, "logs", logs)
 
-    with pytest.raises(DatabaseError, match="candidate services stopped"):
-        database.commit(change, check_health=lambda *args, **kwargs: None)
-
-    assert (change.database.data / "created-by-engine").read_text() == "diagnostic"
+    assert "repository visible" in database.logs(config, target, lines=25)
+    assert seen["lines"] == 25
+    assert "local-kv-password" in seen["secrets"]
 
 
-def test_add_stop_failure_preserves_candidate_definition_diagnostics_and_redacted_log(
-    config, monkeypatch, capsys
-):
-    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
-    change = database.prepare_add(
-        config,
-        "new-prod-01",
-        "postgres",
-        resolver=lambda source: DIGEST,
-        generate=lambda: "private-value",
-    )
-
-    def fake_run(args, **kwargs):
-        if "up" in args and "-d" in args:
-            raise CommandError("private-value start failed")
-        if args[-1] == "stop":
-            assert change.database.compose.is_file()
-            raise CommandError("stop failed")
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(database, "run", fake_run)
-
-    with pytest.raises(DatabaseError, match="recovery failed"):
-        database.commit(change, check_health=lambda *args, **kwargs: None)
-
-    assert change.database.compose.is_file()
-    assert change.database.data.is_dir()
-    assert change.transaction.is_dir()
-    events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
-    failed = next(
-        event
-        for event in events
-        if event["event"] == "database_operation" and event["result"] == "failed"
-    )
-    assert (failed["project"], failed["role"], failed["engine"]) == (
-        change.database.project,
-        change.database.role,
-        change.database.engine,
-    )
-    assert "private-value" not in json.dumps(failed)
-
-
-def test_info_includes_settings_live_version_health_and_postgres_url(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    target = config.select("app-test-01/postgres")
-    password = "p@ss:/ word"
-    secret = config.paths.role_secrets(target.project, target.role) / "password"
-    secret.write_text(password + "\n")
-    secret.chmod(0o600)
-    expected = compose.expected_services(compose.database(config, target, state), target)
-
-    def docker_state(name, **kwargs):
-        item = next(value for value in expected.values() if value["container"] == name)
-        return {
-            "running": True,
-            "healthy": None,
-            "image": item["image"],
-            "labels": {compose.CONTRACT_LABEL: item["contract"]},
-        }
-
-    monkeypatch.setattr(database.docker, "state", docker_state)
-    monkeypatch.setattr(database.postgres, "health", lambda *args, **kwargs: True)
+def test_kv_info_reports_public_and_loopback_http_endpoints(config, monkeypatch):
+    target = config.select("app-test-01/kv")
     monkeypatch.setattr(
         database,
-        "run",
-        lambda args, **kwargs: Result(tuple(args), 0, "postgres (PostgreSQL) 16.4\n", ""),
+        "observe",
+        lambda *args: {"running": False, "healthy": False, "health": "stopped"},
     )
     monkeypatch.setattr(backup, "history", lambda *args: [])
 
     value = database.info(config, target)
-    parsed = urlsplit(value["url"])
+    connection = value["connection"]
 
-    assert value["settings"]["pgbouncer"] is False
-    assert value["source_image"] == "postgres:16"
-    assert value["engine_version"] == "postgres (PostgreSQL) 16.4"
-    assert value["health"] == "healthy"
-    assert value["host"] == "app-test-01.test-01.storage.example.com"
-    assert parsed.hostname == value["host"]
-    assert parsed.port == 5432
-    assert unquote(parsed.username) == target.settings.user
-    assert unquote(parsed.password) == password
-    assert parsed.path == f"/{target.settings.database}"
-    assert parse_qs(parsed.query) == {"sslmode": ["require"]}
+    assert connection["http_url"] == f"https://{target.domain}"
+    assert connection["http_loopback"] == f"http://127.0.0.1:{target.http_port}"
+    assert value["backup"]["state"] == "missing"
 
 
-def test_postgres_health_authenticates_through_pgbouncer(config, monkeypatch):
-    target = config.select("app-test-01/postgres")
-    settings = replace(target.settings, pgbouncer=replace(target.settings.pgbouncer, enabled=True))
-    config = replace_role(config, target, settings)
-    state = _prepare(config, monkeypatch)
-    target = config.select(target.identity)
-    expected = compose.expected_services(compose.database(config, target, state), target)
-    calls = []
-
-    def docker_state(name, **kwargs):
-        item = next(value for value in expected.values() if value["container"] == name)
-        return {
-            "running": True,
-            "healthy": True,
-            "image": item["image"],
-            "labels": {compose.CONTRACT_LABEL: item["contract"]},
-        }
-
-    monkeypatch.setattr(database.docker, "state", docker_state)
-    monkeypatch.setattr(database.postgres, "health", lambda *args, **kwargs: True)
-    monkeypatch.setattr(
-        database.postgres,
-        "pool_health",
-        lambda container, password, **kwargs: calls.append((container, password)) or True,
-    )
-
-    database.health(config, target, state=state)
-
-    assert calls == [("evdb-app-test-01-postgres-pgbouncer", "private-value")]
-
-
-def test_pgbouncer_health_keeps_password_out_of_arguments(monkeypatch):
-    calls = []
-
-    def docker_exec(container, args, **kwargs):
-        calls.append((container, args, kwargs))
-        return Result(tuple(args), 0, "1\n", "")
-
-    monkeypatch.setattr(database.postgres.docker, "exec", docker_exec)
-
-    assert database.postgres.pool_health("pooler", 'private "value" \\ test')
-
-    container, args, kwargs = calls[0]
-    assert container == "pooler"
-    assert 'private "value" \\ test' not in args
-    assert kwargs["env"]["PGPASSWORD"] == 'private "value" \\ test'
-    assert kwargs["secrets"] == ['private "value" \\ test']
-
-
-def test_database_info_health_requires_pgbouncer_authentication(config, monkeypatch):
-    target = config.select("app-test-01/postgres")
-    settings = replace(
-        target.settings,
-        pgbouncer=replace(target.settings.pgbouncer, enabled=True),
-    )
-    target = replace(target, settings=settings)
-    monkeypatch.setattr(database.postgres, "health", lambda *args, **kwargs: True)
-    monkeypatch.setattr(database.postgres, "pool_health", lambda *args, **kwargs: False)
-
-    assert not database._engine_health(target, secrets.Credentials("private-value"))
-
-
-def test_info_includes_concrete_kv_http_credentials(config, monkeypatch):
-    state = _prepare(config, monkeypatch)
-    target = config.select("app-test-01/kv")
-    expected = compose.expected_services(compose.database(config, target, state), target)
-
-    def docker_state(name, **kwargs):
-        item = next(value for value in expected.values() if value["container"] == name)
-        return {
-            "running": True,
-            "healthy": True,
-            "image": item["image"],
-            "labels": {compose.CONTRACT_LABEL: item["contract"]},
-        }
-
-    monkeypatch.setattr(database.docker, "state", docker_state)
-    monkeypatch.setattr(database.redis, "health", lambda *args, **kwargs: True)
-    monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: Result(tuple(args), 0, "Redis server v=7.2.5\n", ""),
-    )
-    monkeypatch.setattr(backup, "history", lambda *args: [])
-
-    value = database.info(config, target)
-    parsed = urlsplit(value["url"])
-
-    assert value["engine"] == "redis"
-    assert value["settings"]["mode"] == "cache"
-    assert value["engine_version"] == "Redis server v=7.2.5"
-    assert value["url"].startswith("rediss://default:")
-    assert value["host"] == "app-test-01.test-01.storage.example.com"
-    assert parsed.hostname == value["host"]
-    assert parsed.port == 6379
-    assert parsed.path == "/0"
-    assert unquote(parsed.password) == "private-value"
-    assert value["http"] == {
-        "enabled": True,
-        "url": "https://app-test-01.test-01.storage.example.com",
-        "token": "private-value",
-    }
-
-
-def test_database_logs_apply_generic_redaction(config, monkeypatch):
-    _prepare(config, monkeypatch)
-    target = config.select("app-test-01/kv")
-    monkeypatch.setattr(
-        database,
-        "run",
-        lambda args, **kwargs: Result(
-            tuple(args),
-            0,
-            "postgresql://user:hunter2@db/app token=abc ref=op://vault/item/password\n",
-            "",
+def test_add_reloads_under_write_lock_and_preserves_concurrent_source(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    monkeypatch.setattr(database.random, "token_urlsafe", lambda size: "generated")
+    concurrent = config.__class__(
+        config.host.__class__(
+            config.host.id,
+            config.host.domain,
+            config.host.data_root,
+            config.host.backup.__class__(config.host.backup.repository, 0, 48),
+            config.host.routing,
         ),
+        config.projects,
+        config.secrets,
+        config.paths,
+    )
+    write(concurrent, secrets=False)
+
+    updated = database.add(config, "worker-prod-01", "kv")
+
+    assert updated.host.backup.max_age_hours == 48
+    assert updated.select("worker-prod-01/kv")
+    assert len(calls) == 1
+
+
+def test_configure_reloads_under_write_lock_and_preserves_concurrent_source(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    stale = config.select("app-test-01/kv")
+    concurrent = config.__class__(
+        config.host.__class__(
+            config.host.id,
+            config.host.domain,
+            config.host.data_root,
+            config.host.backup.__class__(config.host.backup.repository, 0, 48),
+            config.host.routing,
+        ),
+        config.projects,
+        config.secrets,
+        config.paths,
+    )
+    write(concurrent, secrets=False)
+
+    updated = database.configure(config, stale, {"http_connections": 35})
+
+    assert updated.host.backup.max_age_hours == 48
+    assert updated.select(stale.identity).settings.http.connections == 35
+    assert len(calls) == 1
+
+
+def test_restart_rerenders_then_converges_with_compose_up(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    calls = _runtime(monkeypatch)
+    monkeypatch.setattr(
+        database,
+        "run",
+        lambda *args, **kwargs: pytest.fail("compose restart must not be used"),
+        raising=False,
     )
 
-    text = database.logs(config, target)
+    database.restart(config, target)
 
-    assert "hunter2" not in text
-    assert "abc" not in text
-    assert "op://" not in text
-    assert text.count("<redacted>") == 3
+    assert calls == [("up", target.compose, target.compose_project)]
+
+
+@pytest.mark.parametrize("action", [database.start, database.restart])
+def test_lifecycle_reloads_and_reselects_current_source_under_locks(config, monkeypatch, action):
+    stale = config.select("app-test-01/kv")
+    project = config.projects[0]
+    updated = replace(
+        config,
+        projects=(replace(project, kv=replace(project.kv, image="redis:7.4.2")),),
+    )
+    write(updated, secrets=False)
+    seen = []
+    monkeypatch.setattr(
+        database,
+        "render",
+        lambda current, target: seen.append(("render", target.image)),
+    )
+    monkeypatch.setattr(
+        database.docker,
+        "up",
+        lambda path, project, **kwargs: seen.append(("up", kwargs["secrets"])),
+    )
+    monkeypatch.setattr(
+        database,
+        "health",
+        lambda current, target: seen.append(("health", target.image)),
+    )
+
+    action(config, stale)
+
+    assert seen[0] == ("render", "redis:7.4.2")
+    assert seen[-1] == ("health", "redis:7.4.2")
+
+
+def test_existing_role_add_checks_health_and_omitted_engine_is_idempotent(config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(database, "health", lambda current, target: calls.append(target.engine))
+
+    updated = database.add(config, "app-test-01", "kv")
+
+    assert updated.select("app-test-01/kv").engine == "redis"
+    assert calls == ["redis"]
+
+
+def test_existing_role_add_rejects_conflicting_explicit_engine(config, monkeypatch):
+    monkeypatch.setattr(
+        database, "health", lambda *args: pytest.fail("health called after conflict")
+    )
+    with pytest.raises(DatabaseError, match="already uses redis"):
+        database.add(config, "app-test-01", "kv", engine="dragonfly")
+
+
+def test_existing_or_unchanged_role_does_not_succeed_when_unhealthy(config, monkeypatch):
+    def unhealthy(*args):
+        raise DatabaseError("database is unhealthy")
+
+    monkeypatch.setattr(database, "health", unhealthy)
+
+    with pytest.raises(DatabaseError, match="unhealthy"):
+        database.add(config, "app-test-01", "kv")
+
+    target = config.select("app-test-01/kv")
+    with pytest.raises(DatabaseError, match="unhealthy"):
+        database.configure(config, target, {})
+
+
+def test_canonical_database_mutation_preserves_source_owner(config, monkeypatch):
+    uid = config.paths.source.stat().st_uid
+    gid = config.paths.source.stat().st_gid
+    canonical = replace(
+        config,
+        host=replace(config.host, data_root=Path("/srv/evdb-test")),
+    )
+    config.paths.config.chmod(0o1770)
+    monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(
+        config_module.pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=uid),
+    )
+    monkeypatch.setattr(
+        config_module.grp,
+        "getgrnam",
+        lambda name: SimpleNamespace(gr_gid=gid),
+    )
+    write(canonical)
+    calls = _runtime(monkeypatch)
+    monkeypatch.setattr(database, "render", lambda *args: None)
+    target = canonical.select("app-test-01/kv")
+
+    database.configure(
+        canonical,
+        target,
+        {"http_connections": target.settings.http.connections + 1},
+    )
+
+    details = config.paths.source.stat()
+    assert (details.st_uid, details.st_gid, details.st_mode & 0o777) == (uid, gid, 0o640)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("component", ["project", "role", "data"])
+def test_render_rejects_symlinked_data_components(config, tmp_path, monkeypatch, component):
+    target = config.select("app-test-01/kv")
+    root = config.host.data_root
+    root.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / f"outside-{component}"
+    if component == "project":
+        (outside / target.role / "data").mkdir(parents=True)
+        (root / target.project).symlink_to(outside, target_is_directory=True)
+    elif component == "role":
+        (root / target.project).mkdir()
+        (outside / "data").mkdir(parents=True)
+        (root / target.project / target.role).symlink_to(outside, target_is_directory=True)
+    else:
+        (root / target.project / target.role).mkdir(parents=True)
+        outside.mkdir()
+        target.data.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(
+        database.docker,
+        "validate_compose",
+        lambda *args, **kwargs: pytest.fail("unsafe data path reached Compose validation"),
+    )
+
+    with pytest.raises(DatabaseError, match="data path is unsafe"):
+        database.render(config, target)
+
+
+def test_render_preserves_existing_mode_restricted_data_directory(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    target.data.mkdir(parents=True)
+    target.data.chmod(0)
+    before = target.data.lstat()
+    monkeypatch.setattr(database.docker, "validate_compose", lambda *args, **kwargs: None)
+
+    try:
+        database.render(config, target)
+        after = target.data.lstat()
+    finally:
+        target.data.chmod(0o700)
+
+    assert (after.st_uid, after.st_gid, after.st_mode & 0o777) == (
+        before.st_uid,
+        before.st_gid,
+        0,
+    )
+
+
+def test_info_reports_latest_validated_backup_without_credentials(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    monkeypatch.setattr(
+        database,
+        "observe",
+        lambda *args: {"running": False, "healthy": False, "health": "stopped"},
+    )
+    monkeypatch.setattr(
+        backup,
+        "history",
+        lambda *args: [
+            {
+                "backup": "latest-backup",
+                "time": "2026-07-28T12:00:00+00:00",
+                "snapshot": "latest-snapshot",
+                "source": "local+remote",
+            },
+            {
+                "backup": "older-backup",
+                "time": "2026-07-27T12:00:00+00:00",
+                "snapshot": "older-snapshot",
+                "source": "remote",
+            },
+        ],
+    )
+
+    summary = database.info(config, target)["backup"]
+
+    assert summary == {
+        "state": "available",
+        "availability": "local+remote",
+        "time": "2026-07-28T12:00:00+00:00",
+        "backup": "latest-backup",
+        "snapshot": "latest-snapshot",
+    }
+    assert target.credentials.password not in str(summary)
+    assert target.credentials.http_token not in str(summary)
+
+
+def test_info_reports_disabled_and_redacted_backup_errors(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    monkeypatch.setattr(
+        database,
+        "observe",
+        lambda *args: {"running": False, "healthy": False, "health": "stopped"},
+    )
+    cache = replace(target, settings=replace(target.settings, mode="cache"))
+    assert database.info(config, cache)["backup"]["state"] == "disabled"
+
+    secret = target.credentials.password
+    monkeypatch.setattr(
+        backup,
+        "history",
+        lambda *args: (_ for _ in ()).throw(DatabaseError(f"history failed {secret}")),
+    )
+
+    summary = database.info(config, target)["backup"]
+
+    assert summary["state"] == "error"
+    assert summary["error"] == "history failed <redacted>"
+    assert secret not in str(summary)

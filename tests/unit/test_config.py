@@ -1,516 +1,444 @@
-import json
-from contextlib import contextmanager
+import os
+import stat
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
+import yaml
 
-from evdb import lock as lock_module
+import evdb.config as config_module
+import evdb.files as files_module
 from evdb.config import (
-    DEFAULT_HTTP_END,
-    DEFAULT_HTTP_START,
-    DEFAULT_RETENTION,
-    DEFAULT_TIMEOUTS,
-    STATE_VERSION,
-    ConfigError,
-    ImageState,
-    MachineState,
-    Project,
-    RoleState,
-    append_activity,
+    add_role,
     as_dict,
     dump,
+    dump_secrets,
     load,
-    load_state,
-    replace_role,
+    protected,
+    reject_legacy,
     require_valid,
-    resolve_state,
-    state_dict,
-    with_role,
-    write_state,
+    seed_rclone,
+    validate_image,
+    write,
 )
-from evdb.images import image_major, locked_image, validate_source
-
-ROOT = Path(__file__).parents[2]
-FIXTURES = ROOT / "tests/fixtures/config"
-DIGEST = "sha256:" + "a" * 64
+from evdb.errors import ConfigError
+from evdb.models import RoleSecrets
+from evdb.run import Result
 
 
-def test_project_first_fixtures_cover_each_role_shape():
-    postgres = load(FIXTURES / "postgres/host.yml")
-    kv = load(FIXTURES / "kv/host.yml")
-    combined = load(FIXTURES / "combined/host.yml")
-
-    assert [item.identity for item in postgres.databases] == ["app-prod-01/postgres"]
-    assert [item.identity for item in kv.databases] == ["app-dev-01/kv"]
-    assert [item.identity for item in combined.databases] == [
+def test_strict_two_file_round_trip_and_project_role_selectors(config):
+    assert [item.identity for item in config.databases] == [
         "app-test-01/postgres",
         "app-test-01/kv",
     ]
-    combined_postgres = combined.select("app-test-01/postgres")
-    combined_kv = combined.select("app-test-01/kv")
-    assert combined_postgres.compose_project == "evdb-app-test-01-postgres"
-    assert combined_kv.compose_project == "evdb-app-test-01-kv"
-    assert combined_postgres.domain == "app-test-01.test-01.storage.example.com"
-    assert combined_kv.domain == combined_postgres.domain
-    assert combined_kv.settings.http.domain == combined_kv.domain
+    assert config.select("app-test-01/postgres").compose.name == "compose.yaml"
+    assert config.select("app-test-01/kv").data == (config.host.data_root / "app-test-01/kv/data")
+    assert config.paths.source.name == "config.yml"
+    assert config.paths.secrets.name == "secrets.yml"
+    assert config.paths.rclone.name == "rclone.conf"
+    assert yaml.safe_load(dump(config)) == as_dict(config)
+    assert "local-restic-password" not in dump(config)
+    assert "local-restic-password" in dump_secrets(config.secrets)
 
 
-def test_defaults_are_typed_and_concise():
-    config = load(FIXTURES / "kv/host.yml")
-    database = config.select("app-dev-01/kv")
+def test_atomic_writes_keep_source_and_secret_modes(config):
+    write(config)
 
-    assert config.host.backup.retention == DEFAULT_RETENTION
-    assert config.host.timeouts == DEFAULT_TIMEOUTS
-    assert (config.host.http_port_start, config.host.http_port_end) == (
-        DEFAULT_HTTP_START,
-        DEFAULT_HTTP_END,
+    assert config.paths.source.stat().st_mode & 0o777 == 0o640
+    assert config.paths.secrets.stat().st_mode & 0o777 == 0o600
+    assert not list(config.paths.config.glob(".*.yml.*"))
+
+
+def test_secret_file_requires_exact_0600(config):
+    config.paths.secrets.chmod(0o640)
+
+    with pytest.raises(ConfigError, match="mode 0600"):
+        load(config.paths.source, paths=config.paths)
+
+
+def test_old_host_and_machine_state_are_rejected(paths):
+    paths.config.mkdir(parents=True)
+    legacy = paths.config / "host.yml"
+    legacy.write_text("host: {}\n")
+
+    with pytest.raises(ConfigError, match="pre-v1"):
+        load(legacy, paths=paths)
+    with pytest.raises(ConfigError, match="reset.*migrate"):
+        reject_legacy(paths)
+
+    legacy.unlink()
+    state = paths.state / "state/host.json"
+    state.parent.mkdir(parents=True)
+    state.write_text("{}\n")
+    with pytest.raises(ConfigError, match="pre-v1"):
+        reject_legacy(paths)
+
+
+@pytest.mark.parametrize("image", ["postgres", "postgres:latest", " postgres:16"])
+def test_images_require_direct_non_latest_references(image):
+    with pytest.raises(ConfigError):
+        validate_image(image)
+
+
+def test_image_with_registry_port_is_supported():
+    validate_image("registry.example.com:5000/postgres:16.4")
+
+
+def test_rclone_is_seeded_once_and_preserved_byte_for_byte(config, tmp_path):
+    seed = tmp_path / "seed.conf"
+    seed.write_bytes(b"[remote]\ntype = local\n")
+    config.paths.rclone.unlink()
+
+    seed_rclone(config, seed)
+    config.paths.rclone.write_bytes(b"refreshed oauth bytes\x00\n")
+    before = config.paths.rclone.read_bytes()
+
+    seed_rclone(config, seed)
+    assert config.paths.rclone.read_bytes() == before
+
+
+def test_matching_secrets_are_required_and_extras_rejected(config):
+    missing = replace(
+        config,
+        secrets=replace(config.secrets, projects=()),
     )
-    assert database.engine == "dragonfly"
-    assert database.settings.mode == "durable"
-    assert database.settings.memory == "256mb"
-    assert database.settings.threads == 1
-    assert database.settings.http.enabled
-    assert database.settings.http.connections == 20
-    assert database.settings.http.domain == "app-dev-01.test-01.storage.example.com"
+    with pytest.raises(ConfigError, match="matching secrets"):
+        from evdb.config import require_valid
+
+        require_valid(missing)
+
+    role = config.select("app-test-01/postgres")
+    added = add_role(
+        config,
+        "other-prod-01",
+        "postgres",
+        role.settings,
+        RoleSecrets("other-password"),
+    )
+    assert added.select("other-prod-01/postgres").credentials.password == "other-password"
 
 
-def test_select_requires_role_when_project_has_both():
-    config = load(FIXTURES / "combined/host.yml")
+def test_protected_values_are_exact_and_encoded_while_repository_is_visible(config):
+    config.paths.rclone.write_text(
+        "[remote]\n"
+        "type = local\n"
+        'token = {"access_token":"nested access","refresh_token":"nested refresh",'
+        '"nested":{"client_secret":"nested secret"}}\n'
+    )
+    values = protected(config)
 
-    with pytest.raises(ConfigError) as caught:
-        config.select("app-test-01")
+    assert "local-kv-password" in values
+    assert "nested access" in values
+    assert "nested%20access" in values
+    assert "nested refresh" in values
+    assert "nested secret" in values
+    assert config.host.backup.repository not in values
 
-    message = str(caught.value)
-    assert "app-test-01/postgres" in message
-    assert "app-test-01/kv" in message
+
+def test_rclone_defaults_only_credentials_are_protected(config):
+    config.paths.rclone.write_text("[DEFAULT]\nclient_secret = defaults secret\n")
+
+    assert "defaults secret" in protected(config)
 
 
 @pytest.mark.parametrize(
-    ("name", "message"),
+    "text",
     [
-        ("old-schema.yml", "old source schema"),
-        ("bad-suffix.yml", "must end in"),
-        ("engine-setting.yml", "require dragonfly"),
-        ("secret.yml", "must not contain secrets"),
-        ("unsafe-path.yml", "safe absolute path"),
-        ("major.yml", "positive postgres major"),
-        ("duplicate-role.yml", "duplicate YAML key"),
+        "[remote]\ntype = local\n[remote]\ntype = local\n",
+        "[remote]\ntoken = first\ntoken = second\n",
     ],
 )
-def test_invalid_fixtures_fail_before_side_effects(tmp_path, name, message):
-    path = tmp_path / "host.yml"
-    path.write_text((FIXTURES / "invalid" / name).read_text())
+def test_rclone_credential_extraction_rejects_ambiguous_or_malformed_config(config, text):
+    config.paths.rclone.write_text(text)
 
-    with pytest.raises(ConfigError, match=message):
-        load(path)
-
-
-@pytest.mark.parametrize("name", ["postgres.yml", "kv.yml", "host.lock.json"])
-def test_old_side_files_are_rejected(tmp_path, name):
-    (tmp_path / "host.yml").write_text((FIXTURES / "postgres/host.yml").read_text())
-    (tmp_path / name).write_text("{}\n")
-
-    with pytest.raises(ConfigError, match="old source layout"):
-        load(tmp_path / "host.yml")
+    with pytest.raises(ConfigError, match="invalid rclone configuration"):
+        protected(config)
 
 
-def test_source_load_requires_exact_host_yml(tmp_path):
-    path = tmp_path / "host.yaml"
-    path.write_text((FIXTURES / "postgres/host.yml").read_text())
+def test_json_shaped_rclone_token_is_treated_as_opaque(config, monkeypatch):
+    from evdb import backup
 
-    with pytest.raises(ConfigError, match="host.yml"):
-        load(path)
+    config.paths.rclone.write_text("[remote]\ntoken = {broken\n")
+    seen = {}
 
+    def run(args, **kwargs):
+        seen.update(secrets=kwargs["secrets"])
+        return Result(tuple(args), 0, "{}", "")
 
-@pytest.mark.parametrize(
-    "image",
-    ["postgres", "registry.example.com:5000/postgres", "postgres:latest", " postgres:16"],
-)
-def test_images_reject_unversioned_latest_and_invalid_sources(image):
-    with pytest.raises(ConfigError):
-        validate_source(image)
+    monkeypatch.setattr(backup, "run", run)
 
+    backup._restic(config, ["cat", "config"])
 
-def test_images_accept_version_tags_and_digests():
-    digest_image = f"example/http@{DIGEST}"
-
-    assert validate_source("registry.example.com:5000/postgres:16.9")
-    assert validate_source(digest_image)
-    assert locked_image("postgres:16", DIGEST) == f"postgres:16@{DIGEST}"
-    assert image_major("dragonfly:v1.34.1") == 1
+    assert "{broken" in seen["secrets"]
 
 
-def test_config_rejects_repository_credentials_and_overlong_host_label(config):
-    credentialed = replace(
+def test_non_secret_scalars_reject_managed_values_and_encoded_forms(config):
+    secret = config.secrets.restic_password
+    repository = replace(
+        config,
+        host=replace(
+            config.host,
+            backup=replace(config.host.backup, repository=f"rclone:remote:{secret}"),
+        ),
+    )
+    with pytest.raises(ConfigError, match="repository.*managed credential"):
+        require_valid(repository)
+
+    project = config.projects[0]
+    image = replace(
+        config,
+        projects=(
+            replace(project, postgres=replace(project.postgres, image=f"postgres:{secret}")),
+        ),
+    )
+    with pytest.raises(ConfigError, match="image.*managed credential"):
+        require_valid(image)
+
+    encoded_secret = "managed secret"
+    encoded = replace(
         config,
         host=replace(
             config.host,
             backup=replace(
                 config.host.backup,
-                repos={**config.host.backup.repos, "kv": "rest:https://user@repo.example/db"},
+                repository=f"rclone:remote:{quote(encoded_secret, safe='')}",
             ),
         ),
+        secrets=replace(config.secrets, restic_password=encoded_secret),
     )
-    with pytest.raises(ConfigError, match="must not contain credentials"):
-        require_valid(credentialed)
+    with pytest.raises(ConfigError, match="repository.*managed credential"):
+        require_valid(encoded)
 
-    with pytest.raises(ConfigError, match="at most 60"):
-        require_valid(replace(config, host=replace(config.host, id="a" * 61)))
+    domain = replace(config, secrets=replace(config.secrets, restic_password=config.host.domain))
+    with pytest.raises(ConfigError, match="domain.*managed credential"):
+        require_valid(domain)
 
 
-def test_constructed_config_uses_complete_validation(config):
-    with pytest.raises(ConfigError, match="valid email"):
-        require_valid(
-            replace(
-                config,
-                host=replace(config.host, routing=replace(config.host.routing, acme_email="bad")),
-            )
+def test_short_credentials_do_not_collide_with_ordinary_source_fields(config):
+    short = replace(config, secrets=replace(config.secrets, restic_password="a"))
+
+    require_valid(short)
+
+    leaked = replace(
+        short,
+        host=replace(
+            short.host,
+            backup=replace(short.host.backup, repository="a"),
+        ),
+    )
+    with pytest.raises(ConfigError, match="repository.*managed credential"):
+        require_valid(leaked)
+
+
+@pytest.mark.parametrize("role", ["postgres", "kv"])
+def test_every_derived_native_database_domain_must_be_valid(config, role):
+    base_domain = ".".join(("a" * 63, "b" * 63, "c" * 63, "d" * 47))
+    project = config.projects[0]
+    secret_project = config.secrets.projects[0]
+    if role == "postgres":
+        project = replace(project, kv=None)
+        secret_project = replace(secret_project, kv=None)
+    else:
+        project = replace(
+            project,
+            postgres=None,
+            kv=replace(project.kv, http=replace(project.kv.http, enabled=False)),
         )
-
-    with pytest.raises(ConfigError, match="non-empty postgres and kv"):
-        require_valid(
-            replace(
-                config,
-                host=replace(
-                    config.host,
-                    backup=replace(config.host.backup, repos={"postgres": "", "kv": "/tmp/kv"}),
-                ),
-            )
-        )
-
-    with pytest.raises(ConfigError, match="retention.daily"):
-        require_valid(
-            replace(
-                config,
-                host=replace(
-                    config.host,
-                    backup=replace(
-                        config.host.backup,
-                        retention={**DEFAULT_RETENTION, "daily": 0},
-                    ),
-                ),
-            )
-        )
-
-    with pytest.raises(ConfigError, match="postgres must be Postgres"):
-        require_valid(replace(config, projects=(Project("other-prod-01", postgres="bad"),)))
-
-
-def test_http_domains_must_be_unique_between_kv_roles(config):
-    target = config.select("app-test-01/kv")
-
-    with pytest.raises(ConfigError, match="HTTP domain collides"):
-        with_role(config, "other-test-01", "kv", target.settings)
-
-
-def test_paths_are_project_first_and_fully_injectable(config, paths):
-    database = config.select("app-test-01/postgres")
-
-    assert config.paths.source == paths.config / "host.yml"
-    assert database.compose == paths.config / "projects/app-test-01/postgres/compose.yaml"
-    assert config.paths.role_secrets(database.project, database.role) == (
-        paths.config / "secrets/app-test-01/postgres"
-    )
-    assert database.data == config.host.data_root / "app-test-01/postgres/data"
-    assert config.paths.role_backups(database.project, database.role) == (
-        paths.state / "backups/app-test-01/postgres"
-    )
-
-
-def test_round_trip_is_deterministic(tmp_path):
-    original = load(FIXTURES / "combined/host.yml")
-    source = tmp_path / "host.yml"
-    source.write_text(dump(original))
-
-    loaded = load(source)
-
-    assert as_dict(loaded) == as_dict(original)
-    assert dump(loaded) == dump(original)
-
-
-def test_role_add_defaults_are_persisted_explicitly():
-    config = load(FIXTURES / "postgres/host.yml")
-    from evdb.config import HTTP, KV
-
-    updated = with_role(
+        secret_project = replace(secret_project, postgres=None)
+    invalid = replace(
         config,
-        "queue-prod-01",
-        "kv",
-        KV("dragonfly", "docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1", http=HTTP()),
-    )
-    data = as_dict(updated)["projects"]["queue-prod-01"]["kv"]
-
-    assert data["engine"] == "dragonfly"
-    assert data["image"].endswith(":v1.34.1")
-    assert data["http"]["enabled"] is True
-    assert data["http"]["image"].startswith("hiett/serverless-redis-http@sha256:")
-    assert data["http"]["domain"] == "queue-prod-01.test-01.storage.example.com"
-
-
-def test_explicit_http_domain_override_is_preserved():
-    config = load(FIXTURES / "postgres/host.yml")
-    from evdb.config import HTTP, KV
-
-    updated = with_role(
-        config,
-        "queue-prod-01",
-        "kv",
-        KV("redis", "redis:7.2.5", http=HTTP(domain="queue.storage.example.com")),
+        host=replace(config.host, domain=base_domain),
+        projects=(project,),
+        secrets=replace(config.secrets, projects=(secret_project,)),
     )
 
-    assert updated.select("queue-prod-01/kv").settings.http.domain == "queue.storage.example.com"
+    with pytest.raises(ConfigError, match=rf"app-test-01/{role}: native domain is invalid"):
+        require_valid(invalid)
 
 
-def test_replace_role_changes_only_selected_database():
-    config = load(FIXTURES / "combined/host.yml")
-    database = config.select("app-test-01/kv")
-    changed = replace(database.settings, mode="durable")
-
-    updated = replace_role(config, database, changed)
-
-    assert updated.select(database.identity).settings.mode == "durable"
-    assert (
-        updated.select("app-test-01/postgres").settings
-        == config.select("app-test-01/postgres").settings
+def test_canonical_layout_enforces_owner_group_and_modes(config, monkeypatch):
+    uid = os.getuid()
+    gid = os.getgid()
+    config.paths.config.chmod(0o1770)
+    config.paths.source.write_text(
+        config.paths.source.read_text().replace(str(config.host.data_root), "/srv/evdb-test")
+    )
+    monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(
+        config_module.pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=uid),
+    )
+    monkeypatch.setattr(
+        config_module.grp,
+        "getgrnam",
+        lambda name: SimpleNamespace(gr_gid=gid),
     )
 
+    load(config.paths.source, paths=config.paths)
 
-def test_machine_state_round_trip_and_stable_port(config):
-    role = RoleState(
-        "redis",
-        {"primary": ImageState("redis:7.2.5", DIGEST, 7)},
-        http_port=14001,
-        compose_hash="abc",
-        installed=True,
+    monkeypatch.setattr(
+        config_module.pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=uid + 1 if name == "root" else uid),
     )
-    state = MachineState(STATE_VERSION, config.host.id, {}, {"app-test-01/kv": role}, "1.0.0")
-
-    write_state(config, state)
-    loaded = load_state(config)
-
-    assert loaded == state
-    assert loaded.roles["app-test-01/kv"].http_port == 14001
-    assert json.loads(config.paths.machine_state.read_text()) == state_dict(state)
-    assert json.loads(config.paths.machine_state.read_text())["version"] == 1
-    assert (
-        json.loads(config.paths.machine_state.read_text())["roles"]["app-test-01/kv"]["images"][
-            "primary"
-        ]["major"]
-        == 7
-    )
-    assert config.paths.machine_state.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(ConfigError, match="owner, group, or mode"):
+        load(config.paths.source, paths=config.paths)
 
 
-def test_activity_history_is_bounded(config):
-    path = config.paths.activity
-    path.parent.mkdir(parents=True)
-    path.write_text("{}\n" * 1001)
+@pytest.mark.parametrize(
+    "value",
+    ["/", "/var", "/var/lib", "/etc/evdb-data", "/usr/local/evdb-data", "/data"],
+)
+def test_data_root_rejects_shallow_and_system_paths(config, value):
+    unsafe = replace(config, host=replace(config.host, data_root=Path(value)))
 
-    append_activity(config, command="test", result="success")
-
-    lines = path.read_text().splitlines()
-    assert len(lines) == 1000
-    assert json.loads(lines[-1])["command"] == "test"
-    assert path.stat().st_mode & 0o777 == 0o600
-    assert (config.paths.locks / "activity.lock").is_file()
+    with pytest.raises(ConfigError, match="data_root"):
+        require_valid(unsafe)
 
 
-@pytest.mark.parametrize("failure", [OSError("disk unavailable"), KeyboardInterrupt()])
-def test_activity_write_failure_is_logged_without_failing_completed_operation(
-    config, monkeypatch, capsys, failure
-):
-    @contextmanager
-    def unavailable(*args, **kwargs):
-        raise failure
-        yield
+def test_data_root_rejects_existing_symlink_components(config, tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    unsafe = replace(config, host=replace(config.host, data_root=linked / "database-data"))
 
-    monkeypatch.setattr(lock_module, "lock", unavailable)
-
-    append_activity(config, command="database configure", result="success")
-
-    event = json.loads(capsys.readouterr().err)
-    assert event["event"] == "activity_operation"
-    assert event["result"] == "failed"
-    assert event["command"] == "database configure"
+    with pytest.raises(ConfigError, match="symlinked or unsafe"):
+        require_valid(unsafe)
 
 
-def test_state_resolution_preserves_ports_images_and_orphans(config):
-    calls = []
-
-    def resolver(source):
-        calls.append(source)
-        return DIGEST
-
-    initial = resolve_state(config, resolver=resolver)
-    reordered = replace(config, projects=tuple(reversed(config.projects)))
-    stable = resolve_state(reordered, initial, resolver=resolver)
-
-    assert stable == initial
-    assert stable.roles["app-test-01/kv"].http_port == config.host.http_port_start
-    assert calls
-
-    orphan = RoleState("redis", {}, installed=True)
-    current = replace(initial, roles={**initial.roles, "old-prod-01/kv": orphan})
-    preserved = resolve_state(config, current, resolver=resolver)
-    assert preserved.roles["old-prod-01/kv"] is orphan
-
-
-def test_state_resolution_rejects_duplicate_ports_and_skips_occupied_ports(config):
-    initial = resolve_state(
-        config,
-        resolver=lambda source: DIGEST,
-        port_available=lambda port: port != config.host.http_port_start,
-    )
-    target = config.select("app-test-01/kv")
-    assert initial.roles[target.identity].http_port == config.host.http_port_start + 1
-
-    duplicate = replace(
-        initial,
-        roles={
-            **initial.roles,
-            "other-test-01/kv": replace(initial.roles[target.identity], installed=False),
-        },
-    )
-    with pytest.raises(ConfigError, match="assigned to both"):
-        resolve_state(config, duplicate, resolver=lambda source: DIGEST)
-
-
-def test_state_resolution_never_reallocates_a_surviving_port(config):
-    initial = resolve_state(config, resolver=lambda source: DIGEST)
-    narrower = replace(
-        config,
-        host=replace(config.host, http_port_start=config.host.http_port_start + 1),
-    )
-
-    with pytest.raises(ConfigError, match="instead of reallocating"):
-        resolve_state(narrower, initial, resolver=lambda source: DIGEST)
-
-
-def test_disabled_http_port_is_preserved_and_reserved_for_reenable(config):
-    initial = resolve_state(config, resolver=lambda source: DIGEST)
-    target = config.select("app-test-01/kv")
-    disabled_settings = replace(
-        target.settings,
-        http=replace(target.settings.http, enabled=False),
-    )
-    disabled = replace_role(config, target, disabled_settings)
-    disabled_state = resolve_state(disabled, initial, resolver=lambda source: DIGEST)
-    added = with_role(
-        disabled,
-        "other-test-01",
-        "kv",
-        replace(target.settings, mode="durable"),
-    )
-    final = resolve_state(added, disabled_state, resolver=lambda source: DIGEST)
-
-    assert disabled_state.roles[target.identity].http_port == config.host.http_port_start
-    assert final.roles[target.identity].http_port == config.host.http_port_start
-    assert final.roles["other-test-01/kv"].http_port == config.host.http_port_start + 1
-
-
-def test_state_rejects_secrets(config):
-    path = config.paths.machine_state
-    path.parent.mkdir(parents=True)
-    path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "host": config.host.id,
-                "images": {},
-                "roles": {},
-                "password": "do-not-print",
-            }
-        )
-    )
+def test_data_root_rejects_existing_prefix_parent_traversal(config):
+    supplied = Path("/home/ubuntu/../../etc")
+    unsafe = replace(config, host=replace(config.host, data_root=supplied))
 
     with pytest.raises(ConfigError) as caught:
-        load_state(config)
-    assert "do-not-print" not in str(caught.value)
+        require_valid(unsafe)
+
+    message = str(caught.value)
+    assert "must not contain '..'" in message
+    assert "must equal its normalized absolute path" in message
+    assert "must not use a system path" in message
 
 
-def test_machine_state_requires_current_writer_fields(config):
-    path = config.paths.machine_state
-    path.parent.mkdir(parents=True)
-    path.write_text(
-        json.dumps(
-            {
-                "version": STATE_VERSION,
-                "host": config.host.id,
-                "images": {},
-                "roles": {},
-            }
-        )
+def test_canonical_sticky_directory_allows_atomic_rclone_replacement(config, monkeypatch):
+    uid = os.getuid()
+    gid = os.getgid()
+    config.paths.config.chmod(0o1770)
+    config.paths.source.write_text(
+        config.paths.source.read_text().replace(str(config.host.data_root), "/srv/evdb-test")
+    )
+    config.paths.source.chmod(0o640)
+    config.paths.secrets.chmod(0o600)
+    config.paths.rclone.chmod(0o600)
+    monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(
+        config_module.pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=uid),
+    )
+    monkeypatch.setattr(
+        config_module.grp,
+        "getgrnam",
+        lambda name: SimpleNamespace(gr_gid=gid),
+    )
+    source_inode = config.paths.source.stat().st_ino
+    rclone_inode = config.paths.rclone.stat().st_ino
+
+    files_module.write_bytes(
+        config.paths.rclone,
+        b"[local]\ntype = local\nupdated = true\n",
+        mode=0o600,
+        owner=(uid, gid),
     )
 
-    with pytest.raises(ConfigError, match="tool_version is required"):
-        load_state(config)
+    loaded = load(config.paths.source, paths=config.paths)
+    mode = config.paths.config.stat().st_mode
+    assert loaded.host.id == config.host.id
+    assert mode & 0o7777 == 0o1770
+    assert mode & stat.S_ISVTX
+    assert mode & stat.S_IWGRP
+    assert not mode & stat.S_IWOTH
+    assert config.paths.source.stat().st_ino == source_inode
+    assert config.paths.rclone.stat().st_ino != rclone_inode
+    assert not list(config.paths.config.glob(".rclone.conf.*"))
+
+    config.paths.config.chmod(0o750)
+    with pytest.raises(ConfigError, match="mode 1770"):
+        load(config.paths.source, paths=config.paths)
 
 
-def test_machine_state_requires_released_v1_image_shape(config):
-    path = config.paths.machine_state
-    path.parent.mkdir(parents=True)
-    path.write_text(
-        json.dumps(
-            {
-                "version": STATE_VERSION,
-                "host": config.host.id,
-                "tool_version": "1.0.0",
-                "images": {"traefik": {"source": "traefik:v3.7.8", "digest": DIGEST}},
-                "roles": {},
-            }
-        )
+def test_canonical_atomic_writes_apply_final_owners_before_replace(config, monkeypatch):
+    root_uid = 101
+    evdb_uid = 202
+    evdb_gid = 303
+    current_uid = os.getuid()
+    current_gid = os.getgid()
+    selected = replace(config, host=replace(config.host, data_root=Path("/srv/evdb-test")))
+    monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(
+        config_module.pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=root_uid if name == "root" else evdb_uid),
     )
-
-    with pytest.raises(ConfigError, match="machine state.images.traefik.major is required"):
-        load_state(config)
-
-
-def test_machine_state_rejects_future_versions(config):
-    path = config.paths.machine_state
-    path.parent.mkdir(parents=True)
-    path.write_text(
-        json.dumps(
-            {
-                "version": STATE_VERSION + 1,
-                "host": config.host.id,
-                "tool_version": "1.0.0",
-                "images": {},
-                "roles": {},
-            }
-        )
+    monkeypatch.setattr(
+        config_module.grp,
+        "getgrnam",
+        lambda name: SimpleNamespace(gr_gid=evdb_gid),
     )
+    real_fchown = files_module.os.fchown
+    owners = []
 
-    with pytest.raises(ConfigError, match="unsupported machine state version"):
-        load_state(config)
+    def fchown(descriptor, uid, gid):
+        owners.append((uid, gid))
+        real_fchown(descriptor, current_uid, current_gid)
+
+    monkeypatch.setattr(files_module.os, "fchown", fchown)
+
+    write(selected)
+    selected.paths.rclone.unlink()
+    seed = config.paths.config.parent / "seed-rclone.conf"
+    seed.write_text("[local]\ntype = local\n")
+    seed_rclone(selected, seed)
+
+    assert owners == [
+        (root_uid, evdb_gid),
+        (evdb_uid, evdb_gid),
+        (evdb_uid, evdb_gid),
+    ]
+    assert selected.paths.source.stat().st_mode & 0o777 == 0o640
+    assert selected.paths.secrets.stat().st_mode & 0o777 == 0o600
+    assert selected.paths.rclone.stat().st_mode & 0o777 == 0o600
 
 
-def test_http_port_range_rejects_invalid_order(tmp_path):
-    text = (
-        (FIXTURES / "kv/host.yml")
-        .read_text()
-        .replace("projects:", "  http_ports:\n    start: 14001\n    end: 14000\nprojects:")
+def test_canonical_secret_write_failure_does_not_restore_source(config, monkeypatch):
+    selected = replace(config, host=replace(config.host, data_root=Path("/srv/evdb-test")))
+    monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(
+        config_module.pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=os.getuid()),
     )
-    path = tmp_path / "host.yml"
-    path.write_text(text)
+    monkeypatch.setattr(
+        config_module.grp,
+        "getgrnam",
+        lambda name: SimpleNamespace(gr_gid=os.getgid()),
+    )
+    real_write = config_module.write_text
+    owners = []
 
-    with pytest.raises(ConfigError, match="ordered unprivileged range"):
-        load(path)
+    def fail_secret(path, text, *, mode, owner=None):
+        owners.append((path, owner))
+        if path == selected.paths.secrets:
+            raise OSError("injected canonical secret failure")
+        return real_write(path, text, mode=mode, owner=owner)
 
+    monkeypatch.setattr(config_module, "write_text", fail_secret)
 
-def test_config_source_contains_no_runtime_or_secret_fields():
-    data = as_dict(load(FIXTURES / "combined/host.yml"))
-    text = json.dumps(data).lower()
+    with pytest.raises(OSError, match="injected canonical"):
+        write(selected)
 
-    assert "digest" not in text
-    assert "http_port" in text  # only the allocation range is human-owned
-    assert not any(word in text for word in ("password", "token", "op://", "current", "target"))
-
-
-def test_secret_words_in_project_ids_are_allowed(config, tmp_path):
-    settings = config.select("app-test-01/postgres").settings
-    updated = with_role(config, "token-prod-01", "postgres", settings)
-    path = tmp_path / "host.yml"
-    path.write_text(dump(updated))
-
-    assert load(path).select("token-prod-01/postgres").project == "token-prod-01"
+    assert selected.paths.source.read_text() == dump(selected)
+    assert owners[0][1] == (os.getuid(), os.getgid())

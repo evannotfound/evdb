@@ -56,9 +56,10 @@ jobs:
           ASSET="evdb_linux_${{ matrix.arch }}.tar.gz"
           install -d -m 0755 release/bin release/units artifacts
           install -m 0755 dist/evdb release/bin/evdb
-          install -m 0644 src/evdb/units/*.service release/units/
-          install -m 0644 src/evdb/units/*.timer release/units/
-          (cd release && tar -czf "../artifacts/${ASSET}" bin/evdb units/*.service units/*.timer)
+          install -m 0644 src/evdb/units/evdb-backup.service release/units/evdb-backup.service
+          install -m 0644 src/evdb/units/evdb-backup.timer release/units/evdb-backup.timer
+          (cd release && tar -czf "../artifacts/${ASSET}" \
+            bin/evdb units/evdb-backup.service units/evdb-backup.timer)
           tar -tzf "artifacts/${ASSET}"
           (cd artifacts && sha256sum "${ASSET}" > "${ASSET}.sha256")
           uv run python tools/check_release.py "artifacts/${ASSET}" "${GITHUB_REF_NAME}"

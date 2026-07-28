@@ -1,10 +1,11 @@
 [Unit]
-Description=Daily due evdb backup test
+Description=Daily evdb backup
 
 [Timer]
 OnCalendar=daily
 Persistent=true
 RandomizedDelaySec=4h
+Unit=evdb-backup.service
 
 [Install]
 WantedBy=timers.target

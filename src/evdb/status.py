@@ -1,682 +1,331 @@
 from __future__ import annotations
 
 import json
-import os
-import time
+import shutil
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from . import __version__, compose, docker, secrets
-from .config import Config, Database, load_state
-from .engines import dragonfly, postgres, redis
+from . import __version__, backup, docker
+from .config import protected
+from .errors import CommandError, Error
 from .files import free_gb
-from .log import sanitize
-from .log import write as log_write
-from .run import run
+from .models import Config, Database
+from .run import clean, redact, run
 
 VERSION = 1
-_REQUIRED_TIMERS = (
-    "evdb-status.timer",
-    "evdb-backup-test.timer",
-    "evdb-retention.timer",
-    "evdb-prune.timer",
-    "evdb-repository-check.timer",
-)
 
 
 def collect(config: Config, database: Database | None = None) -> dict[str, Any]:
-    started = time.monotonic()
     errors = []
-    try:
-        state = load_state(config)
-    except Exception as exc:
-        state = None
-        errors.append(_error("state_incompatible", "host", exc))
-    orphans = _orphans(config, state)
-    for identity in orphans:
-        errors.append(
-            _error(
-                "orphan_installed",
-                identity,
-                "installed database is absent from source; removal is unsupported",
-            )
-        )
-    try:
-        host = _host(config, state, errors, orphans)
-    except Exception as exc:
-        errors.append(_error("host_assessment_failed", "host", exc))
-        host = _failed_host(config, state, orphans)
+    host = _host(config, errors)
     databases = {}
-    selected = (database,) if database is not None else config.databases
+    selected = (database,) if database else config.databases
     for target in selected:
-        try:
-            item, item_errors = _database(config, target, state)
-        except Exception as exc:
-            item = {
-                "project": target.project,
-                "role": target.role,
-                "engine": target.engine,
-                "running": False,
-                "health": "unknown",
-                "healthy": False,
-                "image": None,
-                "source_image": target.image,
-                "configuration_match": False,
-                "backup": None,
-                "upload": None,
-                "backup_test": None,
-                "error": _message(exc),
-            }
-            item_errors = [_error("assessment_failed", target.identity, exc)]
+        item, item_errors = _database(config, target)
         databases[target.identity] = item
         errors.extend(item_errors)
     healthy = host["healthy"] and all(item["healthy"] for item in databases.values())
-    value = {
+    return {
         "version": VERSION,
         "healthy": healthy,
         "host": host,
         "databases": databases,
         "errors": errors,
     }
-    log_write(
-        "status_operation",
-        host=config.host.id,
-        project=database.project if database else None,
-        role=database.role if database else None,
-        engine=database.engine if database else None,
-        command="status",
-        step="complete",
-        result="healthy" if healthy else "failed",
-        duration=round(time.monotonic() - started, 3),
-    )
-    return value
-
-
-def render(value: dict[str, Any]) -> str:
-    host = value["host"]
-    lines = [
-        f"Host {host['id']}  tool {host['tool_version']}  "
-        f"{'healthy' if host['healthy'] else 'needs attention'}",
-        "DATABASE                     ENGINE      RUN HEALTH       CONFIG  LOCAL          "
-        "UPLOAD         TEST           ERROR                    IMAGE",
-    ]
-    for identity, item in value["databases"].items():
-        image = item.get("image") or "-"
-        local = _backup_cell(item.get("backup"))
-        upload = _upload_cell(item.get("upload"), item.get("backup"))
-        test = _test_cell(item.get("backup_test"))
-        error = _cell(item.get("error"), 24)
-        lines.append(
-            f"{identity:<28} {item['engine']:<11} "
-            f"{('yes' if item['running'] else 'no'):<3} {item['health']:<12} "
-            f"{('ok' if item['configuration_match'] else 'differs'):<7} "
-            f"{local:<14} {upload:<14} {test:<14} {error:<24} {image}"
-        )
-    for error in value["errors"]:
-        lines.append(f"{error['scope']}: {error['message']}")
-    return "\n".join(lines)
 
 
 def dumps(value: dict[str, Any]) -> str:
-    return json.dumps(_safe(value), sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def _host(config, state, errors, orphans):
+def render(value: dict[str, Any], *, width: int | None = None) -> str:
+    width = width or shutil.get_terminal_size((100, 24)).columns
+    identity_width = max(12, min(36, width - 37))
+    host = value["host"]
+    lines = [
+        _fit(
+            f"Host {host['id']}  evdb {host['tool_version']}  "
+            f"{'healthy' if host['healthy'] else 'needs attention'}",
+            width,
+        ),
+        f"{'Database':<{identity_width}}  {'Engine':<9}  {'Status':<9}  Backup",
+    ]
+    for identity, item in value["databases"].items():
+        lines.append(
+            f"{_fit(identity, identity_width):<{identity_width}}  "
+            f"{_fit(item['engine'], 9):<9}  {_fit(item['health'], 9):<9}  "
+            f"{_backup_text(item['latest_backup'])}"
+        )
+    if not value["databases"]:
+        lines.append("No databases configured")
+    return "\n".join(lines)
+
+
+def _host(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
     paths = config.paths
-    data_path = _existing(config.host.data_root)
-    backup_path = _existing(paths.backups)
-    disks = {
-        "data": {"path": str(data_path), "free_gb": round(free_gb(data_path), 2)},
-        "backup": {"path": str(backup_path), "free_gb": round(free_gb(backup_path), 2)},
-    }
+    disks = {}
+    for name, path in (("data", config.host.data_root), ("backup", paths.backups)):
+        try:
+            disks[name] = _disk(path, config.host.backup.min_free_gb)
+        except (Error, OSError) as exc:
+            disks[name] = {
+                "path": str(path),
+                "free_gb": None,
+                "ok": False,
+                "available": False,
+            }
+            errors.append(
+                _error(
+                    "disk_assessment_failed",
+                    f"host/{name}",
+                    _message(config, exc),
+                )
+            )
     for name, item in disks.items():
-        item["ok"] = item["free_gb"] >= config.host.backup.min_free_gb
-        if not item["ok"]:
+        if item["available"] and not item["ok"]:
             errors.append(_error("disk_low", f"host/{name}", "free space is below policy"))
-    infrastructure = _infrastructure(config, state, errors)
-    timers = _timers(config, errors)
-    transaction = _transaction(config)
-    tool_version = _version()
-    tool_match = state is not None and state.tool_version == tool_version
-    if not tool_match:
+    infrastructure = _infrastructure(config, errors)
+    timer = _timer(config, errors)
+    repository = {
+        "url": config.host.backup.repository,
+        "ready": None,
+        "available": False,
+    }
+    try:
+        repository["ready"] = backup.repository_ready(config)
+        repository["available"] = True
+    except (Error, OSError) as exc:
         errors.append(
             _error(
-                "tool_version_mismatch",
-                "host/configuration",
-                "machine state tool version differs from the running evdb package",
+                "repository_assessment_failed",
+                "host/repository",
+                _message(config, exc),
             )
         )
-    if transaction:
-        scope = (
-            f"{transaction['project']}/{transaction['role']}"
-            if transaction.get("project") and transaction.get("role")
-            else "host"
-        )
+    if repository["available"] and not repository["ready"]:
         errors.append(
-            _error(
-                "transaction_incomplete",
-                scope,
-                f"incomplete {transaction['kind']} transaction in phase "
-                f"{transaction['phase']}; {transaction['recovery']}",
-            )
+            _error("repository_unavailable", "host/repository", config.host.backup.repository)
         )
     healthy = (
-        state is not None
-        and tool_match
+        all(item["ok"] for item in disks.values())
         and infrastructure["healthy"]
-        and disks["data"]["ok"]
-        and disks["backup"]["ok"]
-        and timers["ok"]
-        and transaction is None
-        and not orphans
+        and timer["ok"]
+        and repository["ready"] is True
     )
     return {
         "id": config.host.id,
-        "tool_version": tool_version,
+        "tool_version": __version__,
         "healthy": healthy,
-        "configuration": {
-            "ok": state is not None and tool_match and not orphans,
-            "state_version": state.version if state else None,
-            "state_tool_version": state.tool_version if state else None,
-            "tool_match": tool_match,
-            "orphans": list(orphans),
-        },
+        "source": {"config": str(paths.source), "valid": True},
         "infrastructure": infrastructure,
         "disks": disks,
-        "timers": timers,
-        "transaction": transaction,
+        "repository": repository,
+        "timer": timer,
     }
 
 
-def _failed_host(config, state, orphans):
-    return {
-        "id": config.host.id,
-        "tool_version": _version(),
-        "healthy": False,
-        "configuration": {
-            "ok": state is not None and not orphans,
-            "state_version": state.version if state else None,
-            "state_tool_version": state.tool_version if state else None,
-            "tool_match": False,
-            "orphans": list(orphans),
-        },
-        "infrastructure": {
-            "healthy": False,
-            "network": False,
-            "network_owned": False,
-            "traefik": False,
-            "traefik_configuration_match": False,
-            "traefik_contract_match": False,
-            "acme": False,
-            "listeners": {"5432": False, "6379": False},
-            "source_image": config.host.routing.traefik_image,
-            "image": None,
-            "running_image": None,
-        },
-        "disks": {
-            "data": {"path": str(config.host.data_root), "free_gb": None, "ok": False},
-            "backup": {"path": str(config.paths.backups), "free_gb": None, "ok": False},
-        },
-        "timers": {
-            "ok": False,
-            "required": {name: _empty_unit() for name in _REQUIRED_TIMERS},
-            "databases": {
-                target.identity: {
-                    "unit": _backup_timer(target.identity),
-                    **_empty_unit(),
-                }
-                for target in config.databases
-                if target.durable
-            },
-        },
-        "transaction": None,
-    }
-
-
-def _database(config: Config, target: Database, state) -> tuple[dict[str, Any], list[dict]]:
+def _database(config: Config, target: Database) -> tuple[dict[str, Any], list[dict[str, str]]]:
     errors = []
-    role = state.roles.get(target.identity) if state else None
-    if role is None or not role.installed:
-        errors.append(_error("not_installed", target.identity, "database is not installed"))
-        return (
-            {
-                "project": target.project,
-                "role": target.role,
-                "engine": target.engine,
-                "running": False,
-                "health": "not installed",
-                "healthy": False,
-                "image": None,
-                "source_image": target.image,
-                "configuration_match": False,
-                "backup": None,
-                "upload": None,
-                "backup_test": None,
-                "error": None,
-            },
-            errors,
-        )
+    try:
+        from .database import observe
 
-    image = role.images.get("primary").image if role.images.get("primary") else None
-    source_match = _image_sources_match(target, role)
-    if not source_match:
-        errors.append(
-            _error(
-                "image_source_mismatch",
-                target.identity,
-                "configured image sources differ from resolved machine state",
-            )
-        )
-    generated = compose.database(config, target, state)
-    expected = compose.expected_services(generated, target)
-    generated_match = _compose_matches(target.compose, generated)
-    expected_contract = compose.service_hash(generated)
-    state_contract_match = role.compose_hash == expected_contract
-    configuration_match = source_match and generated_match and state_contract_match
-    if not generated_match:
-        errors.append(
-            _error("generated_changed", target.identity, "generated configuration differs")
-        )
-    if not state_contract_match:
-        errors.append(
-            _error(
-                "state_contract_mismatch",
-                target.identity,
-                "machine state contract differs from generated configuration",
-            )
-        )
-    running = False
-    services_healthy = True
-    for name, item in expected.items():
-        observed = docker.state(
-            item["container"],
-            timeout=min(10, config.host.timeouts["health"]),
-            health=item["health"] == "docker",
-        )
-        if name.endswith("-primary"):
-            running = bool(observed["running"])
-        ok = bool(
-            observed["running"]
-            and observed["image"] == item["image"]
-            and observed["labels"].get(compose.CONTRACT_LABEL) == item["contract"]
-            and (item["health"] != "docker" or observed["healthy"])
-        )
-        services_healthy = services_healthy and ok
-        if not ok:
-            errors.append(_error("service_unhealthy", target.identity, item["container"]))
-    engine_ok = _engine_health(config, target) if running else False
-    if running and not engine_ok:
-        errors.append(_error("engine_unhealthy", target.identity, "engine query failed"))
-    operations = role.operations if role else {}
-    backup_state = _safe(operations.get("backup"))
-    upload = _safe(operations.get("upload"))
-    backup_test = _safe(operations.get("backup_test"))
+        observed = observe(config, target)
+    except (Error, OSError) as exc:
+        observed = {"running": None, "healthy": False, "health": "unknown"}
+        errors.append(_error("assessment_failed", target.identity, _message(config, exc)))
+    latest = None
     if target.durable:
-        _freshness(config, target, upload, backup_test, errors)
-    current_error = None
-    recorded_errors = operations.get("errors", {})
-    operation_errors = (
-        [item for item in recorded_errors.values() if isinstance(item, dict)]
-        if isinstance(recorded_errors, dict)
-        else []
-    )
-    if isinstance(backup_test, dict) and backup_test.get("ok") is False:
-        operation_errors.append(
-            {
-                "time": backup_test.get("time", ""),
-                "message": backup_test.get("error") or "backup test failed",
-            }
+        try:
+            rows = backup.history(config, target)
+            remote = [
+                row
+                for row in rows
+                if row.get("remote") and isinstance(row.get("snapshot"), str) and row["snapshot"]
+            ]
+            latest = max(
+                remote,
+                key=lambda row: _date(row.get("time")) or datetime.min.replace(tzinfo=UTC),
+                default=None,
+            )
+        except (Error, OSError) as exc:
+            errors.append(
+                _error("backup_assessment_failed", target.identity, _message(config, exc))
+            )
+        date = _date(latest.get("time")) if latest and latest.get("remote") else None
+        stale = (
+            date is None
+            or (datetime.now(UTC) - date).total_seconds() > config.host.backup.max_age_hours * 3600
         )
-    if operation_errors:
-        latest = max(operation_errors, key=lambda item: item.get("time", ""))
-        current_error = _message(latest.get("message", "operation failed"))
-        errors.append(_error("operation_failed", target.identity, current_error))
-    healthy = bool(
-        role
-        and role.installed
-        and running
-        and services_healthy
-        and engine_ok
-        and configuration_match
-        and not errors
+        if stale:
+            errors.append(
+                _error("backup_stale", target.identity, "remote backup is stale or missing")
+            )
+        backup_state = {
+            "state": "stale" if stale else "current",
+            "time": latest.get("time") if latest else None,
+            "backup": latest.get("backup") if latest else None,
+            "snapshot": latest.get("snapshot") if latest else None,
+            "local": latest.get("local", False) if latest else False,
+            "remote": latest.get("remote", False) if latest else False,
+        }
+    else:
+        backup_state = {
+            "state": "disabled",
+            "time": None,
+            "backup": None,
+            "snapshot": None,
+            "local": False,
+            "remote": False,
+        }
+    if not observed["healthy"]:
+        errors.append(_error("database_unhealthy", target.identity, observed["health"]))
+    current_error = next(
+        (
+            item["message"]
+            for item in errors
+            if item["code"] in {"assessment_failed", "backup_assessment_failed"}
+        ),
+        next((item["message"] for item in reversed(errors)), None),
     )
     return (
         {
             "project": target.project,
             "role": target.role,
             "engine": target.engine,
-            "running": running,
-            "health": (
-                "stopped"
-                if not running
-                else "healthy"
-                if services_healthy and engine_ok
-                else "unhealthy"
-            ),
-            "healthy": healthy,
-            "image": image,
-            "source_image": target.image,
-            "configuration_match": configuration_match,
-            "backup": backup_state,
-            "upload": upload,
-            "backup_test": backup_test,
-            "error": current_error,
+            "running": observed["running"],
+            "health": observed["health"],
+            "healthy": observed["healthy"] and not errors,
+            "image": target.image,
+            "latest_backup": backup_state,
+            "error": current_error[:500] if current_error else None,
         },
         errors,
     )
 
 
-def _engine_health(config: Config, target: Database) -> bool:
-    name = f"evdb-{target.project}-{target.role}-primary"
-    values = secrets.credentials(config, target)
-    if target.engine == "postgres":
-        primary_ok = postgres.health(
-            name,
-            user=target.settings.user,
-            database=target.settings.database,
-        )
-        return primary_ok and (
-            not target.settings.pgbouncer.enabled
-            or postgres.pool_health(
-                f"evdb-{target.project}-{target.role}-pgbouncer",
-                values.password,
-                user=target.settings.user,
-                database=target.settings.database,
-            )
-        )
-    if target.engine == "redis":
-        return redis.health(name, values.password)
-    return dragonfly.health(name, values.password)
-
-
-def _image_sources_match(target: Database, role) -> bool:
-    expected = {"primary": target.image}
-    if target.role == "postgres" and target.settings.pgbouncer.enabled:
-        expected["pgbouncer"] = target.settings.pgbouncer.image
-    if target.role == "kv" and target.settings.http.enabled:
-        expected["http"] = target.settings.http.image
-    return set(role.images) == set(expected) and all(
-        role.images[name].source == source for name, source in expected.items()
-    )
-
-
-def _orphans(config: Config, state) -> tuple[str, ...]:
-    configured = {target.identity for target in config.databases}
-    installed = {
-        identity for identity, role in (state.roles.items() if state else ()) if role.installed
-    }
-    for path in config.paths.projects.glob("*/*/compose.yaml"):
+def _infrastructure(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
+    network_ok = None
+    try:
+        network = run(["docker", "network", "inspect", docker.NETWORK], timeout=10, check=False)
+        if network.code:
+            detail = network.err.strip() or network.out.strip() or "no output"
+            raise CommandError(f"Docker network inspection failed ({network.code}): {detail}")
         try:
-            project, role, name = path.relative_to(config.paths.projects).parts
-        except ValueError, OSError:
-            continue
-        if name == "compose.yaml" and role in {"postgres", "kv"}:
-            installed.add(f"{project}/{role}")
-    return tuple(sorted(installed - configured))
-
-
-def _infrastructure(config, state, errors):
-    network = run(
-        ["docker", "network", "inspect", compose.NETWORK],
-        timeout=10,
-        check=False,
-    )
-    network_available = network.code == 0
-    network_owned = False
-    if network_available:
-        try:
-            network_data = json.loads(network.out)
-            network_owned = (
-                isinstance(network_data, list)
-                and len(network_data) == 1
-                and network_data[0].get("Labels", {}).get(compose.NETWORK_LABEL) == "true"
-            )
-        except AttributeError, json.JSONDecodeError, TypeError:
-            network_owned = False
-    network_ok = network_available and network_owned
-    proxy = docker.state(compose.TRAEFIK_CONTAINER, timeout=10, health=True)
-    traefik_source_match = False
-    traefik_definition_match = False
-    traefik_contract_match = False
-    expected_image = None
-    traefik_state = state.images.get("traefik") if state else None
-    if traefik_state is not None:
-        traefik_source_match = traefik_state.source == config.host.routing.traefik_image
-        expected_image = traefik_state.image
-        try:
-            generated = compose.traefik(config, state)
-            traefik_definition_match = _compose_matches(
-                config.paths.traefik / "compose.yaml", generated
-            )
-            expected = generated["services"]["traefik"]
-            traefik_contract_match = bool(
-                proxy["image"] == expected["image"]
-                and proxy["labels"].get(compose.CONTRACT_LABEL)
-                == expected["labels"][compose.CONTRACT_LABEL]
-            )
-        except KeyError, TypeError, ValueError:
-            pass
-    traefik_configuration_match = traefik_source_match and traefik_definition_match
-    traefik_ok = bool(
-        proxy["running"]
-        and proxy["healthy"]
-        and traefik_configuration_match
-        and traefik_contract_match
-    )
+            item = json.loads(network.out)[0]
+            labels = item["Labels"] or {}
+            if not isinstance(item, dict) or not isinstance(labels, dict):
+                raise TypeError
+            network_ok = labels.get(docker.NETWORK_LABEL) == "true"
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
+            raise CommandError("invalid Docker network inspection") from exc
+    except (Error, OSError) as exc:
+        errors.append(_error("network_assessment_failed", "host/network", _message(config, exc)))
+    proxy = {"running": None, "healthy": None, "image": None}
+    try:
+        proxy = docker.state(docker.TRAEFIK_CONTAINER, timeout=10, health=True)
+        traefik_ok = bool(proxy["running"] and proxy["healthy"])
+    except (Error, OSError) as exc:
+        traefik_ok = None
+        errors.append(_error("traefik_assessment_failed", "host/traefik", _message(config, exc)))
+    try:
+        listeners = _listeners()
+    except (Error, OSError) as exc:
+        listeners = {"5432": None, "6379": None}
+        errors.append(_error("listener_assessment_failed", "host/listeners", _message(config, exc)))
     acme = config.paths.traefik / "acme/acme.json"
-    acme_ok = acme.is_file() and acme.stat().st_mode & 0o777 == 0o600
-    listeners = _listeners()
-    listeners_ok = all(listeners.values())
-    if not network_available:
-        errors.append(
-            _error(
-                "network_unavailable",
-                "host/infrastructure",
-                "dedicated Docker network is unavailable",
-            )
-        )
-    elif not network_owned:
-        errors.append(
-            _error(
-                "network_unowned",
-                "host/infrastructure",
-                "dedicated Docker network is not owned by evdb",
-            )
-        )
-    for code, ok, message in (
-        (
-            "traefik_unhealthy",
-            bool(proxy["running"] and proxy["healthy"]),
-            "dedicated Traefik is unhealthy",
-        ),
-        (
-            "traefik_configuration_changed",
-            traefik_configuration_match,
-            "dedicated Traefik configuration differs",
-        ),
-        (
-            "traefik_contract_changed",
-            traefik_contract_match,
-            "running Traefik differs from its installed contract",
-        ),
-        ("acme_unsafe", acme_ok, "ACME storage is missing or not private"),
-        ("listener_missing", listeners_ok, "native database listener is unavailable"),
-    ):
-        if not ok:
-            errors.append(_error(code, "host/infrastructure", message))
-    return {
-        "healthy": network_ok and traefik_ok and acme_ok and listeners_ok,
+    try:
+        details = acme.lstat()
+        acme_ok = stat.S_ISREG(details.st_mode) and details.st_mode & 0o777 == 0o600
+    except FileNotFoundError:
+        acme_ok = False
+    except OSError as exc:
+        acme_ok = None
+        errors.append(_error("acme_assessment_failed", "host/acme", _message(config, exc)))
+    values = {
         "network": network_ok,
-        "network_owned": network_owned,
         "traefik": traefik_ok,
-        "traefik_configuration_match": traefik_configuration_match,
-        "traefik_contract_match": traefik_contract_match,
-        "acme": acme_ok,
         "listeners": listeners,
-        "source_image": config.host.routing.traefik_image,
-        "image": expected_image,
-        "running_image": proxy["image"],
+        "acme": acme_ok,
+        "image": proxy["image"],
     }
+    values["healthy"] = (
+        network_ok is True
+        and traefik_ok is True
+        and all(value is True for value in listeners.values())
+        and acme_ok is True
+    )
+    if not values["healthy"]:
+        errors.append(
+            _error(
+                "infrastructure_unhealthy",
+                "host/infrastructure",
+                "routing infrastructure is incomplete",
+            )
+        )
+    return values
 
 
 def _listeners() -> dict[str, bool]:
     result = run(["ss", "-H", "-ltn"], timeout=10, check=False)
-    text = result.out if result.code == 0 else ""
-    return {
-        "5432": ":5432 " in text or ":5432\n" in text,
-        "6379": ":6379 " in text or ":6379\n" in text,
+    if result.code:
+        detail = result.err.strip() or result.out.strip() or "no output"
+        raise CommandError(f"listener inspection failed ({result.code}): {detail}")
+    text = result.out
+    return {str(port): f":{port} " in text or f":{port}\n" in text for port in (5432, 6379)}
+
+
+def _timer(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
+    value = {
+        "unit": "evdb-backup.timer",
+        "loaded": None,
+        "enabled": None,
+        "active": None,
+        "available": False,
+        "ok": False,
     }
-
-
-def _timers(config, errors):
-    required = _REQUIRED_TIMERS
-    database_units = {
-        target.identity: _backup_timer(target.identity)
-        for target in config.databases
-        if target.durable
-    }
-    result = run(
-        [
-            "systemctl",
-            "show",
-            *required,
-            *database_units.values(),
-            "--property=Id,LoadState,UnitFileState,ActiveState",
-        ],
-        timeout=20,
-        check=False,
-    )
-    units = {}
-    current = {}
-    for line in result.out.splitlines() + [""]:
-        if not line:
-            if current.get("Id"):
-                units[current["Id"]] = {
-                    "loaded": current.get("LoadState") == "loaded",
-                    "enabled": current.get("UnitFileState") == "enabled",
-                    "active": current.get("ActiveState") == "active",
-                }
-            current = {}
-        elif "=" in line:
-            key, value = line.split("=", 1)
-            current[key] = value
-    required_ok = result.code == 0 and all(_unit_ok(units.get(name)) for name in required)
-    databases = {
-        identity: {"unit": name, **units.get(name, _empty_unit())}
-        for identity, name in database_units.items()
-    }
-    database_ok = result.code == 0 and all(
-        _unit_ok(units.get(name)) for name in database_units.values()
-    )
-    if not required_ok:
-        errors.append(_error("timer_inactive", "host/timers", "required timers are inactive"))
-    for identity, item in databases.items():
-        if not _unit_ok(item):
-            errors.append(_error("timer_inactive", identity, "database backup timer is inactive"))
-    return {
-        "ok": required_ok and database_ok,
-        "required": {name: units.get(name, _empty_unit()) for name in required},
-        "databases": databases,
-    }
-
-
-def _backup_timer(identity: str) -> str:
-    escaped = "".join(
-        "-" if character == "/" else (rf"\x{ord(character):02x}" if character == "-" else character)
-        for character in identity
-    )
-    return f"evdb-backup@{escaped}.timer"
-
-
-def _empty_unit() -> dict[str, bool]:
-    return {"loaded": False, "enabled": False, "active": False}
-
-
-def _unit_ok(value) -> bool:
-    return bool(value and value.get("loaded") and value.get("enabled") and value.get("active"))
-
-
-def _transaction(config: Config) -> dict[str, Any] | None:
-    roots = (config.paths.state / "transactions", config.paths.restores)
-    active = os.getenv("EVDB_ACTIVE_TRANSACTION")
-    active_path = Path(active).resolve() if active else None
-    for root in roots:
-        if root.is_dir():
-            for path in sorted(root.iterdir()):
-                if active_path is not None and path.resolve() == active_path:
-                    continue
-                if path.is_dir() and any(path.iterdir()):
-                    data = {}
-                    record = path / "transaction.json"
-                    if record.is_file() and not record.is_symlink():
-                        try:
-                            value = json.loads(record.read_text())
-                            data = value if isinstance(value, dict) else {}
-                        except OSError, json.JSONDecodeError:
-                            pass
-                    project = data.get("project")
-                    role = data.get("role")
-                    identity = data.get("database")
-                    if isinstance(identity, str) and "/" in identity:
-                        project, role = identity.split("/", 1)
-                    if not project or role not in {"postgres", "kv"}:
-                        for candidate_role in ("postgres", "kv"):
-                            marker = f"-{candidate_role}-"
-                            if marker in path.name:
-                                project = path.name.rsplit(marker, 1)[0]
-                                role = candidate_role
-                                break
-                    details = path.stat()
-                    return {
-                        "kind": data.get("kind")
-                        or ("restore" if root == config.paths.restores else "settings"),
-                        "path": str(path),
-                        "project": project if isinstance(project, str) else None,
-                        "role": role if role in {"postgres", "kv"} else None,
-                        "phase": data.get("phase") or "staged",
-                        "recovery": data.get("recovery") or "run evdb host check before mutation",
-                        "updated": datetime.fromtimestamp(details.st_mtime, UTC).isoformat(),
-                    }
-    return None
-
-
-def _freshness(config, target, upload, test, errors):
-    now = datetime.now(UTC)
-    upload_time = _date(upload.get("time")) if isinstance(upload, dict) else None
-    test_time = _date(test.get("time")) if isinstance(test, dict) and test.get("ok") else None
-    upload_stale = (
-        upload_time is None
-        or (now - upload_time).total_seconds() > config.host.backup.max_age_hours * 3600
-    )
-    if upload_stale:
-        errors.append(_error("backup_stale", target.identity, "remote backup is stale"))
-    if test_time is None or (now - test_time).days > config.host.backup.test_max_age_days:
-        errors.append(_error("backup_test_stale", target.identity, "backup test is stale"))
-
-
-def _compose_matches(path: Path, expected: dict[str, Any]) -> bool:
-    if path.is_symlink() or not path.is_file():
-        return False
     try:
-        text = path.read_text()
-        rendered = yaml.safe_dump(expected, sort_keys=False)
-        return yaml.safe_load(text) == expected and text == rendered
-    except OSError, yaml.YAMLError:
-        return False
+        result = run(
+            [
+                "systemctl",
+                "show",
+                "evdb-backup.timer",
+                "--property=LoadState,UnitFileState,ActiveState",
+            ],
+            timeout=20,
+            check=False,
+        )
+        if result.code:
+            detail = result.err.strip() or result.out.strip() or "no output"
+            raise CommandError(f"timer inspection failed ({result.code}): {detail}")
+        fields = dict(line.split("=", 1) for line in result.out.splitlines() if "=" in line)
+        required = {"LoadState", "UnitFileState", "ActiveState"}
+        if not required.issubset(fields):
+            raise CommandError("timer inspection returned incomplete fields")
+        value.update(
+            loaded=fields["LoadState"] == "loaded",
+            enabled=fields["UnitFileState"] == "enabled",
+            active=fields["ActiveState"] == "active",
+            available=True,
+        )
+        value["ok"] = all(value[name] for name in ("loaded", "enabled", "active"))
+    except (Error, OSError) as exc:
+        errors.append(_error("timer_assessment_failed", "host/timer", _message(config, exc)))
+        return value
+    if not value["ok"]:
+        errors.append(_error("timer_inactive", "host/timer", "evdb-backup.timer is inactive"))
+    return value
 
 
-def _existing(path: Path) -> Path:
-    current = path
-    while not current.exists() and current != current.parent:
-        current = current.parent
-    return current
-
-
-def _version() -> str:
-    return __version__
+def _disk(path: Path, minimum: int) -> dict[str, Any]:
+    available = round(free_gb(path), 2)
+    return {
+        "path": str(path),
+        "free_gb": available,
+        "ok": available >= minimum,
+        "available": True,
+    }
 
 
 def _date(value: Any) -> datetime | None:
@@ -689,62 +338,27 @@ def _date(value: Any) -> datetime | None:
     return result if result.tzinfo else result.replace(tzinfo=UTC)
 
 
-def _backup_cell(value) -> str:
-    if not isinstance(value, dict):
-        return "-"
-    return _cell(value.get("backup") or _short_time(value.get("time")), 14)
+def _backup_text(value: dict[str, Any]) -> str:
+    if value["state"] == "disabled":
+        return "disabled"
+    if value["state"] == "stale":
+        return "stale/missing"
+    date = _date(value["time"])
+    return date.strftime("%m-%d %H:%M") if date else "current"
 
 
-def _upload_cell(value, backup) -> str:
-    if not isinstance(value, dict) and isinstance(backup, dict):
-        value = backup.get("upload")
-    if not isinstance(value, dict):
-        return "-"
-    if value.get("ok") is False:
-        return "failed"
-    return _cell(value.get("snapshot") or _short_time(value.get("time")) or "ok", 14)
+def _fit(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width < 7:
+        return value[:width]
+    left = (width - 1) // 2
+    return value[:left] + "~" + value[-(width - left - 1) :]
 
 
-def _test_cell(value) -> str:
-    if not isinstance(value, dict):
-        return "-"
-    state = "ok" if value.get("ok") else "failed"
-    selected = value.get("backup") or value.get("snapshot") or _short_time(value.get("time"))
-    return _cell(f"{state}:{selected}" if selected else state, 14)
+def _error(code: str, scope: str, message: str) -> dict[str, str]:
+    return {"code": code, "scope": scope, "message": clean(str(message))[:500]}
 
 
-def _short_time(value) -> str | None:
-    date = _date(value)
-    return date.strftime("%m-%d %H:%M") if date else None
-
-
-def _cell(value, width: int) -> str:
-    if value is None or value == "":
-        return "-"
-    text = str(value).replace("\n", " ")
-    return text if len(text) <= width else text[: width - 1] + "~"
-
-
-def _error(code: str, scope: str, value: Any) -> dict[str, str]:
-    return {"code": code, "scope": scope, "message": _message(value)}
-
-
-def _message(value: Any) -> str:
-    return sanitize(str(value).replace("\x00", ""))[:500]
-
-
-def _safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _safe(item)
-            for key, item in value.items()
-            if not any(
-                name in str(key).lower()
-                for name in ("password", "token", "secret", "credential", "authorization")
-            )
-        }
-    if isinstance(value, (list, tuple)):
-        return [_safe(item) for item in value]
-    if isinstance(value, str):
-        return sanitize(value)
-    return value
+def _message(config: Config, value: Any) -> str:
+    return redact(str(value).replace("\0", ""), protected(config))[:500]

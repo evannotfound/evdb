@@ -8,7 +8,7 @@ DESTDIR=${DESTDIR:-}
 ROOT="${DESTDIR}/opt/evdb"
 VERSIONS="${ROOT}/versions"
 STABLE="${DESTDIR}/usr/local/bin/evdb"
-CONFIG="${DESTDIR}/etc/evdb/host.yml"
+CONFIG="${DESTDIR}/etc/evdb/config.yml"
 VERSION=${1:-}
 MAX_RELEASE_SIZE=${EVDB_MAX_RELEASE_SIZE:-268435456}
 STAGE=
@@ -17,6 +17,7 @@ CURRENT_TEMP=
 PREVIOUS_TEMP=
 STABLE_TEMP=
 UPGRADE=0
+CONFIGURED=0
 OLD_CURRENT=
 OLD_PREVIOUS=
 PREVIOUS_EXISTS=0
@@ -35,6 +36,9 @@ fail() {
 
 cleanup() {
     if [ "${COMMITTED}" -eq 0 ]; then
+        if [ "${TARGET_CREATED}" -eq 1 ]; then
+            rm -rf "${TARGET}"
+        fi
         if [ "${PREVIOUS_CREATED}" -eq 1 ]; then
             rm -f "${ROOT}/previous"
             if [ "${PREVIOUS_EXISTS}" -eq 1 ]; then
@@ -49,9 +53,6 @@ cleanup() {
             if [ "${UPGRADE}" -eq 1 ]; then
                 ln -s "${OLD_CURRENT}" "${ROOT}/current"
             fi
-        fi
-        if [ "${TARGET_CREATED}" -eq 1 ]; then
-            rm -rf "${TARGET}"
         fi
     fi
     if [ -n "${CURRENT_TEMP}" ]; then
@@ -135,7 +136,46 @@ version_link() {
         fail "managed ${LABEL} version directory is invalid: ${VERSION_DIR}"
     [ -x "${VERSION_DIR}/bin/evdb" ] && [ ! -L "${VERSION_DIR}/bin/evdb" ] || \
         fail "managed ${LABEL} version has no executable evdb command: ${VERSION_DIR}"
+    REPORTED=$("${VERSION_DIR}/bin/evdb" --version 2>&1) || \
+        fail "managed ${LABEL} version executable failed: ${VERSION_DIR}"
+    [ "${REPORTED}" = "evdb ${SELECTED}" ] || \
+        fail "managed ${LABEL} version executable is mismatched: ${VERSION_DIR}"
     printf '%s\n' "${TARGET_LINK}"
+}
+
+prune_versions() {
+    KEEP_CURRENT=$1
+    KEEP_PREVIOUS=$2
+    set +f
+    for ENTRY in "${VERSIONS}/"*; do
+        if [ ! -e "${ENTRY}" ] && [ ! -L "${ENTRY}" ]; then
+            continue
+        fi
+        NAME=${ENTRY##*/}
+        if [ "${NAME}" = "${KEEP_CURRENT}" ] || [ "${NAME}" = "${KEEP_PREVIOUS}" ]; then
+            continue
+        fi
+        valid_version "${NAME}" || fail "managed versions root contains an unexpected entry: ${ENTRY}"
+        if [ -L "${ENTRY}" ] || [ ! -d "${ENTRY}" ]; then
+            fail "managed version entry is not a safe directory: ${ENTRY}"
+        fi
+        rm -rf "${ENTRY}"
+    done
+    set -f
+}
+
+validate_versions() {
+    set +f
+    for ENTRY in "${VERSIONS}/"*; do
+        if [ ! -e "${ENTRY}" ] && [ ! -L "${ENTRY}" ]; then
+            continue
+        fi
+        NAME=${ENTRY##*/}
+        valid_version "${NAME}" || fail "managed versions root contains an unexpected entry: ${ENTRY}"
+        [ -d "${ENTRY}" ] && [ ! -L "${ENTRY}" ] || \
+            fail "managed version entry is not a safe directory: ${ENTRY}"
+    done
+    set -f
 }
 
 trap cleanup EXIT
@@ -186,7 +226,9 @@ LOCK_CREATED=1
 
 if [ -e "${ROOT}/current" ] || [ -L "${ROOT}/current" ]; then
     if [ -e "${CONFIG}" ] || [ -L "${CONFIG}" ]; then
-        fail "evdb is already configured; use evdb host update VERSION after fixing host config"
+        [ -f "${CONFIG}" ] && [ ! -L "${CONFIG}" ] || \
+            fail "managed configuration is invalid: ${CONFIG}"
+        CONFIGURED=1
     fi
     UPGRADE=1
     OLD_CURRENT=$(version_link "${ROOT}/current" "current")
@@ -209,6 +251,7 @@ else
 fi
 
 install -d -m 0755 "${VERSIONS}"
+validate_versions
 STAGE=$(mktemp -d "${VERSIONS}/.install.XXXXXXXX")
 ARCHIVE="${STAGE}/${ASSET}"
 CHECKSUM="${ARCHIVE}.sha256"
@@ -243,11 +286,7 @@ tar -tvzf "${ARCHIVE}" > "${VERBOSE}"
 while IFS= read -r NAME; do
     case "${NAME}" in
         bin/evdb) ;;
-        units/evdb-*.service|units/evdb-*.timer)
-            case "${NAME#units/}" in
-                */*) fail "release archive contains a nested unit path: ${NAME}" ;;
-            esac
-            ;;
+        units/evdb-backup.service|units/evdb-backup.timer) ;;
         *) fail "release archive contains an unexpected member: ${NAME}" ;;
     esac
 done < "${LIST}"
@@ -268,13 +307,7 @@ while IFS= read -r DETAILS; do
 done < "${VERBOSE}"
 
 grep -Fx 'bin/evdb' "${LIST}" >/dev/null || fail "release archive has no evdb executable"
-for UNIT in \
-    evdb-backup@.service evdb-backup@.timer \
-    evdb-backup-test.service evdb-backup-test.timer \
-    evdb-prune.service evdb-prune.timer \
-    evdb-repository-check.service evdb-repository-check.timer \
-    evdb-retention.service evdb-retention.timer \
-    evdb-status.service evdb-status.timer; do
+for UNIT in evdb-backup.service evdb-backup.timer; do
     grep -Fx "units/${UNIT}" "${LIST}" >/dev/null || \
         fail "release archive is missing canonical unit: ${UNIT}"
 done
@@ -300,7 +333,9 @@ valid_version "${RESOLVED}" || fail "release executable returned an invalid vers
     fail "release executable version does not match ${VERSION}"
 
 TARGET="${VERSIONS}/${RESOLVED}"
-[ ! -e "${TARGET}" ] && [ ! -L "${TARGET}" ] || fail "version is already installed: ${RESOLVED}"
+if [ -e "${TARGET}" ] || [ -L "${TARGET}" ]; then
+    fail "version is already installed: ${RESOLVED}"
+fi
 install -d -m 0755 "$(dirname "${STABLE}")"
 CURRENT_TEMP="${ROOT}/.current.new.$$"
 PREVIOUS_TEMP="${ROOT}/.previous.new.$$"
@@ -312,8 +347,6 @@ STABLE_TEMP="${STABLE}.new.$$"
 [ ! -e "${STABLE_TEMP}" ] && [ ! -L "${STABLE_TEMP}" ] || \
     fail "temporary stable link already exists"
 ln -s "versions/${RESOLVED}" "${CURRENT_TEMP}"
-TARGET_CREATED=1
-mv "${RELEASE}" "${TARGET}"
 if [ "${UPGRADE}" -eq 1 ]; then
     ln -s "${OLD_CURRENT}" "${PREVIOUS_TEMP}"
     PREVIOUS_CREATED=1
@@ -323,6 +356,8 @@ if [ "${UPGRADE}" -eq 1 ]; then
 else
     ln -s "${ROOT}/current/bin/evdb" "${STABLE_TEMP}"
 fi
+mv "${RELEASE}" "${TARGET}"
+TARGET_CREATED=1
 CURRENT_CREATED=1
 rm -f "${ROOT}/current"
 mv "${CURRENT_TEMP}" "${ROOT}/current"
@@ -332,6 +367,14 @@ if [ "${UPGRADE}" -eq 0 ]; then
     mv "${STABLE_TEMP}" "${STABLE}"
     STABLE_TEMP=
 fi
+version_link "${ROOT}/current" "current" >/dev/null
+CURRENT_VERSION=${SELECTED}
+PREVIOUS_VERSION=
+if [ -e "${ROOT}/previous" ] || [ -L "${ROOT}/previous" ]; then
+    version_link "${ROOT}/previous" "previous" >/dev/null
+    PREVIOUS_VERSION=${SELECTED}
+fi
+prune_versions "${CURRENT_VERSION}" "${PREVIOUS_VERSION}"
 COMMITTED=1
 
 if [ "${UPGRADE}" -eq 1 ]; then
@@ -339,4 +382,8 @@ if [ "${UPGRADE}" -eq 1 ]; then
 else
     printf '%s\n' "Installed evdb ${RESOLVED}."
 fi
-printf '%s\n' "Next: sudo evdb host setup"
+if [ "${CONFIGURED}" -eq 1 ]; then
+    "${ROOT}/current/bin/evdb" init --yes
+else
+    printf '%s\n' "Next: sudo evdb init"
+fi

@@ -1,25 +1,31 @@
 host:
   id: test-01
   domain: storage.example.com
-  data_root: /srv/databases
+  data_root: /srv/evdb-test
   backup:
-    repos:
-      postgres: /tmp/test-postgres-repo
-      kv: /tmp/test-kv-repo
+    repository: /tmp/evdb-repository
+    min_free_gb: 0
+    max_age_hours: 26
   routing:
     acme_email: ops@example.com
     dns_provider: testdns
+    traefik_image: traefik:v3.7.8
 projects:
   app-test-01:
     postgres:
       image: postgres:16
       pgbouncer:
-        enabled: false
+        enabled: true
         image: edoburu/pgbouncer:v1.25.1-p0
+        max_clients: 100
+        pool_size: 20
+        reserve_size: 5
     kv:
       engine: redis
       image: redis:7.2.5
-      mode: cache
+      mode: durable
       http:
         enabled: true
         image: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
+        connections: 20
+        domain: null

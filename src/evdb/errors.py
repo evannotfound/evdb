@@ -26,9 +26,5 @@ class BackupError(Error):
     pass
 
 
-class RestoreError(Error):
-    pass
-
-
 class ResticError(Error):
     pass

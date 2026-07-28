@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shlex
 import subprocess
@@ -116,14 +117,18 @@ def sync_manifest(*, run=subprocess.run) -> bytes:
         input=listed,
         stdout=subprocess.PIPE,
         check=False,
-    ).stdout
-    excluded = {item for item in ignored.decode().split("\0") if item}
-    files = [
-        item
-        for item in listed.decode().split("\0")
-        if item and item not in excluded and (ROOT / item).is_file()
-    ]
-    return "\0".join(files).encode() + b"\0"
+    )
+    if ignored.returncode not in {0, 1}:
+        raise DevError(f"git check-ignore failed with exit code {ignored.returncode}")
+    excluded = {item for item in ignored.stdout.split(b"\0") if item}
+    files = []
+    for raw in listed.split(b"\0"):
+        if not raw or raw in excluded:
+            continue
+        name = os.fsdecode(raw)
+        if (ROOT / name).is_file():
+            files.append(raw)
+    return b"\0".join(files) + b"\0"
 
 
 def sync(target: str, checkout: str, *, run=subprocess.run) -> None:
@@ -136,28 +141,23 @@ def sync(target: str, checkout: str, *, run=subprocess.run) -> None:
         f"{_checkout_guard(checkout, writable=True)}"
     )
     run(ssh_command(target, prepare), check=True)
-    rsync = [
-        "rsync",
-        "--archive",
-        "--delete-delay",
-        "--partial-dir=.rsync-partial",
-        "--filter=P /.venv/",
-        "--filter=P /.rsync-partial/",
-        "--files-from=-",
-        "--from0",
-        "--",
-        "./",
-        f"{target}:{checkout}/",
-    ]
-    try:
-        run(rsync, cwd=ROOT, input=manifest, check=True)
-    finally:
-        cleanup = (
-            "set -eu; "
-            f'test "$(hostname -s)" != {PRODUCTION_HOST}; '
-            f"rm -rf {shlex.quote(checkout + '/.rsync-partial')}"
-        )
-        run(ssh_command(target, cleanup), check=False)
+    run(
+        [
+            "rsync",
+            "--archive",
+            "--delete-delay",
+            "--filter=P /.venv/",
+            "--filter=P **/__pycache__/",
+            "--files-from=-",
+            "--from0",
+            "--",
+            "./",
+            f"{target}:{checkout}/",
+        ],
+        cwd=ROOT,
+        input=manifest,
+        check=True,
+    )
     run(
         ssh_command(
             target,
@@ -185,7 +185,7 @@ def execute(
     args: Sequence[str],
     *,
     run=subprocess.run,
-) -> None:
+) -> int:
     sync(target, checkout, run=run)
     checkout = checkout_path(checkout)
     if command == "test":
@@ -197,7 +197,8 @@ def execute(
     else:
         selected = ["sudo", f"{checkout}/.venv/bin/evdb", *args]
         tty = True
-    run(ssh_command(target, remote_script(checkout, selected), tty=tty), check=True)
+    result = run(ssh_command(target, remote_script(checkout, selected), tty=tty), check=False)
+    return result.returncode
 
 
 def activate(target: str, checkout: str, *, enabled: bool, run=subprocess.run) -> None:
@@ -224,8 +225,11 @@ def main() -> int:
         elif args.command in {"activate", "deactivate"}:
             activate(args.target, args.checkout, enabled=args.command == "activate")
         else:
-            execute(args.target, args.checkout, args.command, args.args)
-    except (DevError, OSError, subprocess.CalledProcessError) as exc:
+            return execute(args.target, args.checkout, args.command, args.args)
+    except subprocess.CalledProcessError as exc:
+        print(f"dev VPS: command failed with exit code {exc.returncode}", file=sys.stderr)
+        return exc.returncode or 1
+    except (DevError, OSError) as exc:
         print(f"dev VPS: {exc}", file=sys.stderr)
         return 1
     return 0

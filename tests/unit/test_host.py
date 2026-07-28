@@ -1,1255 +1,727 @@
 import json
-import shutil
+import os
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
-from evdb import backup, compose, host, status
-from evdb.config import (
-    Paths,
-    dump,
-    load_state,
-    resolve_state,
-    write_state,
-)
-from evdb.errors import CommandError, ConfigError, HostError
+from evdb import host
+from evdb.models import Paths
 from evdb.run import Result
 
-DIGEST = "sha256:" + "a" * 64
+
+def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_path, monkeypatch):
+    calls = []
+    order = []
+    before = b"[remote]\ntype = local\ntoken = refreshed oauth state\n"
+    config.paths.rclone.write_bytes(before)
+    host._install_units(tmp_path / "systemd")
+    monkeypatch.setattr(host, "prerequisites", lambda: [])
+    monkeypatch.setattr(host, "_require_ports", lambda current: None)
+    monkeypatch.setattr(host, "_account", lambda paths: None)
+    monkeypatch.setattr(host, "_source_ownership", lambda current: order.append("source ownership"))
+    monkeypatch.setattr(
+        host, "_generated_ownership", lambda current: order.append("generated ownership")
+    )
+    monkeypatch.setattr(host, "_traefik", lambda current: order.append("traefik"))
+    monkeypatch.setattr(host.docker, "ensure_network", lambda **kwargs: order.append("network"))
+    monkeypatch.setattr(host.backup, "initialize", lambda current: order.append("repository"))
+    monkeypatch.setattr(
+        __import__("evdb.status", fromlist=["collect"]),
+        "collect",
+        lambda current: {
+            "healthy": True,
+            "host": {"id": current.host.id, "healthy": True},
+        },
+    )
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:3] == ["systemctl", "enable", "--now"]:
+            order.append("timer")
+        return Result(tuple(args), 0, "", "")
+
+    monkeypatch.setattr(host, "run", run)
+
+    value = host.initialize(
+        config.paths.source,
+        {"rclone_config": str(tmp_path / "unused")},
+        paths=config.paths,
+        unit_dir=tmp_path / "systemd",
+    )
+
+    assert value["host"]["id"] == config.host.id
+    assert config.paths.rclone.read_bytes() == before
+    assert order == [
+        "source ownership",
+        "network",
+        "traefik",
+        "repository",
+        "generated ownership",
+        "timer",
+    ]
+    assert ["systemctl", "daemon-reload"] in calls
+    assert ["systemctl", "enable", "--now", "evdb-backup.timer"] in calls
+    assert not any("evdb-status" in " ".join(call) for call in calls)
 
 
-def _values(tmp_path):
+def test_init_refuses_production_before_subprocesses(config, monkeypatch):
+    config.paths.source.write_text(
+        config.paths.source.read_text().replace("test-01", "montreal-01", 1)
+    )
+    calls = []
+    monkeypatch.setattr(host, "run", lambda *args, **kwargs: calls.append(args))
+
+    from evdb.errors import HostError
+
+    try:
+        host.initialize(config.paths.source, paths=config.paths)
+    except HostError as exc:
+        assert "separate change" in str(exc)
+    else:
+        raise AssertionError("production host was accepted")
+    assert calls == []
+
+
+def test_prerequisites_require_restic_017_without_python_or_uv(monkeypatch):
+    monkeypatch.setattr(host.shutil, "which", lambda name: f"/usr/bin/{name}")
+    calls = []
+    monkeypatch.setattr(
+        host,
+        "run",
+        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
+    )
+    monkeypatch.setattr(host.backup, "require_version", lambda: None)
+
+    assert host.prerequisites() == []
+    assert calls == [["docker", "compose", "version"]]
+    assert "python" not in host.TOOLS
+    assert "uv" not in host.TOOLS
+
+
+def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_path, monkeypatch):
     dns = tmp_path / "dns.env"
     dns.write_text("TESTDNS_TOKEN=private\n")
-    rclone = tmp_path / "rclone.conf"
-    rclone.write_text("[test]\ntype = local\n")
-    return {
-        "host_id": "test-01",
+    rclone = tmp_path / "seed.conf"
+    rclone.write_text("[local]\ntype = local\n")
+    values = {
+        "host_id": "new-test-01",
         "domain": "storage.example.com",
         "data_root": str(tmp_path / "data"),
         "acme_email": "ops@example.com",
         "dns_provider": "testdns",
-        "postgres_repo": str(tmp_path / "postgres-repo"),
-        "kv_repo": str(tmp_path / "kv-repo"),
-        "dns_env_file": str(dns),
+        "repository": str(tmp_path / "repository"),
+        "dns_file": str(dns),
         "rclone_config": str(rclone),
     }
-
-
-def _setup_mocks(monkeypatch):
-    calls = []
-    timer_state = {}
     monkeypatch.setattr(host, "prerequisites", lambda: [])
-    monkeypatch.setattr(host, "_ports_available", lambda: True)
-    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
-    monkeypatch.setattr(compose, "_network_exists", lambda *args, **kwargs: False)
-    monkeypatch.setattr(compose, "ensure_network", lambda *args, **kwargs: None)
-
-    def fake_run(args, **kwargs):
-        calls.append(args)
-        if args[0] == "systemd-escape":
-            return Result(tuple(args), 0, _escaped_timer(args[-1]) + "\n", "")
-        if args[0] == "systemctl":
-            return _systemctl(args, timer_state)
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
+    monkeypatch.setattr(host, "_require_ports", lambda current: None)
+    monkeypatch.setattr(host, "_account", lambda current: None)
+    monkeypatch.setattr(host, "_source_ownership", lambda current: None)
+    monkeypatch.setattr(host, "_generated_ownership", lambda current: None)
+    monkeypatch.setattr(host, "_traefik", lambda current: None)
+    monkeypatch.setattr(host.docker, "ensure_network", lambda **kwargs: None)
+    monkeypatch.setattr(host.backup, "initialize", lambda current: None)
+    monkeypatch.setattr(host, "_install_units", lambda target: None)
+    monkeypatch.setattr(host, "run", lambda args, **kwargs: Result(tuple(args), 0, "", ""))
     monkeypatch.setattr(
-        host,
-        "check",
-        lambda config: {"host": {"infrastructure": {"healthy": True}}},
+        __import__("evdb.status", fromlist=["collect"]),
+        "collect",
+        lambda current: {"healthy": True, "host": {"id": current.host.id, "healthy": True}},
     )
-    return calls, timer_state
 
-
-def test_setup_rerun_preserves_configured_state_and_mutable_files(config, tmp_path, monkeypatch):
-    calls, timer_state = _setup_mocks(monkeypatch)
-    units = tmp_path / "systemd"
-    values = _values(tmp_path)
-    paths = config.paths
-    paths.source.parent.mkdir(parents=True)
-    paths.source.write_text(dump(config))
-    initial = resolve_state(config, resolver=lambda source: DIGEST)
-    database = next(item for item in config.databases if item.durable)
-    role = replace(
-        initial.roles[database.identity],
-        compose_hash="installed-hash",
-        installed=True,
-        operations={"backup": {"time": "2026-07-25T00:00:00Z"}},
-    )
-    preserved = replace(
-        initial,
-        roles={**initial.roles, database.identity: role},
-        tool_version="1.0.0",
-    )
-    write_state(config, preserved)
-
-    result = host.setup(
+    value = host.initialize(
         paths.source,
         values,
-        yes=True,
-        paths=paths,
-        unit_dir=units,
-        resolver=lambda source: pytest.fail(f"unexpected image resolution: {source}"),
-    )
-    rclone = paths.rclone / "rclone.conf"
-    rclone.write_text("refreshed oauth state\n")
-    timer_state["evdb-status.timer"] = (False, False)
-    before_timers = dict(timer_state)
-
-    second = host.setup(
-        paths.source,
-        values,
-        yes=True,
-        paths=paths,
-        unit_dir=units,
-        resolver=lambda source: pytest.fail(f"unexpected image resolution: {source}"),
-    )
-
-    assert result == second == "Host setup complete"
-    assert load_state(config) == preserved
-    assert paths.source.is_file()
-    assert paths.machine_state.stat().st_mode & 0o777 == 0o600
-    assert (paths.secrets / "restic-password").stat().st_mode & 0o777 == 0o600
-    assert (paths.traefik / "dns.env").stat().st_mode & 0o777 == 0o600
-    assert (paths.traefik / "acme/acme.json").stat().st_mode & 0o777 == 0o600
-    assert paths.tool.stat().st_mode & 0o777 == 0o755
-    assert (paths.tool / "versions").stat().st_mode & 0o777 == 0o755
-    assert rclone.read_text() == "refreshed oauth state\n"
-    enables = [args for args in calls if args[:3] == ["systemctl", "enable", "--now"]]
-    assert len(enables) == 1
-    escaped = _escaped_timer(database.identity)
-    assert escaped == "evdb-backup@app\\x2dtest\\x2d01-postgres.timer"
-    assert ["systemd-escape", "--template=evdb-backup@.timer", database.identity] in calls
-    assert escaped in enables[0]
-    assert timer_state == before_timers
-    marker = units / f"{escaped}.d" / host.TIMER_MARKER
-    assert database.identity in marker.read_text()
-    expected_paths = (
-        "[Service]\nReadWritePaths=\n"
-        f"ReadWritePaths=/var/lib/evdb {json.dumps(str(config.host.data_root))}\n"
-    )
-    assert (units / "evdb-backup@.service.d" / host.DATA_DROPIN).read_text() == expected_paths
-    assert (units / "evdb-backup-test.service.d" / host.DATA_DROPIN).read_text() == expected_paths
-
-
-def test_setup_validates_private_traefik_before_canonical_install(config, tmp_path, monkeypatch):
-    paths = config.paths
-    paths.source.parent.mkdir(parents=True)
-    paths.source.write_text(dump(config))
-    write_state(config, resolve_state(config, resolver=lambda source: DIGEST))
-    paths.traefik.mkdir(parents=True)
-    canonical = paths.traefik / "compose.yaml"
-    canonical.write_text("prior compose\n")
-    canonical.chmod(0o600)
-    prior = (canonical.read_bytes(), canonical.stat().st_mode & 0o777)
-    _setup_mocks(monkeypatch)
-
-    def reject_candidate(path, project, **kwargs):
-        assert Path(path) != canonical
-        assert Path(path).parent.stat().st_mode & 0o777 == 0o700
-        raise HostError("candidate invalid")
-
-    monkeypatch.setattr(compose, "validate", reject_candidate)
-
-    with pytest.raises(HostError, match="candidate invalid"):
-        host.setup(
-            paths.source,
-            _values(tmp_path),
-            yes=True,
-            paths=paths,
-            unit_dir=tmp_path / "systemd",
-            resolver=lambda source: DIGEST,
-        )
-
-    assert (canonical.read_bytes(), canonical.stat().st_mode & 0o777) == prior
-
-
-def test_setup_failure_restores_prior_files_metadata_and_timer_state(config, tmp_path, monkeypatch):
-    paths = config.paths
-    paths.source.parent.mkdir(parents=True)
-    paths.source.write_text(dump(config))
-    write_state(config, resolve_state(config, resolver=lambda source: DIGEST))
-    paths.traefik.mkdir(parents=True)
-    canonical = paths.traefik / "compose.yaml"
-    canonical.write_text("prior compose\n")
-    canonical.chmod(0o600)
-    prior_compose = (canonical.read_bytes(), canonical.stat().st_mode & 0o777)
-    prior_state = paths.machine_state.read_bytes()
-    calls, timer_state = _setup_mocks(monkeypatch)
-    timer_state["evdb-status.timer"] = (False, True)
-    before_timers = {name: timer_state.get(name, (False, False)) for name in host.DEFAULT_TIMERS}
-    monkeypatch.setattr(
-        host,
-        "_wait_infrastructure",
-        lambda config: {"host": {"infrastructure": {"healthy": False}}},
-    )
-    units = tmp_path / "systemd"
-
-    with pytest.raises(HostError, match="prior files restored"):
-        host.setup(
-            paths.source,
-            _values(tmp_path),
-            yes=True,
-            paths=paths,
-            unit_dir=units,
-            resolver=lambda source: DIGEST,
-        )
-
-    assert (canonical.read_bytes(), canonical.stat().st_mode & 0o777) == prior_compose
-    assert paths.machine_state.read_bytes() == prior_state
-    assert {name: timer_state[name] for name in host.DEFAULT_TIMERS} == before_timers
-    assert not any(units.glob("*.service"))
-    assert not any(units.glob("*.timer"))
-    assert not (units / "evdb-backup@.service.d" / host.DATA_DROPIN).exists()
-    assert any(args[:2] == ["systemctl", "disable"] for args in calls)
-
-
-def test_setup_waits_for_native_infrastructure_health(config, tmp_path, monkeypatch):
-    paths = config.paths
-    paths.source.parent.mkdir(parents=True)
-    paths.source.write_text(dump(config))
-    write_state(config, resolve_state(config, resolver=lambda source: DIGEST))
-    _setup_mocks(monkeypatch)
-    checks = iter(
-        [
-            {"host": {"infrastructure": {"healthy": False}}},
-            {"host": {"infrastructure": {"healthy": True}}},
-        ]
-    )
-    sleeps = []
-    monkeypatch.setattr(host, "check", lambda config: next(checks))
-    monkeypatch.setattr(host.time, "sleep", lambda seconds: sleeps.append(seconds))
-
-    result = host.setup(
-        paths.source,
-        _values(tmp_path),
-        yes=True,
         paths=paths,
         unit_dir=tmp_path / "systemd",
-        resolver=lambda source: DIGEST,
     )
 
-    assert result == "Host setup complete"
-    assert sleeps == [1]
+    assert value["host"]["id"] == "new-test-01"
+    assert paths.source.is_file()
+    assert paths.secrets.stat().st_mode & 0o777 == 0o600
 
 
-def test_uninstall_preserves_local_data_and_removes_runtime(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    _installed_host(config, units)
-    calls = _mock_uninstall_run(config, monkeypatch, orphan_project="evdb-old-kv")
+def test_database_traefik_publishes_only_native_ports(config, monkeypatch):
+    monkeypatch.setattr(host.docker, "validate_compose", lambda *args, **kwargs: None)
+    monkeypatch.setattr(host.docker, "up", lambda *args, **kwargs: None)
 
-    result = host.uninstall(config, yes=True, unit_dir=units)
+    host._traefik(config)
 
-    assert result == "Host uninstalled; local data preserved"
-    assert config.paths.config.exists()
-    assert config.paths.state.exists()
-    assert config.host.data_root.exists()
-    assert not config.paths.tool.exists()
-    assert not any(units.glob("evdb-*.service"))
-    assert not any(units.glob("evdb-*.timer"))
-    assert (
-        compose.command(
-            config.paths.traefik / "compose.yaml",
-            compose.TRAEFIK_PROJECT,
-            "down",
-            "--remove-orphans",
-        )
-        in calls
-    )
-    assert ["docker", "rm", "--force", "orphan-1"] in calls
-    assert ["docker", "network", "rm", compose.NETWORK] in calls
+    service = yaml.safe_load((config.paths.traefik / "compose.yaml").read_text())["services"][
+        "traefik"
+    ]
+    assert service["ports"] == ["5432:5432/tcp", "6379:6379/tcp"]
+    assert not any("entrypoints.https" in item for item in service["command"])
 
 
-def test_uninstall_purge_removes_local_managed_data(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    _installed_host(config, units)
-    calls = _mock_uninstall_run(config, monkeypatch)
-
-    result = host.uninstall(config, purge=True, yes=True, unit_dir=units)
-
-    assert result == "Host uninstalled and local data purged"
-    assert not config.paths.config.exists()
-    assert not config.paths.state.exists()
-    assert not config.host.data_root.exists()
-    assert not config.paths.tool.exists()
-    assert not any(call[0] in {"userdel", "groupdel"} for call in calls)
-
-
-def test_uninstall_refuses_unowned_network(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    _installed_host(config, units)
-    _mock_uninstall_run(config, monkeypatch, network_owned=False)
-
-    with pytest.raises(HostError, match="Docker network is not owned"):
-        host.uninstall(config, yes=True, unit_dir=units)
-
-    assert config.paths.tool.exists()
-
-
-def test_setup_checks_prerequisites_ports_and_writable_roots_before_mutation(
-    paths, tmp_path, monkeypatch
-):
-    monkeypatch.setattr(host, "prerequisites", lambda: ["restic"])
-
-    with pytest.raises(HostError, match="restic"):
-        host.setup(paths.source, _values(tmp_path), yes=True, paths=paths)
-    assert not paths.config.exists()
-
+def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, monkeypatch):
+    dns = tmp_path / "dns.env"
+    dns.write_text("TESTDNS_TOKEN=private\n")
+    rclone = tmp_path / "seed.conf"
+    rclone.write_text("[local]\ntype = local\n")
+    values = {
+        "host_id": "retry-test-01",
+        "domain": "storage.example.com",
+        "data_root": str(tmp_path / "data"),
+        "acme_email": "ops@example.com",
+        "dns_provider": "testdns",
+        "repository": str(tmp_path / "repository"),
+        "dns_file": str(dns),
+        "rclone_config": str(rclone),
+    }
+    order = []
+    attempts = iter([RuntimeError("injected network failure"), None])
     monkeypatch.setattr(host, "prerequisites", lambda: [])
-    monkeypatch.setattr(host, "_writable", lambda path: path != paths.state)
-    with pytest.raises(HostError, match="state"):
-        host.setup(paths.source, _values(tmp_path), yes=True, paths=paths)
-    assert not paths.config.exists()
+    monkeypatch.setattr(host, "_require_ports", lambda current: None)
+    monkeypatch.setattr(host, "_account", lambda current: None)
+    monkeypatch.setattr(host, "_source_ownership", lambda current: order.append("source"))
+    monkeypatch.setattr(host, "_generated_ownership", lambda current: order.append("generated"))
 
-    monkeypatch.setattr(host, "_writable", lambda path: True)
-    monkeypatch.setattr(host, "_ports_available", lambda: False)
-    with pytest.raises(HostError, match="occupied"):
-        host.setup(paths.source, _values(tmp_path), yes=True, paths=paths)
-    assert not paths.config.exists()
+    def network(**kwargs):
+        order.append("network")
+        failure = next(attempts)
+        if failure:
+            raise failure
 
-
-def test_setup_rejects_unsafe_network_before_mutation(paths, tmp_path, monkeypatch):
-    monkeypatch.setattr(host, "prerequisites", lambda: [])
-    monkeypatch.setattr(host, "_writable", lambda path: True)
-    monkeypatch.setattr(host, "_ports_available", lambda: True)
+    monkeypatch.setattr(host.docker, "ensure_network", network)
+    monkeypatch.setattr(host, "_traefik", lambda current: order.append("traefik"))
+    monkeypatch.setattr(host.backup, "initialize", lambda current: order.append("repository"))
+    monkeypatch.setattr(host, "_install_units", lambda target: None)
+    monkeypatch.setattr(host, "run", lambda args, **kwargs: Result(tuple(args), 0, "", ""))
     monkeypatch.setattr(
-        compose,
-        "_network_exists",
-        lambda **kwargs: (_ for _ in ()).throw(ConfigError("network is not owned by evdb")),
+        __import__("evdb.status", fromlist=["collect"]),
+        "collect",
+        lambda current: {"healthy": True, "host": {"id": current.host.id, "healthy": True}},
     )
 
-    with pytest.raises(ConfigError, match="not owned"):
-        host.setup(paths.source, _values(tmp_path), yes=True, paths=paths)
+    with pytest.raises(RuntimeError, match="injected"):
+        host.initialize(paths.source, values, paths=paths, unit_dir=tmp_path / "systemd")
 
-    assert not paths.config.exists()
+    assert paths.source.is_file() and paths.secrets.is_file() and paths.rclone.is_file()
+    assert order == ["source", "network"]
 
+    result = host.initialize(
+        paths.source,
+        {"restic_password_file": str(tmp_path / "must-not-be-read")},
+        paths=paths,
+        unit_dir=tmp_path / "systemd",
+    )
 
-def test_setup_requires_dns_credential_input_before_mutation(paths, tmp_path, monkeypatch):
-    values = _values(tmp_path)
-    values.pop("dns_env_file")
-    monkeypatch.setattr(host, "prerequisites", lambda: [])
-    monkeypatch.setattr(host, "_writable", lambda path: True)
-    monkeypatch.setattr(host, "_ports_available", lambda: True)
-    monkeypatch.setattr(compose, "_network_exists", lambda **kwargs: False)
-
-    with pytest.raises(HostError, match="dns_env_file is required"):
-        host.setup(paths.source, values, yes=True, paths=paths)
-
-    assert not paths.config.exists()
+    assert result["healthy"]
+    assert order == ["source", "network", "source", "network", "traefik", "repository", "generated"]
 
 
-def test_initial_setup_validates_managed_path_overlap_before_prerequisites(
-    paths, tmp_path, monkeypatch
+def test_unit_convergence_rejects_symlink_and_nonregular_destinations(tmp_path):
+    target = tmp_path / "systemd"
+    target.mkdir()
+    destination = target / host.BACKUP_SERVICE
+    destination.symlink_to(tmp_path / "elsewhere")
+
+    with pytest.raises(host.HostError, match="unsafe"):
+        host._install_units(target)
+
+    destination.unlink()
+    destination.mkdir()
+    with pytest.raises(host.HostError, match="unsafe"):
+        host._install_units(target)
+
+    destination.rmdir()
+    target.rmdir()
+    target.symlink_to(tmp_path)
+    with pytest.raises(host.HostError, match="directory is unsafe"):
+        host._install_units(target)
+
+
+def test_unit_convergence_enforces_mode_owner_and_reports_metadata_change(tmp_path, monkeypatch):
+    target = tmp_path / "systemd"
+    host._install_units(target)
+    service = target / host.BACKUP_SERVICE
+    service.chmod(0o600)
+    ownership = []
+    monkeypatch.setattr(host, "UNIT_DIR", target)
+    monkeypatch.setattr(host.os, "chown", lambda path, uid, gid: ownership.append((path, uid, gid)))
+    real_stat = host.Path.stat
+
+    def stat_with_foreign_owner(path, *args, **kwargs):
+        value = real_stat(path, *args, **kwargs)
+        if path.parent == target:
+            return os.stat_result(
+                (value.st_mode, value.st_ino, value.st_dev, 1, 1, 1, value.st_size, 0, 0, 0)
+            )
+        return value
+
+    monkeypatch.setattr(host.Path, "stat", stat_with_foreign_owner)
+
+    host._install_units(target)
+    assert service.stat().st_mode & 0o777 == 0o644
+    assert {Path(path).name for path, uid, gid in ownership if (uid, gid) == (0, 0)} == {
+        host.BACKUP_SERVICE,
+        host.BACKUP_TIMER,
+    }
+
+
+def test_initial_restic_password_file_is_private_and_existing_config_ignores_replacement(
+    paths, tmp_path
 ):
-    values = {**_values(tmp_path), "data_root": str(paths.state)}
-    checked = []
-    monkeypatch.setattr(host, "prerequisites", lambda: checked.append(True) or [])
+    password = tmp_path / "restic-password"
+    password.write_text("existing repository password\n")
+    password.chmod(0o600)
+    dns = tmp_path / "dns.env"
+    dns.write_text("TESTDNS_TOKEN=private\n")
+    values = {
+        "host_id": "password-test-01",
+        "domain": "storage.example.com",
+        "data_root": str(tmp_path / "data"),
+        "acme_email": "ops@example.com",
+        "dns_provider": "testdns",
+        "repository": str(tmp_path / "repository"),
+        "dns_file": str(dns),
+        "rclone_config": str(tmp_path / "rclone.conf"),
+        "restic_password_file": str(password),
+    }
 
-    with pytest.raises(ConfigError, match="overlaps managed path"):
-        host.setup(paths.source, values, yes=True, paths=paths)
+    config = host._initial(values, paths)
 
-    assert checked == []
+    assert config.secrets.restic_password == "existing repository password"
+    password.chmod(0o644)
+    with pytest.raises(host.HostError, match="private regular"):
+        host._initial(values, paths)
+
+
+def test_initial_restic_password_rejects_unsafe_file_shapes(tmp_path):
+    candidates = []
+    empty = tmp_path / "empty"
+    empty.write_text("")
+    empty.chmod(0o600)
+    candidates.append(empty)
+    multiline = tmp_path / "multiline"
+    multiline.write_text("first\nsecond\n")
+    multiline.chmod(0o600)
+    candidates.append(multiline)
+    nul = tmp_path / "nul"
+    nul.write_bytes(b"before\0after\n")
+    nul.chmod(0o600)
+    candidates.append(nul)
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    candidates.append(directory)
+    symlink = tmp_path / "symlink"
+    symlink.symlink_to(empty)
+    candidates.append(symlink)
+
+    for path in candidates:
+        with pytest.raises(host.HostError, match="password"):
+            host._restic_password({"restic_password_file": str(path)})
+
+
+def test_generated_ownership_never_recursively_chowns_database_data(config, monkeypatch):
+    descendant = config.host.data_root / "app-test-01/postgres/data/PG_VERSION"
+    descendant.parent.mkdir(parents=True)
+    descendant.write_text("16\n")
+    before = descendant.stat()
+    calls = []
+    monkeypatch.setattr(host, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(
+        host,
+        "run",
+        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
+    )
+
+    host._generated_ownership(config)
+
+    recursive = next(args for args in calls if "-R" in args)
+    assert str(config.host.data_root) not in recursive
+    assert ["chown", "evdb:evdb", str(config.host.data_root)] in calls
+    after = descendant.stat()
+    assert descendant.read_text() == "16\n"
+    assert (after.st_uid, after.st_gid, after.st_mode) == (
+        before.st_uid,
+        before.st_gid,
+        before.st_mode,
+    )
+
+
+def test_managed_directory_symlink_is_rejected_without_following(config, tmp_path):
+    real = tmp_path / "real-state"
+    real.mkdir()
+    linked = tmp_path / "state-link"
+    linked.symlink_to(real, target_is_directory=True)
+    unsafe = replace(
+        config,
+        paths=Paths(config=config.paths.config, state=linked),
+    )
+
+    with pytest.raises(host.HostError, match="unsafe"):
+        host._directories(unsafe)
+
+
+def test_canonical_source_directory_converges_to_sticky_group_writable(config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(host, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(
+        host,
+        "run",
+        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
+    )
+
+    host._directories(config)
+    host._source_ownership(config)
+
+    assert config.paths.config.stat().st_mode & 0o7777 == 0o1770
+    assert calls.count(["chmod", "01770", str(config.paths.config)]) == 1
+
+
+def test_ports_probe_uses_sockets_only_for_confirmed_absent_container(config, monkeypatch):
+    calls = []
+    binds = []
+
+    class Socket:
+        def bind(self, address):
+            binds.append(address)
+
+        def close(self):
+            pass
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return Result(tuple(args), 1, "", "Error: No such object: evdb-traefik")
+
+    monkeypatch.setattr(host, "run", run)
+    monkeypatch.setattr(host.socket, "socket", Socket)
+
+    host._require_ports(config)
+    assert binds == [("0.0.0.0", 5432), ("0.0.0.0", 6379)]
+    assert config.secrets.restic_password in calls[0][1]["secrets"]
+
+
+def test_ports_probe_preserves_redacted_docker_denial_without_socket_probe(config, monkeypatch):
+    secret = config.secrets.restic_password
+    monkeypatch.setattr(
+        host,
+        "run",
+        lambda args, **kwargs: Result(tuple(args), 1, "", f"daemon denied {secret}"),
+    )
+    monkeypatch.setattr(
+        host.socket,
+        "socket",
+        lambda: pytest.fail("socket probe must not run after Docker denial"),
+    )
+
+    with pytest.raises(host.HostError) as caught:
+        host._require_ports(config)
+
+    assert str(caught.value) == "daemon denied <redacted>"
+
+
+def test_ports_probe_rejects_malformed_docker_json_without_socket_probe(config, monkeypatch):
+    secret = config.secrets.restic_password
+    monkeypatch.setattr(
+        host,
+        "run",
+        lambda args, **kwargs: Result(tuple(args), 0, f"not-json {secret}", ""),
+    )
+    monkeypatch.setattr(
+        host.socket,
+        "socket",
+        lambda: pytest.fail("socket probe must not run after malformed Docker output"),
+    )
+
+    with pytest.raises(host.HostError) as caught:
+        host._require_ports(config)
+
+    assert str(caught.value) == "malformed Docker inspection: not-json <redacted>"
+
+
+def test_ports_probe_names_exact_occupied_native_port(config, monkeypatch):
+    binds = []
+
+    class Socket:
+        def bind(self, address):
+            binds.append(address)
+            if address[1] == 6379:
+                raise OSError("address in use")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        host,
+        "run",
+        lambda args, **kwargs: Result(tuple(args), 1, "", "No such container: evdb-traefik"),
+    )
+    monkeypatch.setattr(host.socket, "socket", Socket)
+
+    with pytest.raises(host.HostError, match="port 6379 is occupied"):
+        host._require_ports(config)
+
+    assert binds == [("0.0.0.0", 5432), ("0.0.0.0", 6379)]
+
+
+def test_ports_probe_stopped_owned_traefik_and_accepts_free_ports(config, monkeypatch):
+    binds = []
+
+    class Socket:
+        def bind(self, address):
+            binds.append(address)
+
+        def close(self):
+            pass
+
+    inspected = json.dumps(
+        [
+            {
+                "Config": {"Labels": {"com.docker.compose.project": "evdb-traefik"}},
+                "State": {"Running": False},
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        host,
+        "run",
+        lambda args, **kwargs: Result(tuple(args), 0, inspected, ""),
+    )
+    monkeypatch.setattr(host.socket, "socket", Socket)
+
+    host._require_ports(config)
+
+    assert binds == [("0.0.0.0", 5432), ("0.0.0.0", 6379)]
+
+
+def test_ports_accept_running_owned_traefik_without_socket_probe(config, monkeypatch):
+    inspected = json.dumps(
+        [
+            {
+                "Config": {"Labels": {"com.docker.compose.project": "evdb-traefik"}},
+                "State": {"Running": True},
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        host,
+        "run",
+        lambda args, **kwargs: Result(tuple(args), 0, inspected, ""),
+    )
+    monkeypatch.setattr(
+        host.socket,
+        "socket",
+        lambda: pytest.fail("running owned Traefik must not probe ports"),
+    )
+
+    host._require_ports(config)
+
+
+def test_ports_probe_stopped_owned_traefik_rejects_exact_occupied_port(config, monkeypatch):
+    class Socket:
+        def bind(self, address):
+            if address[1] == 5432:
+                raise OSError("address in use")
+
+        def close(self):
+            pass
+
+    inspected = json.dumps(
+        [
+            {
+                "Config": {"Labels": {"com.docker.compose.project": "evdb-traefik"}},
+                "State": {"Running": False},
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        host,
+        "run",
+        lambda args, **kwargs: Result(tuple(args), 0, inspected, ""),
+    )
+    monkeypatch.setattr(host.socket, "socket", Socket)
+
+    with pytest.raises(host.HostError, match="port 5432 is occupied by another service"):
+        host._require_ports(config)
+
+
+def test_existing_service_account_is_validated_before_docker_membership(paths, monkeypatch):
+    calls = []
+    monkeypatch.setattr(host, "CONFIG_DIR", paths.config)
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["getent", "group"]:
+            return Result(tuple(args), 0, "evdb:x:997:\n", "")
+        if args[:2] == ["getent", "passwd"]:
+            return Result(
+                tuple(args),
+                0,
+                "evdb:x:1001:997::/var/lib/evdb:/usr/sbin/nologin\n",
+                "",
+            )
+        return Result(tuple(args), 0, "", "")
+
+    monkeypatch.setattr(host, "run", run)
+
+    assert host._account(paths) == (1001, 997)
+    assert calls[-1] == ["usermod", "--append", "--groups", "docker", "evdb"]
 
 
 @pytest.mark.parametrize(
-    ("labels", "available"),
+    "entry",
     [
-        ({}, False),
-        ({"com.docker.compose.project": "other", compose.CONTRACT_LABEL: "hash"}, False),
-        (
-            {
-                "com.docker.compose.project": compose.TRAEFIK_PROJECT,
-                compose.CONTRACT_LABEL: "hash",
-            },
-            True,
-        ),
+        "evdb:x:998:996::/var/lib/evdb:/usr/sbin/nologin\n",
+        "evdb:x:998:997::/home/evdb:/usr/sbin/nologin\n",
+        "evdb:x:998:997::/var/lib/evdb:/bin/bash\n",
+        "evdb:x:not-a-number:997::/var/lib/evdb:/usr/sbin/nologin\n",
+        "evdb:x:998:997:malformed\n",
     ],
 )
-def test_port_preflight_trusts_only_owned_traefik(labels, available, monkeypatch):
-    value = json.dumps([{"Config": {"Labels": labels}, "State": {"Running": True}}])
+def test_invalid_existing_service_user_never_gets_docker_membership(paths, monkeypatch, entry):
+    calls = []
+    monkeypatch.setattr(host, "CONFIG_DIR", paths.config)
+
+    def run(args, **kwargs):
+        calls.append(args)
+        value = "evdb:x:997:\n" if args[:2] == ["getent", "group"] else entry
+        return Result(tuple(args), 0, value, "")
+
+    monkeypatch.setattr(host, "run", run)
+
+    with pytest.raises(host.HostError, match="evdb user"):
+        host._account(paths)
+
+    assert not any(args and args[0] == "usermod" for args in calls)
+
+
+@pytest.mark.parametrize("entry", ["evdb:x:0:\n", "evdb:x:not-a-number:\n", "bad\n"])
+def test_invalid_existing_service_group_never_gets_docker_membership(paths, monkeypatch, entry):
+    calls = []
+    monkeypatch.setattr(host, "CONFIG_DIR", paths.config)
+
+    def run(args, **kwargs):
+        calls.append(args)
+        return Result(tuple(args), 0, entry, "")
+
+    monkeypatch.setattr(host, "run", run)
+
+    with pytest.raises(host.HostError, match="evdb group"):
+        host._account(paths)
+
+    assert not any(args and args[0] in {"useradd", "usermod"} for args in calls)
+
+
+def test_missing_service_account_is_recreated_validated_then_joined_to_docker(paths, monkeypatch):
+    calls = []
+    created = {"group": False, "passwd": False}
+    monkeypatch.setattr(host, "CONFIG_DIR", paths.config)
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["getent", "group"]:
+            return Result(
+                tuple(args),
+                0 if created["group"] else 2,
+                "evdb:x:997:\n" if created["group"] else "",
+                "",
+            )
+        if args[:2] == ["getent", "passwd"]:
+            return Result(
+                tuple(args),
+                0 if created["passwd"] else 2,
+                ("evdb:x:998:997::/var/lib/evdb:/usr/sbin/nologin\n" if created["passwd"] else ""),
+                "",
+            )
+        if args[0] == "groupadd":
+            created["group"] = True
+        if args[0] == "useradd":
+            created["passwd"] = True
+        return Result(tuple(args), 0, "", "")
+
+    monkeypatch.setattr(host, "run", run)
+
+    assert host._account(paths) == (998, 997)
+    actions = [args[0] for args in calls]
+    assert actions.index("groupadd") < actions.index("useradd") < actions.index("usermod")
+
+
+def test_existing_canonical_bootstrap_orders_guard_account_ownership_before_load(
+    config, monkeypatch
+):
+    order = []
+    monkeypatch.setattr(host, "_guard_preload", lambda *args: order.append("guard"))
     monkeypatch.setattr(
         host,
-        "run",
-        lambda *args, **kwargs: Result(("docker", "inspect"), 0, value, ""),
+        "_require_safe_canonical_source",
+        lambda *args: order.append("paths"),
     )
-
-    assert host._ports_available() is available
-
-
-def test_prerequisites_do_not_require_python_or_uv(monkeypatch):
-    calls = []
-    monkeypatch.setattr(host.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    def fake_run(args, **kwargs):
-        calls.append(args)
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    assert host.prerequisites() == []
-    assert calls == [["docker", "compose", "version"]]
-    assert "python3" not in host.TOOLS
-    assert "uv" not in host.TOOLS
-
-
-def test_setup_refuses_production_migration(paths, tmp_path):
-    values = {**_values(tmp_path), "host_id": "montreal-01"}
-
-    with pytest.raises(HostError, match="separate change"):
-        host.setup(paths.source, values, yes=True, paths=paths)
-
-
-def test_canonical_account_and_ownership_commands(config, monkeypatch):
-    canonical = replace(config, paths=Paths())
-    calls = []
-
-    def fake_run(args, **kwargs):
-        calls.append(args)
-        code = 2 if args[:2] in (["getent", "group"], ["getent", "passwd"]) else 0
-        return Result(tuple(args), code, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    host._account(canonical.paths)
-    host._ownership(canonical)
-
-    assert ["groupadd", "--system", "evdb"] in calls
-    useradd = next(args for args in calls if args[0] == "useradd")
-    assert useradd == [
-        "useradd",
-        "--system",
-        "--gid",
-        "evdb",
-        "--home-dir",
-        "/var/lib/evdb",
-        "--shell",
-        "/usr/sbin/nologin",
-        "evdb",
-    ]
-    assert ["usermod", "--append", "--groups", "docker", "evdb"] in calls
-    assert ["chown", "root:evdb", "/etc/evdb", "/etc/evdb/host.yml"] in calls
-    service_chown = next(args for args in calls if args[:3] == ["chown", "-R", "evdb:evdb"])
-    assert service_chown[3:] == [
-        "/etc/evdb/projects",
-        "/etc/evdb/traefik",
-        "/etc/evdb/secrets",
-        "/var/lib/evdb",
-    ]
-    assert ["chown", "evdb:evdb", str(config.host.data_root)] in calls
-    assert "/etc/evdb/host.yml" not in service_chown
-    assert ["chmod", "0750", "/etc/evdb"] in calls
-    assert ["chmod", "0640", "/etc/evdb/host.yml"] in calls
-    assert ["chmod", "0755", "/opt/evdb", "/opt/evdb/versions"] in calls
-
-
-def _prepare_update(config, units):
-    config.paths.source.parent.mkdir(parents=True, exist_ok=True)
-    config.paths.source.write_text(dump(config))
-    state = resolve_state(config, resolver=lambda source: DIGEST)
-    write_state(config, replace(state, tool_version="1.0.0"))
-    config.paths.traefik.mkdir(parents=True, exist_ok=True)
-    (config.paths.traefik / "compose.yaml").write_text("name: evdb-traefik\n")
-    host._install_units(units)
-    old = config.paths.tool / "versions/1.0.0"
-    (old / "bin").mkdir(parents=True)
-    (old / "bin/evdb").write_text("old")
-    (old / "bin/evdb").chmod(0o755)
-    (old / "units").mkdir()
-    for source in host._units():
-        shutil.copy2(source, old / "units" / source.name)
-    (config.paths.tool / "current").symlink_to(old)
-    return old
-
-
-def _install_candidate(config, version="1.1.0", marker="# candidate package", extra_timer=None):
-    candidate = config.paths.tool / f"versions/{version}"
-    (candidate / "bin").mkdir(parents=True, exist_ok=True)
-    (candidate / "bin/evdb").write_text("candidate")
-    (candidate / "bin/evdb").chmod(0o755)
-    packaged = candidate / "units"
-    packaged.mkdir(parents=True)
-    for source in host._units():
-        text = source.read_text()
-        if source.name == "evdb-status.service":
-            text += f"\n{marker}\n"
-        (packaged / source.name).write_text(text)
-    if extra_timer is not None:
-        (packaged / extra_timer).write_text(
-            "[Unit]\nDescription=New global timer\n\n"
-            "[Timer]\nOnCalendar=daily\nPersistent=true\n\n"
-            "[Install]\nWantedBy=timers.target\n"
-        )
-    return candidate
-
-
-@pytest.fixture(autouse=True)
-def _release_candidate(config, monkeypatch):
-    def install(target, selected, current_units, *, timeout):
-        del current_units, timeout
-        assert target == config.paths.tool / f"versions/{selected}"
-        _install_candidate(config, selected)
-
-    monkeypatch.setattr(host, "_install_release", install)
-
-
-def _status(config, *, healthy=True, version=status.VERSION, errors=None):
-    return json.dumps(
-        {
-            "version": version,
-            "healthy": healthy,
-            "host": {"id": config.host.id},
-            "databases": {item.identity: {} for item in config.databases},
-            "errors": errors or [],
-        }
-    )
-
-
-def _escaped_timer(identity):
-    escaped = []
-    valid = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_."
-    for value in identity:
-        if value == "/":
-            escaped.append("-")
-        elif value == "-" or value == "\\" or value not in valid:
-            escaped.append(f"\\x{ord(value):02x}")
-        else:
-            escaped.append(value)
-    return f"evdb-backup@{''.join(escaped)}.timer"
-
-
-def _systemctl(args, timer_state):
-    if args[1] == "is-enabled":
-        enabled = timer_state.get(args[2], (False, False))[0]
-        output = "enabled\n" if enabled else "disabled\n"
-        return Result(tuple(args), 0 if enabled else 1, output, "")
-    if args[1] == "is-active":
-        active = timer_state.get(args[2], (False, False))[1]
-        return Result(tuple(args), 0 if active else 3, "active\n" if active else "inactive\n", "")
-    if args[1] in {"enable", "disable"}:
-        names = args[3:] if args[2] == "--now" else args[2:]
-        for name in names:
-            current = timer_state.get(name, (False, False))
-            timer_state[name] = (args[1] == "enable", True if args[2] == "--now" else current[1])
-    if args[1] in {"start", "stop"}:
-        name = args[2]
-        timer_state[name] = (timer_state.get(name, (False, False))[0], args[1] == "start")
-    return Result(tuple(args), 0, "", "")
-
-
-def _installed_host(config, units):
-    config.paths.source.parent.mkdir(parents=True)
-    config.paths.source.write_text(dump(config))
-    config.paths.state.mkdir(parents=True)
-    config.host.data_root.mkdir(parents=True)
-    (config.paths.tool / "versions/1.0.0/bin").mkdir(parents=True)
-    (config.paths.tool / "versions/1.0.0/bin/evdb").write_text("evdb")
-    (config.paths.traefik).mkdir(parents=True)
-    (config.paths.traefik / "compose.yaml").write_text("name: evdb-traefik\n")
-    for database in config.databases:
-        database.compose.parent.mkdir(parents=True)
-        database.compose.write_text(f"name: {database.compose_project}\n")
-        database.data.mkdir(parents=True, exist_ok=True)
-    host._install_units(units)
-
-
-def _mock_uninstall_run(config, monkeypatch, *, orphan_project=None, network_owned=True):
-    calls = []
-
-    def fake_run(args, **kwargs):
-        del kwargs
-        calls.append(args)
-        if args[0] == "systemd-escape":
-            return Result(tuple(args), 0, _escaped_timer(args[-1]) + "\n", "")
-        if args[:3] == ["docker", "network", "inspect"]:
-            labels = {compose.NETWORK_LABEL: "true" if network_owned else "false"}
-            return Result(tuple(args), 0, json.dumps([{"Labels": labels}]), "")
-        if args[:2] == ["docker", "inspect"]:
-            name = args[2]
-            if name == compose.TRAEFIK_CONTAINER:
-                project = compose.TRAEFIK_PROJECT
-            elif name == "orphan-1":
-                project = orphan_project
-            else:
-                return Result(tuple(args), 1, "", "not found")
-            labels = {"com.docker.compose.project": project, compose.CONTRACT_LABEL: "hash"}
-            return Result(tuple(args), 0, json.dumps([{"Config": {"Labels": labels}}]), "")
-        if args[:2] == ["docker", "ps"]:
-            return Result(tuple(args), 0, "orphan-1\n" if orphan_project else "", "")
-        if args[0] == "getent":
-            return Result(tuple(args), 1, "", "not found")
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-    return calls
-
-
-def test_exact_update_uses_candidate_units_preserves_timers_and_cleans_versions(
-    config, tmp_path, monkeypatch
-):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    stale = _install_candidate(config, version="0.9.0")
-    calls = []
-    timer_state = {
-        name: (index % 2 == 0, index % 3 == 0)
-        for index, name in enumerate(
-            sorted(path.name for path in host._units() if path.suffix == ".timer")
-        )
-    }
-    before_timers = dict(timer_state)
-
-    def fake_run(args, **kwargs):
-        calls.append((args, kwargs))
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            return Result(tuple(args), 0, _status(config), "")
-        if args and args[0] == "systemctl":
-            return _systemctl(args, timer_state)
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    result = host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    candidate = config.paths.tool / "versions/1.1.0"
-    assert result == "Updated evdb to 1.1.0"
-    assert (config.paths.tool / "current").resolve() == candidate
-    assert (config.paths.tool / "previous").resolve() == old
-    assert load_state(config).tool_version == "1.1.0"
-    assert "# candidate package" in (units / "evdb-status.service").read_text()
-    assert timer_state == before_timers
-    assert not stale.exists()
-    assert sorted(path.name for path in (config.paths.tool / "versions").iterdir()) == [
-        "1.0.0",
-        "1.1.0",
-    ]
-    assert not any(args[0] in {"python", "python3", "pip", "pipx", "uv"} for args, _ in calls)
-    assert not any(args[:2] == ["docker", "compose"] for args, _ in calls)
-    assert not any(
-        args[:2]
-        in (
-            ["systemctl", "enable"],
-            ["systemctl", "disable"],
-            ["systemctl", "start"],
-            ["systemctl", "stop"],
-        )
-        for args, _ in calls
-    )
-    candidate_checks = [args for args, _kwargs in calls if args[0].endswith("/bin/evdb")]
-    assert candidate_checks[0][-2:] == ["status", "--json"]
-    assert candidate_checks[1][-3:] == ["host", "check", "--json"]
-    for args, kwargs in calls:
-        if args[0].endswith("/bin/evdb"):
-            assert kwargs["env"]["EVDB_COMPATIBILITY_CHECK"] == "1"
-            assert kwargs["env"]["EVDB_UNIT_DIR"] == str(units)
-
-
-def test_update_preview_names_state_and_unit_migrations(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    _install_candidate(config)
-    previews = []
-
-    def fake_run(args, **kwargs):
-        if args[-1] == "--version":
-            return Result(tuple(args), 0, "evdb 1.1.0\n", "")
-        if args and args[0].endswith("/bin/evdb"):
-            return Result(tuple(args), 0, _status(config), "")
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    result = host.update(
-        config,
-        "1.1.0",
-        confirm=lambda preview: previews.append(preview) or False,
-        unit_dir=units,
-    )
-
-    assert result == "Cancelled"
-    assert "Configuration migration: none" in previews[0]
-    assert "Machine state tool version: 1.0.0 -> 1.1.0" in previews[0]
-    assert "Systemd units: evdb-status.service" in previews[0]
-    assert "Database Compose and services will not change" in previews[0]
-    assert (config.paths.tool / "current").resolve() == old
-
-
-def test_update_rejects_preexisting_candidate_with_wrong_executable_version(
-    config, tmp_path, monkeypatch
-):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    candidate = _install_candidate(config)
-
-    def fake_run(args, **kwargs):
-        if args[-1] == "--version":
-            return Result(tuple(args), 0, "evdb 9.9.9\n", "")
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="version does not match"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert (config.paths.tool / "current").resolve() == old
-    assert candidate.is_dir()
-
-
-def test_update_rejects_candidate_units_that_systemd_cannot_verify(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-
-    def fake_run(args, **kwargs):
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args[0] == "systemd-analyze":
-            return Result(tuple(args), 1, "", "invalid unit")
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="incompatible systemd units"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert (config.paths.tool / "current").resolve() == old
-    assert not (config.paths.tool / "versions/1.1.0").exists()
-
-
-def test_update_enables_only_new_global_timer(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    _prepare_update(config, units)
-    added = "evdb-new-maintenance.timer"
-    timer_state = {
-        name: (index % 2 == 0, index % 3 == 0) for index, name in enumerate(host.DEFAULT_TIMERS)
-    }
-    before = dict(timer_state)
-    calls = []
     monkeypatch.setattr(
         host,
-        "_install_release",
-        lambda target, selected, current_units, *, timeout: _install_candidate(
-            config, selected, extra_timer=added
-        ),
+        "_account",
+        lambda *args, **kwargs: order.append("account") or (998, 997),
+    )
+    monkeypatch.setattr(
+        host,
+        "_converge_canonical_source",
+        lambda *args: order.append("ownership"),
     )
 
-    def fake_run(args, **kwargs):
-        calls.append(args)
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config, extra_timer=added)
-        if args and args[0].endswith("/bin/evdb"):
-            return Result(tuple(args), 0, _status(config), "")
-        if args and args[0] == "systemctl":
-            return _systemctl(args, timer_state)
-        return Result(tuple(args), 0, "", "")
+    host._bootstrap_existing(config.paths.source, config.paths)
 
-    monkeypatch.setattr(host, "run", fake_run)
-
-    host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert timer_state[added] == (True, True)
-    assert {name: timer_state[name] for name in before} == before
-    enables = [args for args in calls if args[:3] == ["systemctl", "enable", "--now"]]
-    assert enables == [["systemctl", "enable", "--now", added]]
+    assert order == ["guard", "paths", "account", "ownership"]
 
 
-def test_update_preserves_existing_backup_timer_state(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    _prepare_update(config, units)
-    database = next(item for item in config.databases if item.durable)
-    state = load_state(config)
-    write_state(
-        config,
-        replace(
-            state,
-            roles={
-                **state.roles,
-                database.identity: replace(state.roles[database.identity], installed=True),
-            },
-        ),
+def test_existing_canonical_initialize_bootstraps_before_strict_load(config, monkeypatch):
+    order = []
+    monkeypatch.setattr(host, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(
+        host,
+        "_bootstrap_existing",
+        lambda *args: order.append("bootstrap"),
     )
-    database.compose.parent.mkdir(parents=True)
-    database.compose.write_text("name: installed-database\n")
-    timer = _escaped_timer(database.identity)
-    marker = units / f"{timer}.d" / host.TIMER_MARKER
-    marker.parent.mkdir(parents=True)
-    marker.write_text(f"[Unit]\nDescription=Daily backup for {database.identity}\n")
-    timer_state = {name: (True, True) for name in host.DEFAULT_TIMERS}
-    timer_state[timer] = (False, True)
-    before = dict(timer_state)
-    calls = []
 
-    def fake_run(args, **kwargs):
-        calls.append(args)
-        if args[0] == "systemd-escape":
-            return Result(tuple(args), 0, timer + "\n", "")
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            return Result(tuple(args), 0, _status(config), "")
-        if args and args[0] == "systemctl":
-            return _systemctl(args, timer_state)
-        return Result(tuple(args), 0, "", "")
+    def load(*args, **kwargs):
+        order.append("load")
+        raise RuntimeError("stop after ordering assertion")
 
-    monkeypatch.setattr(host, "run", fake_run)
+    monkeypatch.setattr(host, "load", load)
 
-    host.update(config, "1.1.0", yes=True, unit_dir=units)
+    with pytest.raises(RuntimeError, match="ordering assertion"):
+        host.initialize(config.paths.source, paths=config.paths)
 
-    assert timer_state == before
-    assert not any(args[:3] == ["systemctl", "enable", "--now"] for args in calls)
+    assert order == ["bootstrap", "load"]
 
 
-def test_update_rejects_invalid_candidate_version_directory_before_activation(
-    config, tmp_path, monkeypatch
+def test_existing_canonical_init_guards_actual_montreal_host_before_subprocesses(
+    config, monkeypatch
 ):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    checks = []
+    calls = []
+    monkeypatch.setattr(host, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(host.socket, "gethostname", lambda: "montreal-01.example.com")
+    monkeypatch.setattr(host, "run", lambda *args, **kwargs: calls.append(args))
 
-    def install(target, selected, current_units, *, timeout):
-        del target, current_units, timeout
-        candidate = _install_candidate(config, selected)
-        (candidate / "bin/evdb").chmod(0o644)
+    with pytest.raises(host.HostError, match="separate change"):
+        host.initialize(config.paths.source, paths=config.paths)
 
-    monkeypatch.setattr(host, "_install_release", install)
-
-    def fake_run(args, **kwargs):
-        if args[:3] == ["uv", "tool", "install"]:
-            candidate = _install_candidate(config)
-            (candidate / "bin/evdb").chmod(0o644)
-        if args and args[0].endswith("/bin/evdb"):
-            checks.append(args)
-        return Result(tuple(args), 0, _status(config), "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="no executable evdb command"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert not checks
-    assert (config.paths.tool / "current").resolve() == old
-    assert not (config.paths.tool / "versions/1.1.0").exists()
-
-
-def test_update_reports_deferred_inactive_version_cleanup(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    stale = _install_candidate(config, version="0.9.0")
-    real_rmtree = shutil.rmtree
-
-    def fake_run(args, **kwargs):
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            return Result(tuple(args), 0, _status(config), "")
-        if args and args[0] == "systemctl":
-            return _systemctl(args, {})
-        return Result(tuple(args), 0, "", "")
-
-    def fail_cleanup(path, *args, **kwargs):
-        if Path(path).name.startswith(".cleanup-"):
-            raise OSError("busy")
-        return real_rmtree(path, *args, **kwargs)
-
-    monkeypatch.setattr(host, "run", fake_run)
-    monkeypatch.setattr(host.shutil, "rmtree", fail_cleanup)
-
-    result = host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert "cleanup pending" in result
-    assert (config.paths.tool / "current").resolve().name == "1.1.0"
-    assert (config.paths.tool / "previous").resolve() == old
-    assert not stale.exists()
-    assert any(path.name.startswith(".cleanup-") for path in stale.parent.iterdir())
-
-
-def test_frozen_command_reads_units_from_adjacent_release(tmp_path, monkeypatch):
-    target = tmp_path / "versions/1.2.3"
-    executable = target / "bin/evdb"
-    executable.parent.mkdir(parents=True)
-    executable.write_text("candidate")
-    units = target / "units"
-    units.mkdir()
-    source = host._units()[0]
-    shutil.copy2(source, units / source.name)
-
-    monkeypatch.setattr(host.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(host.sys, "executable", str(executable))
-
-    assert host._units() == (units / source.name,)
+    assert calls == []
 
 
 @pytest.mark.parametrize(
-    ("code", "version", "message"),
-    (
-        (2, status.VERSION, "exit code 2"),
-        (0, status.VERSION + 1, "structurally incompatible"),
-    ),
+    "text",
+    [
+        "BAD-KEY=value\n",
+        "EMPTY=\n",
+        "NUL=before\0after\n",
+        "MULTI=first\nsecond\n",
+    ],
 )
-def test_update_rejects_nonzero_or_structurally_incompatible_candidate(
-    config, tmp_path, monkeypatch, code, version, message
-):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    old_unit = (units / "evdb-status.service").read_bytes()
+def test_first_init_dns_file_uses_secret_value_validation(tmp_path, text):
+    source = tmp_path / "dns.env"
+    source.write_text(text)
 
-    def fake_run(args, **kwargs):
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            return Result(tuple(args), code, _status(config, version=version), "")
-        return Result(tuple(args), 0, "", "")
+    with pytest.raises(host.HostError, match="DNS credential file"):
+        host._env_file(source)
 
-    monkeypatch.setattr(host, "run", fake_run)
 
-    with pytest.raises(HostError, match=message):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
+def test_first_init_dns_file_rejects_duplicate_keys(tmp_path):
+    source = tmp_path / "dns.env"
+    source.write_text("TOKEN=first\nTOKEN=second\n")
 
-    assert (config.paths.tool / "current").resolve() == old
-    assert not (config.paths.tool / "previous").exists()
-    assert not (config.paths.tool / "versions/1.1.0").exists()
-    assert (units / "evdb-status.service").read_bytes() == old_unit
-    assert load_state(config).tool_version == "1.0.0"
-
-
-def test_update_accepts_unhealthy_structural_preflight_then_requires_healthy_postcheck(
-    config, tmp_path, monkeypatch
-):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    checks = 0
-
-    def fake_run(args, **kwargs):
-        nonlocal checks
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            checks += 1
-            if checks == 1:
-                return Result(tuple(args), 1, _status(config, healthy=False), "")
-            return Result(tuple(args), 0, _status(config), "")
-        if args and args[0] == "systemctl":
-            return _systemctl(args, {})
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    assert host.update(config, "1.1.0", yes=True, unit_dir=units) == "Updated evdb to 1.1.0"
-    assert checks == 2
-    assert (config.paths.tool / "previous").resolve() == old
-
-
-def test_update_rejects_candidate_contract_errors_before_activation(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-
-    def fake_run(args, **kwargs):
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            errors = [
-                {
-                    "code": "generated_changed",
-                    "scope": "app-test-01/kv",
-                    "message": "candidate contract differs",
-                }
-            ]
-            return Result(tuple(args), 1, _status(config, healthy=False, errors=errors), "")
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="cannot operate"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert (config.paths.tool / "current").resolve() == old
-    assert not (config.paths.tool / "versions/1.1.0").exists()
-
-
-def test_update_rolls_back_when_post_activation_status_is_unhealthy(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    checks = 0
-
-    def fake_run(args, **kwargs):
-        nonlocal checks
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            checks += 1
-            result = _status(config, healthy=checks == 1)
-            return Result(tuple(args), 0 if checks == 1 else 1, result, "")
-        if args and args[0] == "systemctl":
-            return _systemctl(args, {})
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="prior version restored"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert (config.paths.tool / "current").resolve() == old
-    assert not (config.paths.tool / "versions/1.1.0").exists()
-
-
-def test_update_rejects_and_restores_candidate_compatibility_writes(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    old_state = config.paths.machine_state.read_bytes()
-
-    def fake_run(args, **kwargs):
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            config.paths.machine_state.write_text("{}\n")
-            return Result(tuple(args), 0, _status(config), "")
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="modified managed host files"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert (config.paths.tool / "current").resolve() == old
-    assert config.paths.machine_state.read_bytes() == old_state
-    assert not (config.paths.tool / "versions/1.1.0").exists()
-
-
-def test_update_restores_candidate_writes_after_interrupted_compatibility_check(
-    config, tmp_path, monkeypatch
-):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    old_state = config.paths.machine_state.read_bytes()
-
-    def fake_run(args, **kwargs):
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            config.paths.machine_state.write_text("{}\n")
-            raise KeyboardInterrupt()
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="modified managed host files"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert (config.paths.tool / "current").resolve() == old
-    assert config.paths.machine_state.read_bytes() == old_state
-    assert not (config.paths.tool / "versions/1.1.0").exists()
-
-
-def test_update_restores_managed_file_replaced_by_candidate_symlink(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    old_state = config.paths.machine_state.read_bytes()
-
-    def fake_run(args, **kwargs):
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            config.paths.machine_state.unlink()
-            config.paths.machine_state.symlink_to(tmp_path / "outside-state")
-            return Result(tuple(args), 0, _status(config), "")
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="unsafe managed files"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert (config.paths.tool / "current").resolve() == old
-    assert not config.paths.machine_state.is_symlink()
-    assert config.paths.machine_state.read_bytes() == old_state
-
-
-def test_failed_update_restores_links_state_units_and_timer_state(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    old = _prepare_update(config, units)
-    prior = _install_candidate(config, version="0.9.0")
-    (config.paths.tool / "previous").symlink_to(prior)
-    old_state = config.paths.machine_state.read_bytes()
-    old_units = {path.name: (units / path.name).read_bytes() for path in host._units()}
-    timer_state = {path.name: (True, False) for path in host._units() if path.suffix == ".timer"}
-    timer_state["evdb-prune.timer"] = (False, True)
-    before_timers = dict(timer_state)
-    checks = 0
-
-    def fake_run(args, **kwargs):
-        nonlocal checks
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            checks += 1
-            if checks == 2:
-                return Result(tuple(args), 2, "", "failed")
-            return Result(tuple(args), 0, _status(config), "")
-        if args and args[0] == "systemctl":
-            return _systemctl(args, timer_state)
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="prior version restored"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert (config.paths.tool / "current").resolve() == old
-    assert (config.paths.tool / "previous").resolve() == prior
-    assert config.paths.machine_state.read_bytes() == old_state
-    assert {path.name: (units / path.name).read_bytes() for path in host._units()} == old_units
-    assert timer_state == before_timers
-    assert not (config.paths.tool / "versions/1.1.0").exists()
-
-
-def test_failed_update_reports_daemon_reload_rollback_failure(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    _prepare_update(config, units)
-    checks = 0
-    reloads = 0
-
-    def fake_run(args, **kwargs):
-        nonlocal checks, reloads
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            checks += 1
-            if checks == 2:
-                return Result(tuple(args), 2, "", "failed")
-            return Result(tuple(args), 0, _status(config), "")
-        if args[:2] == ["systemctl", "daemon-reload"]:
-            reloads += 1
-            if reloads == 2:
-                raise CommandError("daemon reload failed")
-        if args and args[0] == "systemctl":
-            return _systemctl(args, {})
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", fake_run)
-
-    with pytest.raises(HostError, match="rollback was incomplete") as caught:
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert "daemon reload failed" in str(caught.value)
-    transactions = list((config.paths.state / "transactions").glob("host-update-*"))
-    assert len(transactions) == 1
-    record = json.loads((transactions[0] / "transaction.json").read_text())
-    assert record["phase"] == "recovery_failed"
-
-
-def test_failed_update_preserves_candidate_when_active_link_cannot_be_restored(
-    config, tmp_path, monkeypatch
-):
-    units = tmp_path / "systemd"
-    _prepare_update(config, units)
-    checks = 0
-
-    def fake_run(args, **kwargs):
-        nonlocal checks
-        if args[:3] == ["uv", "tool", "install"]:
-            _install_candidate(config)
-        if args and args[0].endswith("/bin/evdb"):
-            checks += 1
-            if checks == 2:
-                return Result(tuple(args), 2, "", "failed")
-            return Result(tuple(args), 0, _status(config), "")
-        if args and args[0] == "systemctl":
-            return _systemctl(args, {})
-        return Result(tuple(args), 0, "", "")
-
-    real_restore = host._restore_link
-
-    def fail_current(path, target):
-        if path == config.paths.tool / "current":
-            raise HostError("active link restore failed")
-        return real_restore(path, target)
-
-    monkeypatch.setattr(host, "run", fake_run)
-    monkeypatch.setattr(host, "_restore_link", fail_current)
-
-    with pytest.raises(HostError, match="rollback was incomplete") as caught:
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    candidate = config.paths.tool / "versions/1.1.0"
-    assert "candidate version remains active" in str(caught.value)
-    assert candidate.is_dir()
-    assert (config.paths.tool / "current").resolve() == candidate
-
-
-def test_update_validates_backup_records_before_install(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    _prepare_update(config, units)
-    record = config.paths.backups / "app-prod-01/postgres/backup-1/backup.json"
-    record.parent.mkdir(parents=True)
-    record.write_text("not json")
-    calls = []
-    monkeypatch.setattr(
-        host,
-        "run",
-        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
-    )
-
-    with pytest.raises(HostError, match="invalid backup record"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert not any(args[:3] == ["uv", "tool", "install"] for args in calls)
-    assert record.read_text() == "not json"
-
-
-def test_update_rejects_backup_record_with_wrong_engine_format(config, tmp_path, monkeypatch):
-    units = tmp_path / "systemd"
-    _prepare_update(config, units)
-    folder = config.paths.backups / "app-test-01/postgres/backup-1"
-    folder.mkdir(parents=True)
-    backup.manifest_write(
-        folder,
-        {
-            "status": "complete",
-            "backup": "backup-1",
-            "host": config.host.id,
-            "project": "app-test-01",
-            "role": "postgres",
-            "engine": "postgres",
-            "source_image": "postgres:16",
-            "image": f"postgres:16@{DIGEST}",
-            "started": "2026-01-01T00:00:00+00:00",
-            "finished": "2026-01-01T00:01:00+00:00",
-            "version": "16.1",
-            "format": "redis-rdb-v1",
-            "purpose": "manual",
-            "facts": {},
-            "files": [],
-            "checks": ["size", "sha256", "postgres"],
-            "upload": {"ok": False, "backup": "backup-1"},
-        },
-    )
-    calls = []
-    monkeypatch.setattr(
-        host,
-        "run",
-        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
-    )
-
-    with pytest.raises(HostError, match="invalid backup record"):
-        host.update(config, "1.1.0", yes=True, unit_dir=units)
-
-    assert not any(args[:3] == ["uv", "tool", "install"] for args in calls)
-
-
-def test_update_rejects_non_exact_versions_before_install(config):
-    for value in (
-        "latest",
-        "1",
-        "1.2",
-        ">=1.2.3",
-        "1.2.x",
-        "01.2.3",
-        "1.2.3-01",
-        "1.2.3-..",
-        "1.2.3-alpha..1",
-        "1.2.3+build..1",
-    ):
-        with pytest.raises(HostError, match="exact semantic version"):
-            host.update(config, value, yes=True)
+    with pytest.raises(host.HostError, match="duplicate key: TOKEN"):
+        host._env_file(source)

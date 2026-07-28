@@ -1,850 +1,290 @@
 from __future__ import annotations
 
-import hashlib
-import os
-import shutil
+import secrets as random
 import time
-import uuid
-from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from . import compose, docker, secrets
-from .config import (
-    DEFAULT_IMAGES,
-    HTTP,
-    KV,
-    Config,
-    Database,
-    MachineState,
-    PgBouncer,
-    Postgres,
-    append_activity,
-    dump,
-    load_state,
-    replace_role,
-    require_no_orphans,
-    resolve_state,
-    state_dict,
-    with_role,
-    write_state,
-)
-from .engines import dragonfly, postgres, redis
-from .errors import ConfigError, DatabaseError
-from .files import private_dir, write_bytes, write_json, write_text
-from .images import image_major, validate_source
-from .lock import operation
-from .log import sanitize
-from .log import write as log_write
-from .run import run
-
-_VERSION_COMMANDS = {
-    "postgres": ("postgres", "--version"),
-    "redis": ("redis-server", "--version"),
-    "dragonfly": ("dragonfly", "--version"),
-}
+from . import docker
+from .config import add_role, defaults, load, protected, replace_role, validate_image, write
+from .engines import get
+from .errors import DatabaseError, Error
+from .files import managed_dir, private_dir, private_line, write_text
+from .lock import lock, operation
+from .models import KV, Config, Database, Postgres, RoleSecrets
+from .run import clean, redact
 
 
-@dataclass(frozen=True)
-class FileState:
-    path: Path
-    data: bytes | None
-    mode: int | None
-    uid: int | None
-    gid: int | None
+def render(config: Config, database: Database) -> dict[str, Any]:
+    engine = get(database.engine)
+    engine.validate(database.settings)
+    try:
+        managed_dir(database.data, None)
+    except OSError as exc:
+        raise DatabaseError(f"database data path is unsafe: {database.data}") from exc
+    generated = private_dir(database.generated)
+    for name, text in engine.files(database).items():
+        write_text(generated / name, text, mode=0o600)
+    data = {
+        "name": database.compose_project,
+        "services": engine.services(database),
+        "networks": {docker.NETWORK: {"external": True, "name": docker.NETWORK}},
+    }
+    docker.write_compose(database.compose, data)
+    docker.validate_compose(
+        database.compose,
+        database.compose_project,
+        timeout=config.host.timeouts["command"],
+        secrets=protected(config),
+    )
+    return data
 
 
-@dataclass(frozen=True)
-class Change:
-    before: Config
-    after: Config
-    before_state: MachineState
-    after_state: MachineState
-    database: Database
-    prior: Database | None
-    changed: tuple[str, ...]
-    services: tuple[str, ...]
-    outage: str
-    safety_backup: bool
-    transaction: Path
-    secret_files: tuple[secrets.SecretFile, ...]
-    compose_data: dict[str, Any]
-    fingerprint: str
-    credential: str | None = None
-
-    @property
-    def noop(self) -> bool:
-        return not self.changed
-
-    def preview(self) -> str:
-        changed = ", ".join(self.changed) if self.changed else "none"
-        services = ", ".join(self.services) if self.services else "none"
-        backup = "required" if self.safety_backup else "not required"
-        lines = [
-            f"Host: {self.after.host.id}",
-            f"Database: {self.database.identity}",
-            f"Settings: {changed}",
-            f"Services: {services}",
-            f"Interruption: {self.outage}",
-            f"Safety backup: {backup}",
-        ]
-        if self.credential:
-            lines.append(f"Credential: {self.credential}")
-        return "\n".join(lines)
-
-    def cancel(self) -> None:
-        shutil.rmtree(self.transaction, ignore_errors=True)
-
-
-def prepare_add(
+def add(
     config: Config,
     project: str,
     role: str,
     *,
-    engine: str = "dragonfly",
-    state: MachineState | None = None,
-    resolver=None,
-    generate=None,
-    initial_password: str | None = None,
-) -> Change:
-    require_no_orphans(config, state or load_state(config))
-    if initial_password is not None:
-        initial_password = secrets.validate_password(initial_password)
-        if role != "postgres":
-            raise DatabaseError("initial password is only valid for Postgres")
+    engine: str | None = None,
+    password: str | None = None,
+) -> Config:
     identity = f"{project}/{role}"
-    try:
-        existing = config.select(identity)
-    except ConfigError as exc:
-        if "unknown database" not in str(exc):
-            raise
-    else:
-        if initial_password is not None:
-            current_password = secrets.credentials(config, existing).password
-            if current_password != initial_password:
-                raise DatabaseError("password rotation requires a separate operation")
-        current = state or load_state(config)
-        return _stage(
-            config,
-            config,
-            current,
-            existing,
-            existing,
-            (),
-            resolver=resolver,
-            generate=generate,
+    if role == "postgres" and engine is not None:
+        raise DatabaseError("--engine is only valid for a KV database")
+    timeout = config.host.timeouts["command"]
+    with operation(config, write=True, timeout=timeout):
+        current = load(config.paths.source, paths=config.paths)
+        existing = next(
+            (database for database in current.databases if database.identity == identity),
+            None,
         )
-
-    if role == "postgres":
-        settings = Postgres(DEFAULT_IMAGES["postgres"], PgBouncer())
-    elif role == "kv":
-        if engine not in {"redis", "dragonfly"}:
-            raise DatabaseError("KV engine must be redis or dragonfly")
-        settings = KV(
-            engine,
-            DEFAULT_IMAGES[engine],
-            http=HTTP(),
-            memory="256mb" if engine == "dragonfly" else None,
-            threads=1 if engine == "dragonfly" else None,
+        if existing is not None:
+            if role == "kv" and engine is not None and existing.engine != engine:
+                raise DatabaseError(
+                    f"{identity} already uses {existing.engine}; engine conversion is outside v1"
+                )
+            if password is not None and existing.credentials.password != _password(password):
+                raise DatabaseError("password rotation is outside v1")
+            with lock(current.paths.role_lock(project, role), timeout=timeout):
+                health(current, existing)
+            return current
+        settings = defaults(role, engine or "dragonfly")
+        credential = (
+            _password(password) if password is not None else _password(random.token_urlsafe(32))
         )
-    else:
-        raise DatabaseError("database role must be postgres or kv")
-    after = with_role(config, project, role, settings)
-    target = after.select(identity)
-    current = state or load_state(config)
-    return _stage(
-        config,
-        after,
-        current,
-        target,
-        None,
-        ("create",),
-        resolver=resolver,
-        generate=generate,
-        initial_password=initial_password,
-    )
+        token = (
+            _password(random.token_urlsafe(32)) if role == "kv" and settings.http.enabled else None
+        )
+        updated = add_role(current, project, role, settings, RoleSecrets(credential, token))
+        target = updated.select(identity)
+        with lock(updated.paths.role_lock(project, role), timeout=timeout):
+            write(updated)
+            render(updated, target)
+            docker.up(
+                target.compose,
+                target.compose_project,
+                timeout=timeout,
+                secrets=protected(updated),
+            )
+            health(updated, target)
+        return updated
 
 
-def prepare_configure(
+def configure(
     config: Config,
-    selector: str,
+    database: Database,
     values: dict[str, Any],
     *,
     reset: tuple[str, ...] = (),
-    state: MachineState | None = None,
-    resolver=None,
-    generate=None,
-) -> Change:
-    current = state or load_state(config)
-    require_no_orphans(config, current)
-    database = config.select(selector)
-    settings, changed = _settings(database, values, reset)
-    if database.engine != ("postgres" if database.role == "postgres" else settings.engine):
-        raise DatabaseError("changing the KV engine requires an explicit migration")
-    if "image" in changed and image_major(database.image) != image_major(settings.image):
-        raise DatabaseError("engine major changes require an explicit migration")
-    after = replace_role(config, database, settings)
-    target = after.select(database.identity)
-    return _stage(
-        config,
-        after,
-        current,
-        target,
-        database,
-        changed,
-        resolver=resolver,
-        generate=generate,
-    )
-
-
-def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str, Any]:
-    if change.noop:
-        change.cancel()
-        return {"database": change.database.identity, "changed": [], "status": "unchanged"}
-    config = change.before
-    database = change.database
-    health = check_health or globals()["health"]
+) -> Config:
     timeout = config.host.timeouts["command"]
-    command_name = "database configure" if change.prior else "database add"
-    started = time.monotonic()
-    activity_started = datetime.now(UTC).isoformat()
-    protected = secrets.protected(change.secret_files)
-    log_write(
-        "database_operation",
-        secrets=protected,
-        host=config.host.id,
-        project=database.project,
-        role=database.role,
-        engine=database.engine,
-        command=command_name,
-        step="start",
-        result="started",
-    )
-    with operation(config, database, write=True, timeout=timeout):
-        try:
-            require_no_orphans(config, load_state(config))
-            if _fingerprint(change.before, change.prior) != change.fingerprint:
-                raise DatabaseError("configuration changed after preview; run the command again")
-        except BaseException:
-            append_activity(
-                config,
-                command=command_name,
-                database=database,
-                changed=change.changed,
-                result="failed",
-                recovery=None,
-                started=activity_started,
-            )
-            raise
-        safety = None
-        safety_snapshot = None
-        if change.safety_backup:
-            try:
-                if backup_create is None:
-                    from .backup import create as backup_create
-                safety = backup_create(config, change.prior, purpose="safety", lock_held=True)
-                snapshot = safety.get("snapshot") or safety.get("upload", {}).get("snapshot")
-                if not snapshot:
-                    raise DatabaseError("safety backup did not produce a confirmed snapshot")
-                safety_snapshot = snapshot
-                live_state = load_state(config)
-                live_role = live_state.roles.get(database.identity)
-                candidate_role = change.after_state.roles.get(database.identity)
-                if live_role is None or candidate_role is None:
-                    raise DatabaseError("safety backup left incomplete database state")
-                change = replace(
-                    change,
-                    after_state=replace(
-                        change.after_state,
-                        roles={
-                            **change.after_state.roles,
-                            database.identity: replace(
-                                candidate_role,
-                                operations=dict(live_role.operations),
-                            ),
-                        },
-                    ),
-                )
-            except BaseException as exc:
-                append_activity(
-                    config,
-                    command=command_name,
-                    database=database,
-                    changed=change.changed,
-                    result="failed",
-                    recovery=None,
-                    started=activity_started,
-                    safety_snapshot=safety_snapshot,
-                )
-                log_write(
-                    "database_operation",
-                    secrets=protected,
-                    host=config.host.id,
-                    project=database.project,
-                    role=database.role,
-                    engine=database.engine,
-                    command=command_name,
-                    step="safety_backup",
-                    result="failed",
-                    duration=round(time.monotonic() - started, 3),
-                    error=str(exc),
-                )
-                raise
-
-        try:
-            targets = _installed_paths(change)
-            prior_files = _snapshot(targets)
-            asset_dirs = (
-                database.data,
-                change.after.paths.role_config(database.project, database.role),
-                change.after.paths.role_secrets(database.project, database.role),
-            )
-            for path in asset_dirs:
-                if path.is_symlink() or (path.exists() and not path.is_dir()):
-                    raise DatabaseError(f"managed asset path is unsafe: {path}")
-            created_dirs = tuple(path for path in asset_dirs if not path.exists())
-            write_json(
-                change.transaction / "transaction.json",
-                {
-                    "kind": "settings",
-                    "host": config.host.id,
-                    "database": database.identity,
-                    "changed": list(change.changed),
-                    "phase": "installing",
-                    "recovery": "run evdb host check before retrying the settings change",
-                },
-            )
-        except BaseException:
-            append_activity(
-                config,
-                command=command_name,
-                database=database,
-                changed=change.changed,
-                result="failed",
-                recovery=None,
-                started=activity_started,
-                safety_snapshot=safety_snapshot,
-            )
-            raise
-        candidate_invoked = False
-        try:
-            _install(change)
-            candidate_invoked = True
-            run(
-                compose.command(
-                    database.compose,
-                    database.compose_project,
-                    "up",
-                    "-d",
-                    "--remove-orphans",
-                ),
+    with operation(config, write=True, timeout=timeout):
+        current = load(config.paths.source, paths=config.paths)
+        selected = current.select(database.identity)
+        settings = _settings(selected, values, reset)
+        if settings == selected.settings:
+            with lock(
+                current.paths.role_lock(selected.project, selected.role),
                 timeout=timeout,
-                secrets=secrets.protected(change.secret_files),
+            ):
+                health(current, selected)
+            return current
+        updated = replace_role(current, selected.identity, settings)
+        target = updated.select(selected.identity)
+        with lock(updated.paths.role_lock(target.project, target.role), timeout=timeout):
+            write(updated, secrets=False)
+            render(updated, target)
+            docker.up(
+                target.compose,
+                target.compose_project,
+                timeout=timeout,
+                secrets=protected(updated),
             )
-            health(change.after, database, state=change.after_state)
-        except BaseException as exc:
-            failures = []
-            if change.prior is None and candidate_invoked:
-                try:
-                    run(
-                        compose.command(database.compose, database.compose_project, "stop"),
-                        timeout=timeout,
-                        secrets=secrets.protected(change.secret_files),
-                    )
-                except BaseException:
-                    failures.append("candidate service stop")
-            if not failures:
-                failures.extend(_restore(prior_files))
-            if not failures and change.prior is not None:
-                try:
-                    run(
-                        compose.command(
-                            change.prior.compose,
-                            change.prior.compose_project,
-                            "up",
-                            "-d",
-                            "--remove-orphans",
-                        ),
-                        timeout=timeout,
-                        secrets=secrets.protected(change.secret_files),
-                    )
-                    health(config, change.prior, state=change.before_state)
-                except BaseException:
-                    failures.append("prior service health")
-            elif not failures:
-                failures.extend(_remove_created_empty(created_dirs))
-            append_activity(
-                config,
-                command=command_name,
-                database=database,
-                changed=change.changed,
-                result="failed",
-                recovery="failed" if failures else "recovered",
-                started=activity_started,
-                safety_snapshot=safety_snapshot,
-            )
-            log_write(
-                "database_operation",
-                secrets=protected,
-                host=config.host.id,
-                project=database.project,
-                role=database.role,
-                engine=database.engine,
-                command=command_name,
-                step="recovery",
-                result="failed",
-                recovery="failed" if failures else "recovered",
-                duration=round(time.monotonic() - started, 3),
-                error=str(exc),
-            )
-            if failures:
-                write_json(
-                    change.transaction / "transaction.json",
-                    {
-                        "kind": "settings",
-                        "host": config.host.id,
-                        "database": database.identity,
-                        "changed": list(change.changed),
-                        "phase": "recovery_failed",
-                        "recovery": "inspect protected files and run evdb host check",
-                    },
-                )
-                raise DatabaseError(
-                    f"database change failed and recovery failed; inspect {change.transaction}"
-                ) from exc
-            change.cancel()
-            if change.prior is None:
-                raise DatabaseError("database creation failed; candidate services stopped") from exc
-            raise DatabaseError("database change failed; prior service recovered") from exc
+            health(updated, target)
+        return updated
 
-        append_activity(
-            change.after,
-            command=command_name,
-            database=database,
-            changed=change.changed,
-            result="success",
-            recovery=None,
-            started=activity_started,
-            safety_snapshot=safety_snapshot,
+
+def start(config: Config, database: Database) -> None:
+    _converge(config, database)
+
+
+def stop(config: Config, database: Database) -> None:
+    _require_generated(database)
+    with operation(config, database, timeout=config.host.timeouts["command"]):
+        docker.stop(
+            database.compose,
+            database.compose_project,
+            timeout=config.host.timeouts["command"],
+            secrets=protected(config),
         )
-        log_write(
-            "database_operation",
-            secrets=protected,
-            host=config.host.id,
-            project=database.project,
-            role=database.role,
-            engine=database.engine,
-            command=command_name,
-            step="complete",
-            result="success",
-            duration=round(time.monotonic() - started, 3),
+
+
+def restart(config: Config, database: Database) -> None:
+    _converge(config, database)
+
+
+def _converge(config: Config, database: Database) -> None:
+    with operation(config, database, timeout=config.host.timeouts["command"]):
+        current = load(config.paths.source, paths=config.paths)
+        target = current.select(database.identity)
+        render(current, target)
+        docker.up(
+            target.compose,
+            target.compose_project,
+            timeout=current.host.timeouts["command"],
+            secrets=protected(current),
         )
-        change.cancel()
-        result = {
-            "database": database.identity,
-            "changed": list(change.changed),
-            "safety_snapshot": (
-                safety.get("snapshot") or safety.get("upload", {}).get("snapshot")
-                if safety
-                else None
-            ),
-            "status": "healthy",
-        }
-        if change.credential:
-            result["credential"] = change.credential
-        return result
-
-
-def start(config: Config, database: Database, *, state: MachineState | None = None) -> None:
-    _lifecycle(config, database, "start", ("up", "-d", "--remove-orphans"), state, True)
-
-
-def stop(config: Config, database: Database, *, state: MachineState | None = None) -> None:
-    _lifecycle(config, database, "stop", ("stop",), state, False)
-
-
-def restart(config: Config, database: Database, *, state: MachineState | None = None) -> None:
-    _lifecycle(config, database, "restart", ("restart",), state, True)
-
-
-def _lifecycle(
-    config: Config,
-    database: Database,
-    command: str,
-    args: tuple[str, ...],
-    state: MachineState | None,
-    check_health: bool,
-) -> None:
-    started = time.monotonic()
-    protected = _protected_credentials(config, database)
-    log_write(
-        "database_lifecycle",
-        secrets=protected,
-        host=config.host.id,
-        project=database.project,
-        role=database.role,
-        engine=database.engine,
-        command=f"database {command}",
-        step="start",
-        result="started",
-    )
-    try:
-        current = state or load_state(config)
-        _require_installed(config, database, current)
-        with operation(config, database, timeout=config.host.timeouts["command"]):
-            run(
-                compose.command(database.compose, database.compose_project, *args),
-                timeout=config.host.timeouts["command"],
-                secrets=protected,
-            )
-            if check_health:
-                health(config, database, state=current)
-    except BaseException as exc:
-        log_write(
-            "database_lifecycle",
-            secrets=protected,
-            host=config.host.id,
-            project=database.project,
-            role=database.role,
-            engine=database.engine,
-            command=f"database {command}",
-            step="complete",
-            result="failed",
-            duration=round(time.monotonic() - started, 3),
-            error=str(exc),
-        )
-        raise
-    log_write(
-        "database_lifecycle",
-        secrets=protected,
-        host=config.host.id,
-        project=database.project,
-        role=database.role,
-        engine=database.engine,
-        command=f"database {command}",
-        step="complete",
-        result="success",
-        duration=round(time.monotonic() - started, 3),
-    )
+        health(current, target)
 
 
 def logs(config: Config, database: Database, *, lines: int = 200) -> str:
     if not 1 <= lines <= 5000:
         raise DatabaseError("log line count must be between 1 and 5000")
-    _require_installed(config, database, load_state(config))
-    values = _protected_credentials(config, database)
-    result = run(
-        compose.command(
-            database.compose,
-            database.compose_project,
-            "logs",
-            "--no-color",
-            "--tail",
-            str(lines),
-        ),
+    _require_generated(database)
+    return docker.logs(
+        database.compose,
+        database.compose_project,
+        lines,
         timeout=config.host.timeouts["command"],
-        secrets=values,
+        secrets=protected(config),
     )
-    return sanitize(result.out, values)
-
-
-def info(config: Config, database: Database) -> dict[str, Any]:
-    values = secrets.credentials(config, database)
-    state = load_state(config)
-    role = state.roles.get(database.identity)
-    if role is None or not role.installed:
-        raise DatabaseError(f"database is not installed: {database.identity}")
-    generated = compose.database(config, database, state)
-    expected = compose.expected_services(generated, database)
-    service_state = {}
-    services_ok = True
-    primary_running = False
-    for name, item in expected.items():
-        observed = docker.state(
-            item["container"],
-            timeout=min(10, config.host.timeouts["health"]),
-            health=item["health"] == "docker",
-        )
-        ok = bool(
-            observed["running"]
-            and observed["image"] == item["image"]
-            and observed["labels"].get(compose.CONTRACT_LABEL) == item["contract"]
-            and (item["health"] != "docker" or observed["healthy"])
-        )
-        service_state[name] = {
-            "running": bool(observed["running"]),
-            "healthy": ok,
-            "image": observed["image"],
-        }
-        services_ok = services_ok and ok
-        if name.endswith("-primary"):
-            primary_running = bool(observed["running"])
-    engine_ok = _engine_health(database, values) if primary_running else False
-    health = (
-        "stopped"
-        if not primary_running
-        else ("healthy" if services_ok and engine_ok else "unhealthy")
-    )
-    engine_version = _engine_version(config, database) if primary_running else None
-    try:
-        from .backup import history
-
-        rows = history(config, database) if database.durable else []
-        latest = rows[0] if rows else None
-    except Exception as exc:
-        latest = {"error": sanitize(str(exc))[:500]}
-    result = {
-        "database": database.identity,
-        "project": database.project,
-        "role": database.role,
-        "engine": database.engine,
-        "settings": _info_settings(database),
-        "source_image": database.image,
-        "image": role.images["primary"].image,
-        "engine_version": engine_version,
-        "running": primary_running,
-        "health": health,
-        "services": service_state,
-        "data": str(database.data),
-        "compose": str(database.compose),
-        "backup": latest,
-        "host": database.domain,
-        "port": database.port,
-        "tls": True,
-    }
-    password = quote(values.password, safe="")
-    if database.role == "postgres":
-        user = quote(database.settings.user, safe="")
-        name = quote(database.settings.database, safe="")
-        result["username"] = database.settings.user
-        result["database_name"] = database.settings.database
-        result["url"] = (
-            f"postgresql://{user}:{password}@{database.domain}:5432/{name}?sslmode=require"
-        )
-        result["pgbouncer"] = database.settings.pgbouncer.enabled
-    else:
-        result["url"] = f"rediss://default:{password}@{database.domain}:6379/0"
-        if database.settings.http.enabled:
-            if values.http_token is None:
-                raise DatabaseError(f"{database.identity}: HTTP token is missing")
-            domain = database.settings.http.domain or database.domain
-            result["http"] = {
-                "enabled": True,
-                "url": f"https://{domain}",
-                "token": values.http_token,
-            }
-        else:
-            result["http"] = {"enabled": False}
-    return result
-
-
-def _info_settings(database: Database) -> dict[str, Any]:
-    if database.role == "postgres":
-        pool = database.settings.pgbouncer
-        return {
-            "image": database.settings.image,
-            "user": database.settings.user,
-            "database": database.settings.database,
-            "pgbouncer": pool.enabled,
-            "pgbouncer_image": pool.image,
-            "max_clients": pool.max_clients,
-            "pool_size": pool.pool_size,
-            "reserve_size": pool.reserve_size,
-        }
-    http = database.settings.http
-    result = {
-        "image": database.settings.image,
-        "mode": database.settings.mode,
-        "http": http.enabled,
-        "http_image": http.image,
-        "http_connections": http.connections,
-    }
-    if database.engine == "dragonfly":
-        result.update(memory=database.settings.memory, threads=database.settings.threads)
-    return result
-
-
-def _engine_health(database: Database, values: secrets.Credentials) -> bool:
-    container = f"evdb-{database.project}-{database.role}-primary"
-    if database.engine == "postgres":
-        primary_ok = postgres.health(
-            container,
-            user=database.settings.user,
-            database=database.settings.database,
-        )
-        return primary_ok and (
-            not database.settings.pgbouncer.enabled
-            or postgres.pool_health(
-                f"evdb-{database.project}-{database.role}-pgbouncer",
-                values.password,
-                user=database.settings.user,
-                database=database.settings.database,
-            )
-        )
-    if database.engine == "redis":
-        return redis.health(container, values.password)
-    return dragonfly.health(container, values.password)
-
-
-def _engine_version(config: Config, database: Database) -> str | None:
-    container = f"evdb-{database.project}-{database.role}-primary"
-    result = run(
-        ["docker", "exec", container, *_VERSION_COMMANDS[database.engine]],
-        timeout=min(10, config.host.timeouts["health"]),
-        check=False,
-    )
-    value = result.out.strip()
-    return value if result.code == 0 and value else None
 
 
 def health(
     config: Config,
     database: Database,
     *,
-    state: MachineState | None = None,
     timeout: int | None = None,
 ) -> None:
-    current = state or load_state(config)
-    data = compose.database(config, database, current)
-    expected = compose.expected_services(data, database)
     deadline = time.monotonic() + (timeout or config.host.timeouts["health"])
-    values = secrets.credentials(config, database)
+    engine = get(database.engine)
+    service_names = tuple(engine.services(database))
     while True:
-        services_ok = True
-        for item in expected.values():
-            observed = docker.state(
-                item["container"],
+        containers = [
+            docker.state(
+                name,
                 timeout=min(10, config.host.timeouts["health"]),
-                health=item["health"] == "docker",
+                health=name != database.service("primary"),
             )
-            services_ok = services_ok and bool(
-                observed["running"]
-                and observed["image"] == item["image"]
-                and observed["labels"].get(compose.CONTRACT_LABEL) == item["contract"]
-                and (item["health"] != "docker" or observed["healthy"])
-            )
-        primary = f"evdb-{database.project}-{database.role}-primary"
-        if database.engine == "postgres":
-            engine_ok = postgres.health(
-                primary,
-                user=database.settings.user,
-                database=database.settings.database,
-            )
-            pool_ok = not database.settings.pgbouncer.enabled or postgres.pool_health(
-                f"evdb-{database.project}-{database.role}-pgbouncer",
-                values.password,
-                user=database.settings.user,
-                database=database.settings.database,
-            )
-        elif database.engine == "redis":
-            engine_ok = redis.health(primary, values.password)
-            pool_ok = True
-        else:
-            engine_ok = dragonfly.health(primary, values.password)
-            pool_ok = True
-        if services_ok and engine_ok and pool_ok:
+            for name in service_names
+        ]
+        services_ok = all(item["running"] and (item["healthy"] is not False) for item in containers)
+        if services_ok and engine.health(database, timeout=10):
             return
         if time.monotonic() >= deadline:
             raise DatabaseError(f"database did not become healthy: {database.identity}")
         time.sleep(1)
 
 
-def _stage(
-    before,
-    after,
-    current,
-    target,
-    prior,
-    changed,
-    *,
-    resolver=None,
-    generate=None,
-    initial_password: str | None = None,
-) -> Change:
-    after_state = resolve_state(after, current, resolver=resolver)
-    transaction = private_dir(
-        after.paths.state / "transactions" / f"{target.project}-{target.role}-{uuid.uuid4().hex}"
+def observe(config: Config, database: Database) -> dict[str, Any]:
+    engine = get(database.engine)
+    services = engine.services(database)
+    states = {
+        name: docker.state(name, health=name != database.service("primary")) for name in services
+    }
+    running = states[database.service("primary")]["running"]
+    healthy = bool(
+        running
+        and all(value["running"] and value["healthy"] is not False for value in states.values())
+        and engine.health(database)
     )
+    return {
+        "running": running,
+        "healthy": healthy,
+        "health": "healthy" if healthy else ("unhealthy" if running else "stopped"),
+        "services": states,
+    }
+
+
+def info(config: Config, database: Database) -> dict[str, Any]:
+    observed = observe(config, database)
+    engine = get(database.engine)
     try:
-        create = generate or (lambda: __import__("secrets").token_urlsafe(32))
-        credential = None
-        if prior is None:
-            if initial_password is not None:
-                password = initial_password
-                credential = "supplied"
-            else:
-                password = create()
-                credential = "generated"
-            token = create() if target.role == "kv" and target.settings.http.enabled else None
-            if not isinstance(password, str) or not password or token == "":
-                raise ConfigError("credential generator returned an empty value")
-            values = secrets.Credentials(password, token)
-        else:
-            values = secrets.credentials(before, prior)
-            if target.role == "kv" and target.settings.http.enabled and values.http_token is None:
-                token_path = secrets.path(before, prior, "http-token")
-                if token_path.exists() or token_path.is_symlink():
-                    token = secrets.read(before, prior, "http-token")
-                else:
-                    token = create()
-                    if not isinstance(token, str) or not token:
-                        raise ConfigError("credential generator returned an empty value")
-                values = secrets.Credentials(values.password, token)
-        secret_files = secrets.render(after, target, values)
-        data = compose.database(after, target, after_state)
-        primary_name = f"evdb-{target.project}-{target.role}-primary"
-        primary_change = False
-        if prior is not None:
-            prior_data = compose.database(before, prior, current)
-            primary_change = prior_data["services"][primary_name] != data["services"][primary_name]
-        contract = compose.service_hash(data)
-        role = after_state.roles[target.identity]
-        role = replace(role, compose_hash=contract, installed=True)
-        after_state = replace(
-            after_state,
-            roles={**after_state.roles, target.identity: role},
-        )
-        write_text(transaction / "host.yml", dump(after), mode=0o600)
-        write_json(transaction / "state.json", state_dict(after_state), mode=0o600)
-        staged = []
-        for item in secret_files:
-            candidate = transaction / "secrets" / item.path.name
-            write_text(candidate, item.content, mode=0o600)
-            staged.append((str(item.path), str(candidate)))
-        validation_data = _replace_paths(data, staged)
-        validation_path = transaction / "compose.yaml"
-        compose.write(validation_path, validation_data)
-        if target.role == "postgres" and target.settings.pgbouncer.enabled:
-            write_text(transaction / "pgbouncer.ini", compose.pool_config(target), mode=0o600)
-        compose.validate(
-            validation_path,
-            target.compose_project,
-            timeout=after.host.timeouts["command"],
-            secrets=secrets.protected(secret_files),
-        )
-        services = tuple(data["services"])
-        return Change(
-            before,
-            after,
-            current,
-            after_state,
-            target,
-            prior,
-            tuple(changed),
-            services,
-            "brief database restart" if prior else "initial service start",
-            bool(prior and prior.durable and primary_change),
-            transaction,
-            secret_files,
-            data,
-            _fingerprint(before, prior),
-            credential,
-        )
-    except Exception:
-        shutil.rmtree(transaction, ignore_errors=True)
-        raise
+        details = engine.info(database) if observed["running"] else {}
+    except (Error, OSError) as exc:
+        details = {"error": clean(str(exc))}
+    backup_summary = {
+        "state": "disabled" if not database.durable else "missing",
+        "availability": None,
+        "time": None,
+        "backup": None,
+        "snapshot": None,
+    }
+    if database.durable:
+        from . import backup
+
+        try:
+            rows = backup.history(config, database)
+            if rows:
+                latest = rows[0]
+                backup_summary.update(
+                    state="available",
+                    availability=latest["source"],
+                    time=latest["time"],
+                    backup=latest["backup"],
+                    snapshot=latest["snapshot"],
+                )
+        except (Error, OSError) as exc:
+            backup_summary.update(
+                state="error",
+                error=clean(redact(str(exc), protected(config)))[:500],
+            )
+    password = quote(database.credentials.password, safe="")
+    if database.role == "postgres":
+        url = f"postgresql://default:{password}@{database.domain}:5432/postgres?sslmode=require"
+        connection = {
+            "url": url,
+            "username": "default",
+            "password": database.credentials.password,
+            "database": "postgres",
+        }
+    else:
+        connection = {
+            "url": f"rediss://default:{password}@{database.domain}:6379/0",
+            "username": "default",
+            "password": database.credentials.password,
+        }
+        if database.settings.http.enabled:
+            connection.update(
+                http_url=f"https://{database.settings.http.domain or database.domain}",
+                http_loopback=f"http://127.0.0.1:{database.http_port}",
+                http_token=database.credentials.http_token,
+            )
+    return {
+        "database": database.identity,
+        "engine": database.engine,
+        "status": observed["health"],
+        "image": database.image,
+        "sidecar_images": _sidecar_images(database),
+        "data": str(database.data),
+        "compose": str(database.compose),
+        "settings": _setting_values(database),
+        "engine_info": details,
+        "backup": backup_summary,
+        "connection": connection,
+    }
 
 
 def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]):
@@ -857,196 +297,93 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
     if unknown:
         raise DatabaseError(f"setting is not valid for {database.engine}: {unknown[0]}")
     if database.engine == "redis" and ({"memory", "threads"} & (set(values) | set(reset))):
-        raise DatabaseError("memory and threads are only valid for dragonfly")
-    changed = []
-    settings = database.settings
-    defaults = (
-        Postgres(DEFAULT_IMAGES["postgres"], PgBouncer())
-        if database.role == "postgres"
-        else KV(
-            database.engine,
-            DEFAULT_IMAGES[database.engine],
-            http=HTTP(),
-            memory="256mb" if database.engine == "dragonfly" else None,
-            threads=1 if database.engine == "dragonfly" else None,
-        )
-    )
+        raise DatabaseError("memory and threads are only valid for Dragonfly")
+    base = defaults(database.role, database.engine)
     updates = dict(values)
     for name in reset:
-        if name.startswith("pgbouncer_"):
-            key = name.removeprefix("pgbouncer_")
-            updates[name] = getattr(defaults.pgbouncer, key)
-        elif name.startswith("http_"):
-            key = name.removeprefix("http_")
-            updates[name] = getattr(defaults.http, key)
-        else:
-            updates[name] = getattr(defaults, name)
+        updates[name] = _current(base, name)
+    settings = database.settings
+    if "image" in updates:
+        validate_image(updates["image"])
     if database.role == "postgres":
         pool = settings.pgbouncer
         pool_values = {}
         for name in ("pgbouncer", "pgbouncer_image", "max_clients", "pool_size", "reserve_size"):
-            if name not in updates:
-                continue
-            key = {"pgbouncer": "enabled", "pgbouncer_image": "image"}.get(name, name)
-            pool_values[key] = updates[name]
-            if getattr(pool, key) != updates[name]:
-                changed.append(name)
-        if "image" in updates:
-            validate_source(updates["image"])
-            if settings.image != updates["image"]:
-                changed.append("image")
+            if name in updates:
+                pool_values[
+                    {"pgbouncer": "enabled", "pgbouncer_image": "image"}.get(name, name)
+                ] = updates[name]
         settings = replace(
             settings,
             image=updates.get("image", settings.image),
             pgbouncer=replace(pool, **pool_values),
         )
     else:
-        http = settings.http
         http_values = {}
         for name in ("http", "http_image", "http_connections"):
-            if name not in updates:
-                continue
-            key = {
-                "http": "enabled",
-                "http_image": "image",
-                "http_connections": "connections",
-            }[name]
-            http_values[key] = updates[name]
-            if getattr(http, key) != updates[name]:
-                changed.append(name)
-        direct = {}
-        for name in ("image", "mode", "memory", "threads"):
             if name in updates:
-                direct[name] = updates[name]
-                if getattr(settings, name) != updates[name]:
-                    changed.append(name)
-        if "image" in direct:
-            validate_source(direct["image"])
-        settings = replace(settings, **direct, http=replace(http, **http_values))
-    return settings, tuple(sorted(set(changed)))
+                http_values[
+                    {"http": "enabled", "http_image": "image", "http_connections": "connections"}[
+                        name
+                    ]
+                ] = updates[name]
+        direct = {
+            name: updates[name]
+            for name in ("image", "mode", "memory", "threads")
+            if name in updates
+        }
+        settings = replace(settings, **direct, http=replace(settings.http, **http_values))
+    get(database.engine).validate(settings)
+    return settings
 
 
-def _install(change: Change) -> None:
-    config = change.after
-    database = change.database
-    if config.paths.source.exists():
-        write_bytes(config.paths.previous, config.paths.source.read_bytes(), mode=0o640)
-    write_text(config.paths.source, dump(config), mode=0o640)
-    secrets.write(change.secret_files)
-    compose.write(database.compose, change.compose_data)
+def _current(settings: Postgres | KV, name: str):
+    if name == "pgbouncer":
+        return settings.pgbouncer.enabled
+    if name.startswith("pgbouncer_"):
+        return getattr(settings.pgbouncer, name.removeprefix("pgbouncer_"))
+    if name == "http":
+        return settings.http.enabled
+    if name.startswith("http_"):
+        return getattr(settings.http, name.removeprefix("http_"))
+    return getattr(settings, name)
+
+
+def _setting_values(database: Database) -> dict[str, Any]:
+    names = (
+        ("image", "pgbouncer", "pgbouncer_image", "max_clients", "pool_size", "reserve_size")
+        if database.role == "postgres"
+        else (
+            ("image", "mode", "http", "http_image", "http_connections", "memory", "threads")
+            if database.engine == "dragonfly"
+            else ("image", "mode", "http", "http_image", "http_connections")
+        )
+    )
+    return {name: _current(database.settings, name) for name in names}
+
+
+def _sidecar_images(database: Database) -> dict[str, str]:
+    values = {}
     if database.role == "postgres" and database.settings.pgbouncer.enabled:
-        write_text(
-            config.paths.role_config(database.project, database.role) / "pgbouncer.ini",
-            compose.pool_config(database),
-            mode=0o640,
-        )
-    write_state(config, change.after_state)
-    database.data.mkdir(parents=True, exist_ok=True, mode=0o700)
+        values["pgbouncer"] = database.settings.pgbouncer.image
+    if database.role == "kv" and database.settings.http.enabled:
+        values["http"] = database.settings.http.image
+    return values
 
 
-def _installed_paths(change: Change) -> tuple[Path, ...]:
-    database = change.database
-    paths = {
-        change.after.paths.source,
-        change.after.paths.previous,
-        change.after.paths.machine_state,
-        database.compose,
-        change.after.paths.role_config(database.project, database.role) / "pgbouncer.ini",
-        *(item.path for item in change.secret_files),
-    }
-    return tuple(sorted(paths, key=str))
-
-
-def _snapshot(paths) -> tuple[FileState, ...]:
-    result = []
-    for path in paths:
-        if path.is_symlink():
-            raise DatabaseError(f"managed path must not be a symlink: {path}")
-        if not path.exists():
-            result.append(FileState(path, None, None, None, None))
-            continue
-        if not path.is_file():
-            raise DatabaseError(f"managed path must be a file: {path}")
-        stat = path.stat()
-        result.append(
-            FileState(path, path.read_bytes(), stat.st_mode & 0o777, stat.st_uid, stat.st_gid)
-        )
-    return tuple(result)
-
-
-def _restore(states) -> list[str]:
-    failures = []
-    for item in states:
-        try:
-            if item.data is None:
-                item.path.unlink(missing_ok=True)
-                continue
-            write_bytes(item.path, item.data, mode=item.mode)
-            if item.uid is not None and item.gid is not None:
-                os.chown(item.path, item.uid, item.gid)
-        except OSError:
-            failures.append(str(item.path))
-    return failures
-
-
-def _remove_created_empty(paths: tuple[Path, ...]) -> list[str]:
-    failures = []
-    for path in sorted(paths, key=lambda item: len(item.parts), reverse=True):
-        try:
-            if path.is_symlink() or (path.exists() and not path.is_dir()):
-                failures.append(str(path))
-            elif path.is_dir() and not any(path.iterdir()):
-                path.rmdir()
-        except OSError:
-            failures.append(str(path))
-    return failures
-
-
-def _fingerprint(config: Config, database: Database | None) -> str:
-    paths = [config.paths.source, config.paths.machine_state]
-    if database is not None:
-        paths.append(database.compose)
-        paths.extend(
-            config.paths.role_secrets(database.project, database.role) / name
-            for name in (
-                "password",
-                "http-token",
-                "pgbouncer-users",
-                "redis.conf",
-                "dragonfly.flags",
-                "http.env",
-            )
-        )
-    digest = hashlib.sha256()
-    for path in sorted(paths, key=str):
-        digest.update(str(path).encode())
-        digest.update(b"\0")
-        if path.is_file() and not path.is_symlink():
-            digest.update(path.read_bytes())
-            digest.update(str(path.stat().st_mode & 0o777).encode())
-        else:
-            digest.update(b"missing")
-    return digest.hexdigest()
-
-
-def _replace_paths(value: Any, replacements: list[tuple[str, str]]) -> Any:
-    if isinstance(value, dict):
-        return {key: _replace_paths(item, replacements) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_replace_paths(item, replacements) for item in value]
-    if isinstance(value, str):
-        for old, new in replacements:
-            value = value.replace(old, new)
+def _password(value: str) -> str:
+    if not isinstance(value, str) or not value or any(char in value for char in "\0\r\n"):
+        raise DatabaseError("database credentials must be one non-empty line")
     return value
 
 
-def _require_installed(config: Config, database: Database, state: MachineState) -> None:
-    require_no_orphans(config, state)
-    role = state.roles.get(database.identity)
-    if role is None or not role.installed or not database.compose.is_file():
-        raise DatabaseError(f"database is not installed: {database.identity}")
+def password_file(value: str | Path) -> str:
+    try:
+        return private_line(value)
+    except ValueError as exc:
+        raise DatabaseError(str(exc)) from exc
 
 
-def _protected_credentials(config: Config, database: Database) -> tuple[str, ...]:
-    values = secrets.credentials(config, database)
-    return secrets.protected(item for item in (values.password, values.http_token) if item)
+def _require_generated(database: Database) -> None:
+    if database.compose.is_symlink() or not database.compose.is_file():
+        raise DatabaseError(f"database generated files are missing: {database.identity}")

@@ -8,7 +8,7 @@
 
 evdb turns a Linux server into a platform for Postgres and Redis-compatible databases. (More dbs to come)
 
-Create a database, get a private TLS connection URL, and use it with any standard Postgres or Redis client. evdb handles the infrastructure around it: provisioning, routing, credentials, backups, health checks, restores, updates, and rollback.
+Create a database, get a private TLS connection URL, and use it with any standard Postgres or Redis client. evdb handles the infrastructure around it: provisioning, routing, credentials, backups, health checks, and updates.
 
 ```sh
 sudo evdb database add notes-prod-01 postgres
@@ -16,187 +16,119 @@ sudo evdb database info notes-prod-01/postgres
 ```
 
 ```text
-postgresql://default:<password>@notes-prod-01.your-own-infra.com:5432/postgres?sslmode=require
+postgresql://default:<password>@notes-prod-01.example-01.storage.example.com:5432/postgres?sslmode=require
 ```
-
-## Why evdb
-
-Running a database container is easy. Operating it safely over time is not.
-
-evdb handles the hard parts for you:
-
-- TLS routing for Postgres, Dragonfly, and Redis
-- Separate credentials for every database
-- Encrypted off-site backups
-- Automatic backup verification
-- Safer restores with rollback
-- Health checks and update recovery
-- Stable ports and connection details
-
-You keep control of the server and storage without the hassle of building the database infrastructure yourself.
 
 ## Installation
 
-evdb supports:
+evdb supports Ubuntu 22.04 or newer on ARM64 and x86_64. The host requires Docker with Compose,
+Restic 0.17 or newer, rclone, systemd, DNS provider credentials for TLS certificates, and free native
+ports `5432` and `6379`.
 
-- Ubuntu 22.04 or newer
-- ARM64 and x86_64
-
-The host also requires:
-
-- Docker with Compose
-- Restic
-- rclone
-- systemd
-- DNS provider credentials for SSL certificates
-- Ports `5432` and `6379` to be free
-
-Install the latest release:
+Install the latest standalone release, then initialize the host:
 
 ```sh
 curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install.sh | sudo sh
-sudo evdb host setup
+sudo evdb init
 ```
 
-See [Host setup and updates](docs/setup.md) for pinned installations, unattended setup, and release security details.
+Initialization creates or validates `/etc/evdb/config.yml`, private `/etc/evdb/secrets.yml`, and
+mutable `/etc/evdb/rclone.conf`. It initializes the host's one Restic repository, including a missing
+rclone-backed path, then enables one persistent randomized daily systemd timer that runs
+`evdb backup create --all`.
+
+On first init, the guided masked Restic password prompt generates a password when left blank. Direct
+init can read one from a private file with `--restic-password-file PATH`; the credential is never
+accepted inline or through the environment and is not printed.
+
+See [Host setup and updates](docs/setup.md) for pinned installations and configured-host updates.
 
 ## Quick start
 
-Create a Postgres database:
+Create Postgres and the default Dragonfly-backed KV role, or select Redis explicitly:
 
 ```sh
-evdb database add notes-prod-01 postgres
-```
-
-Or create a key-value database (by default, we use [DragonflyDB](https://www.dragonflydb.io/), a performant Redis alternative. We also support Redis itself.):
-
-```sh
+sudo evdb database add notes-prod-01 postgres
 sudo evdb database add notes-prod-01 kv
+sudo evdb database add cache-prod-01 kv --engine redis
 ```
 
-Retrieve its connection details:
+Retrieve connection details:
 
 ```sh
 sudo evdb database info notes-prod-01/postgres
 sudo evdb database info notes-prod-01/kv
 ```
 
-evdb prints a complete TLS connection URL:
+Postgres, Redis-compatible native access, and Redis over HTTPS use standard clients. Native Postgres
+and KV connections use TLS and share a project hostname; the scheme and port select the protocol.
+`database info` deliberately shows usable credentials in a terminal. Status and machine-readable
+output remain credential-free.
 
-```text
-postgresql://default:<password>@notes-prod-01.example-01.storage.example.com:5432/postgres?sslmode=require
-rediss://default:<password>@notes-prod-01.example-01.storage.example.com:6379/0
-```
+## Backups
 
-Postgres, Redis-compatible native access, and Redis over HTTPS use the same project hostname; the
-scheme and port select the protocol.
-
-Set it as `DATABASE_URL` or `REDIS_URL` and use the client your application already has.
-
-`database info` is the only command that prints complete credentials, and it only prints them in an interactive terminal.
-
-## Features
-
-### Standard database connections
-
-Applications connect directly to Postgres, Dragonfly, or Redis using their existing drivers.
-
-There is no evdb SDK, proxy protocol, or application dependency.
-
-### Serverless Redis
-
-Besides a regular Redis `rediss://` connection URL, evdb also supports redis over https, just like [Upstash](https://upstash.com/).
-
-Powered by [serverless-redis-http](https://github.com/hiett/serverless-redis-http), you can use Redis over HTTPS on serverless platforms such as [Vercel](https://vercel.com/evanovation). evdb's redis over https support is fully compatible with `@upstash/redis` client.
-
-### TLS hostname routing
-
-All Postgres databases can share port `5432`, and all Redis-compatible databases can share port `6379`.
-
-evdb uses TLS and the requested hostname SNI to route each connection to the correct database container.
-One project uses one public hostname, for example `notes-prod-01.example-01.storage.example.com`,
-with Postgres on `5432` and Redis-compatible KV on `6379`.
-
-### Private credential storage
-
-Passwords are stored in private files on the host.
-
-In the future, we are planning to support automatic upload and sync to a cloud secret store such as 1Password.
-
-### Verified backups
-
-evdb creates encrypted Restic backups and uploads them to the storage provider you configure.
-
-A backup is not treated as successful just because the upload completed. evdb restores it into an isolated container and verifies that the restored database contains the data recorded when the backup was created.
-
-### Safer restores
-
-Before replacing a live database, evdb:
-
-1. Verifies the requested backup
-2. Creates and uploads a safety backup of the current database
-3. Restores the requested backup
-4. Runs health checks against the restored database
-
-If the restored database fails its health checks, evdb restores the previous data.
-
-### Planned updates and rollback
-
-Before applying a change, evdb shows what it will do and asks for confirmation.
-
-Credentials and assigned ports remain stable. If a database deployment or evdb update fails, evdb rolls the change back.
-
-## How it compares
-
-Services such as Supabase, Neon, Amazon RDS, and ElastiCache run databases on infrastructure managed by the provider.
-
-evdb gives applications a similar interface: a standard connection URL. The difference is that the databases run on a Linux server you own. 
-
-evdb is not intended to reproduce every feature of a managed cloud service. It does not provide:
-
-- Supabase Auth or Storage
-- Neon serverless scaling or database branching
-- AWS high availability or managed service-level agreements
-
-It is designed for small deployments or projects where you want control of the infrastructure, low cost, and no managed infrastructure. 
-
-
-## Usage
-
-Run `evdb` without arguments to open the guided menu:
+Backup creation runs engine-native checks, records file sizes and SHA-256 hashes, and reports success
+only after Restic confirms the snapshot. Create or inspect one database backup directly:
 
 ```sh
-evdb
+sudo evdb backup create notes-prod-01/postgres
+sudo evdb backup list notes-prod-01/postgres
+sudo evdb backup create --all
 ```
 
-You can also use direct commands:
+The automatic timer runs the same all-database command sequentially. Remote snapshots grow
+indefinitely because evdb v1 does not delete them. Recovery uses Restic plus manual engine tools; evdb
+does not provide a recovery command in v1.
+
+## Commands
+
+Run `evdb` without arguments for the guided terminal interface. Direct commands are available for
+scripts, SSH, and systemd:
 
 ```sh
-evdb status
+sudo evdb init
+sudo evdb status
 
-evdb database add notes-prod-01 postgres
-evdb database add notes-prod-01 kv
+sudo evdb database list
+sudo evdb database add notes-prod-01 postgres
+sudo evdb database info notes-prod-01/postgres
+sudo evdb database configure notes-prod-01/postgres
+sudo evdb database start notes-prod-01/postgres
+sudo evdb database stop notes-prod-01/postgres
+sudo evdb database restart notes-prod-01/postgres
+sudo evdb database logs notes-prod-01/postgres
 
-evdb backup create notes-prod-01/postgres
-evdb restore notes-prod-01/postgres latest
+sudo evdb backup create notes-prod-01/postgres
+sudo evdb backup create --all
+sudo evdb backup list notes-prod-01/postgres
 ```
 
-Commands that make changes show a plan and ask for confirmation before applying it.
+Explicit direct commands execute immediately. Guided creation and settings changes use one final
+confirmation.
+
+Operational identifiers stay visible in output and errors, including repository URLs, rclone remote
+names, paths, image references, snapshot IDs, and unrelated subprocess output. evdb redacts only exact
+managed password and token values and their required encoded forms.
+
+## V1 limitations
+
+evdb v1 targets Ubuntu hosts with systemd. A failed creation or settings change leaves readable source
+and generated files in place for correction and retry with `database start`. Existing pre-v1 host
+files are not migrated automatically. Production migration is a separate approved change.
 
 ## Documentation
 
 - [Command reference](docs/commands.md)
 - [Host setup and updates](docs/setup.md)
 - [Configuration](docs/configuration.md)
-- [Database deployment](docs/deploy.md)
+- [Database operations](docs/deploy.md)
 - [Routing](docs/routing.md)
 - [Backups](docs/backup.md)
-- [Restore and recovery](docs/restore.md)
-- [Secrets](docs/secrets.md)
+- [Credentials](docs/secrets.md)
 
 ## Development
 
-Development uses Python and `uv`. Installed database hosts do not require either.
+Development uses Python and `uv`; installed hosts require neither.
 
 ```sh
 uv sync --locked
@@ -210,4 +142,4 @@ tree intact and rejects `montreal-01`.
 
 ## License
 
-[MIT](LICENSE) © Evan Luo
+[MIT](LICENSE)

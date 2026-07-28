@@ -1,134 +1,53 @@
 from __future__ import annotations
 
+import json
+import shutil
+import socket
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import replace
-from pathlib import Path
 
-from evdb import backup, compose, database, restore, secrets
-from evdb.config import resolve_state, write_state
+import pytest
+
+from evdb import backup, database, docker
+from evdb.config import defaults, require_valid
 from evdb.engines import dragonfly, kv
-from tests.fixtures.containers import (
-    DRAGONFLY_IMAGE,
-    PGBOUNCER_IMAGE,
-    POSTGRES_IMAGE,
-    REDIS_IMAGE,
-    command,
-    container,
-    docker_exec,
-    network,
-    require_image,
-    wait_exec,
-)
-
-DIGEST = "sha256:" + "a" * 64
+from evdb.models import Config, Project, ProjectSecrets, RoleSecrets, http_port
+from evdb.run import run
 
 
-def test_postgres_backup_and_restore_multiple_databases(config):
-    require_image(POSTGRES_IMAGE)
-    config, target = _postgres_config(config)
-    state = _ready(config, target, POSTGRES_IMAGE)
-    name = _container_name(target)
-
-    with container(
-        POSTGRES_IMAGE,
-        name,
-        env={
-            "POSTGRES_USER": "default",
-            "POSTGRES_PASSWORD": "local-postgres-integration",
-            "POSTGRES_DB": "postgres",
-        },
-        memory="2g",
-    ):
-        wait_exec(name, ["pg_isready", "-U", "default", "-d", "postgres"])
-        docker_exec(
-            name,
-            ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "default", "-d", "postgres"],
-            input_text="CREATE ROLE reporting LOGIN PASSWORD 'local-role-password';\n",
-        )
-        docker_exec(name, ["createdb", "-U", "default", "app"])
-        docker_exec(name, ["createdb", "-U", "default", "odd database"])
-        docker_exec(
-            name,
-            ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "default", "-d", "app"],
-            input_text=(
-                "CREATE SCHEMA inventory AUTHORIZATION reporting;\n"
-                "CREATE TABLE inventory.items (id integer PRIMARY KEY, name text NOT NULL);\n"
-                "INSERT INTO inventory.items VALUES (1, 'alpha'), (2, 'beta');\n"
-            ),
-        )
-        docker_exec(
-            name,
-            [
-                "psql",
-                "-X",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-U",
-                "default",
-                "-d",
-                "odd database",
-            ],
-            input_text=(
-                "CREATE TABLE notes (id integer PRIMARY KEY, body text NOT NULL);\n"
-                "INSERT INTO notes VALUES (1, 'space-name-database');\n"
-            ),
-        )
-        created = backup.create(config, target, upload=False, state=state)
-
-    folder = Path(created["folder"])
-    record = backup.manifest_check(folder)
-    checked = restore.verify(config, target, folder, state=state)
-
-    assert set(record["facts"]["databases"]) == {"postgres", "app", "odd database"}
-    assert (folder / "databases/odd%20database.dump").stat().st_size > 0
-    assert "ROLE reporting" in (folder / "globals.sql").read_text()
-    assert "SCRAM-SHA-256" in (folder / "globals.sql").read_text()
-    assert set(checked["result"]["databases"]) == {"postgres", "app", "odd database"}
-    assert checked["result"]["objects"]["app"] >= 1
-    assert checked["result"]["objects"]["odd database"] >= 1
-
-
-def test_postgres_pgbouncer_uses_private_generated_files(config, tmp_path):
-    require_image(POSTGRES_IMAGE)
-    require_image(PGBOUNCER_IMAGE)
-    config, target, state = _postgres_pgbouncer_config(config)
+def test_postgres_and_private_pgbouncer_run_in_disposable_compose(config, tmp_path, monkeypatch):
+    _require_docker()
+    monkeypatch.setattr(backup, "_upload", lambda *args: "integration-snapshot")
+    project = _project("postgres")
     password = 'pool password "quoted" \\ slash'
-    secrets.write(secrets.render(config, target, secrets.Credentials(password)))
-    config.paths.role_config(target.project, target.role).mkdir(parents=True, exist_ok=True)
-    pgbouncer_ini = config.paths.role_config(target.project, target.role) / "pgbouncer.ini"
-    pgbouncer_ini.write_text(compose.pool_config(target))
-    pgbouncer_ini.chmod(0o640)
-    target.data.mkdir(parents=True, exist_ok=True, mode=0o700)
-    data = compose.database(config, target, state)
-    path = tmp_path / "compose.yaml"
+    selected = _config(
+        config,
+        tmp_path,
+        (Project(project, postgres=defaults("postgres")),),
+        (ProjectSecrets(project, postgres=RoleSecrets(password)),),
+    )
+    target = selected.select(f"{project}/postgres")
 
-    with network() as network_name:
-        data["networks"][compose.NETWORK]["name"] = network_name
-        compose.write(path, data)
+    with _network(monkeypatch) as network:
+        del network
         try:
-            command(compose.command(path, target.compose_project, "up", "-d"), timeout=300)
-            primary = f"evdb-{target.project}-{target.role}-primary"
-            pooler = f"evdb-{target.project}-{target.role}-pgbouncer"
-            wait_exec(primary, ["pg_isready", "-U", "default", "-d", "postgres"])
-            wait_exec(
-                pooler,
-                [
-                    "pg_isready",
-                    "-h",
-                    "127.0.0.1",
-                    "-p",
-                    "5432",
-                    "-U",
-                    "default",
-                    "-d",
-                    "postgres",
-                ],
+            database.render(selected, target)
+            docker.up(
+                target.compose,
+                target.compose_project,
+                timeout=600,
+                secrets=(password,),
             )
-            result = docker_exec(
-                pooler,
+            database.health(selected, target, timeout=120)
+            result = docker.exec(
+                target.service("pgbouncer"),
                 [
                     "psql",
                     "-X",
+                    "-A",
+                    "-t",
                     "-v",
                     "ON_ERROR_STOP=1",
                     "-h",
@@ -143,196 +62,168 @@ def test_postgres_pgbouncer_uses_private_generated_files(config, tmp_path):
                     "SELECT 1",
                 ],
                 env={"PGPASSWORD": password},
+                secrets=(password,),
                 timeout=60,
             )
-            assert "(1 row)" in result.stdout
-            database.health(config, target, state=state, timeout=60)
-        except BaseException as exc:
-            logs = command(
-                compose.command(path, target.compose_project, "logs", "--no-color"),
-                check=False,
-            )
-            raise AssertionError(logs.stdout or logs.stderr) from exc
+            assert result.out.strip() == "1"
+            created = backup.create(selected, target)
+            manifest = backup.manifest_check(created["folder"])
+            assert manifest["format"] == "postgres-custom-v1"
+            assert manifest["checks"] == ["size", "sha256", "postgres"]
+            assert {item["name"] for item in manifest["files"]} >= {"globals.sql"}
         finally:
-            command(compose.command(path, target.compose_project, "down", "--volumes"), check=False)
+            _clean(target, "/var/lib/postgresql/data")
 
 
-def test_redis_backup_and_restore_types_databases_and_ttl(config):
-    require_image(REDIS_IMAGE)
-    config, target = _kv_config(config, "redis", REDIS_IMAGE)
-    state = _ready(config, target, REDIS_IMAGE)
-    password = "local-redis-integration"
-    secrets.ensure(config, target, generate=lambda: password)
-    name = _container_name(target)
-    auth = {"REDISCLI_AUTH": password}
+def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_path, monkeypatch):
+    _require_docker()
+    monkeypatch.setattr(backup, "_upload", lambda *args: "integration-snapshot")
+    used = set()
+    projects = []
+    secrets = []
+    credentials = {}
+    for engine in ("redis", "dragonfly"):
+        project = _http_project(engine, used)
+        password = f"local-{engine}-password"
+        token = f"local-{engine}-token"
+        projects.append(Project(project, kv=defaults("kv", engine)))
+        secrets.append(ProjectSecrets(project, kv=RoleSecrets(password, token)))
+        credentials[engine] = (password, token)
+    selected = _config(config, tmp_path, tuple(projects), tuple(secrets))
+    targets = tuple(selected.databases)
 
-    with container(
-        REDIS_IMAGE,
-        name,
-        ["/usr/local/bin/redis-server", "/run/secrets/redis.conf"],
-        mounts=[(secrets.path(config, target, "redis.conf"), "/run/secrets/redis.conf", True)],
-    ):
-        wait_exec(name, ["redis-cli", "--raw", "PING"], env=auth)
-        kv.text(name, password, ["SET", "message", "stale"])
-        kv.text(name, password, ["SAVE"])
-        kv.text(name, password, ["SET", "message", "fresh"])
-        kv.text(name, password, ["SADD", "colors", "red", "green", "blue"])
-        kv.text(name, password, ["-n", "1", "HSET", "user", "name", "Ada", "id", "7"])
-        kv.text(name, password, ["-n", "2", "SET", "expires", "still-here"])
-        kv.text(name, password, ["-n", "2", "PEXPIRE", "expires", "180000"])
-        created = backup.create(config, target, upload=False, state=state)
-
-    record = backup.manifest_check(created["folder"])
-    checked = restore.verify(config, target, created["folder"], state=state)
-
-    assert record["facts"]["databases"] == {"0": 2, "1": 1, "2": 1}
-    assert record["facts"]["keys"] == 4
-    assert {sample["type"] for sample in record["facts"]["samples"]} == {
-        "string",
-        "set",
-        "hash",
-    }
-    assert any(sample["ttl_ms"] > 0 for sample in record["facts"]["samples"])
-    assert checked["result"]["databases"] == {"0": 2, "1": 1, "2": 1}
-
-
-def test_dragonfly_uses_one_native_snapshot_generation_and_restores_it(
-    config, tmp_path, monkeypatch
-):
-    require_image(DRAGONFLY_IMAGE)
-    config, target = _kv_config(config, "dragonfly", DRAGONFLY_IMAGE)
-    state = _ready(config, target, DRAGONFLY_IMAGE)
-    password = "local-dragonfly-integration"
-    secrets.ensure(config, target, generate=lambda: password)
-    name = _container_name(target)
-    auth = {"REDISCLI_AUTH": password}
-    stale_rdb = tmp_path / "stale-default.rdb"
-    stale_summary = tmp_path / "stale-summary.dfs"
-    stale_shard = tmp_path / "stale-0000.dfs"
-    stale_rdb.write_bytes(b"stale-default-rdb")
-    stale_summary.write_bytes(b"stale-summary")
-    stale_shard.write_bytes(b"stale-shard")
-    copied = []
-    real_copy = dragonfly.docker.copy
-
-    def record_copy(source, target_path, **kwargs):
-        copied.append(source)
-        return real_copy(source, target_path, **kwargs)
-
-    monkeypatch.setattr(dragonfly.docker, "copy", record_copy)
-
-    with container(
-        DRAGONFLY_IMAGE,
-        name,
-        [
-            "/usr/local/bin/dragonfly",
-            "--logtostderr",
-            "--flagfile=/run/secrets/dragonfly.flags",
-        ],
-        mounts=[
-            (secrets.path(config, target, "dragonfly.flags"), "/run/secrets/dragonfly.flags", True)
-        ],
-        memory="3g",
-    ):
-        wait_exec(name, ["redis-cli", "PING"], env=auth)
-        kv.text(name, password, ["SET", "message", "dragonfly"])
-        kv.text(name, password, ["SADD", "colors", "cyan", "magenta"])
-        kv.text(name, password, ["-n", "1", "HSET", "user", "name", "Grace"])
-        kv.text(name, password, ["SET", "expires", "temporary"])
-        kv.text(name, password, ["PEXPIRE", "expires", "180000"])
-        command(["docker", "cp", str(stale_rdb), f"{name}:/data/dump.rdb"])
-        command(["docker", "cp", str(stale_summary), f"{name}:/data/stale-summary.dfs"])
-        command(["docker", "cp", str(stale_shard), f"{name}:/data/stale-0000.dfs"])
-        created = backup.create(config, target, upload=False, state=state)
-
-        assert len(copied) == 2
-        sources = {item.split(":", 1)[1] for item in copied}
-        assert all(item.startswith("/data/evdb-") and item.endswith(".dfs") for item in sources)
-        assert any(item.endswith("-summary.dfs") for item in sources)
-        assert any(item.endswith("-0000.dfs") for item in sources)
-        assert all(
-            docker_exec(name, ["stat", item], check=False).returncode != 0 for item in sources
-        )
-        assert docker_exec(name, ["stat", "/data/stale-summary.dfs"]).returncode == 0
-        assert docker_exec(name, ["stat", "/data/stale-0000.dfs"]).returncode == 0
-
-    record = backup.manifest_check(created["folder"])
-    checked = restore.verify(config, target, created["folder"], state=state)
-
-    files = {item["name"] for item in record["files"]}
-    assert record["format"] == "dragonfly-dfs-v1"
-    assert files == {
-        f"{record['facts']['snapshot_base']}-summary.dfs",
-        f"{record['facts']['snapshot_base']}-0000.dfs",
-    }
-    assert record["facts"]["databases"] == {"0": 3, "1": 1}
-    assert record["facts"]["keys"] == 4
-    assert checked["result"]["databases"] == {"0": 3, "1": 1}
-    assert "1.34.1" in record["version"]
+    with _network(monkeypatch):
+        try:
+            for target in targets:
+                database.render(selected, target)
+                docker.up(
+                    target.compose,
+                    target.compose_project,
+                    timeout=600,
+                    secrets=credentials[target.engine],
+                )
+            for target in targets:
+                database.health(selected, target, timeout=120)
+                password, token = credentials[target.engine]
+                status, body = _request(target.http_port, ["PING"], token)
+                assert (status, body) == (200, {"result": "PONG"})
+                assert _request(target.http_port, ["SET", "blocked", "value"])[0] in {
+                    400,
+                    401,
+                    403,
+                }
+                assert _request(target.http_port, ["SET", "scope", target.engine], token) == (
+                    200,
+                    {"result": "OK"},
+                )
+                assert (
+                    kv.text(target.service("primary"), password, ["GET", "scope"]) == target.engine
+                )
+                created = backup.create(selected, target)
+                manifest = backup.manifest_check(created["folder"])
+                assert manifest["checks"] == ["size", "sha256", target.engine]
+                assert manifest["files"]
+                if target.engine == "dragonfly":
+                    assert not dragonfly._sources(
+                        target.service("primary"), f"evdb-{manifest['backup']}"
+                    )
+                service = docker.inspect(target.service("http"))["NetworkSettings"]["Ports"][
+                    "80/tcp"
+                ]
+                assert service == [{"HostIp": "127.0.0.1", "HostPort": str(target.http_port)}]
+            assert len({target.http_port for target in targets}) == 2
+        finally:
+            for target in targets:
+                _clean(target, "/data")
 
 
-def _postgres_config(config):
-    project = replace(config.projects[0], id=_project_id("postgres"), kv=None)
-    selected = replace(config, projects=(project,))
-    return selected, selected.select(f"{project.id}/postgres")
-
-
-def _postgres_pgbouncer_config(config):
-    source = config.projects[0].postgres
-    settings = replace(
-        source,
-        image=POSTGRES_IMAGE.split("@", 1)[0],
-        pgbouncer=replace(
-            source.pgbouncer,
-            enabled=True,
-            image=PGBOUNCER_IMAGE.split("@", 1)[0],
-        ),
+def _config(base, tmp_path, projects, secrets) -> Config:
+    selected = replace(
+        base,
+        host=replace(base.host, data_root=tmp_path / "data"),
+        projects=projects,
+        secrets=replace(base.secrets, projects=secrets),
     )
-    project = replace(config.projects[0], id=_project_id("pgbouncer"), postgres=settings, kv=None)
-    selected = replace(config, projects=(project,))
-    target = selected.select(f"{project.id}/postgres")
-    digests = {
-        target.settings.image: POSTGRES_IMAGE.split("@", 1)[1],
-        target.settings.pgbouncer.image: PGBOUNCER_IMAGE.split("@", 1)[1],
-    }
-    state = resolve_state(selected, resolver=lambda source: digests.get(source, DIGEST))
-    role = replace(state.roles[target.identity], installed=True)
-    state = replace(state, roles={**state.roles, target.identity: role})
-    write_state(selected, state)
-    return selected, target, state
+    require_valid(selected)
+    return selected
 
 
-def _kv_config(config, engine, image):
-    project = config.projects[0]
-    settings = replace(
-        project.kv,
-        engine=engine,
-        image=image.split("@", 1)[0],
-        mode="durable",
-        http=replace(project.kv.http, enabled=False),
-        memory="256mb" if engine == "dragonfly" else None,
-        threads=1 if engine == "dragonfly" else None,
-    )
-    project = replace(project, id=_project_id(engine), postgres=None, kv=settings)
-    selected = replace(config, projects=(project,))
-    return selected, selected.select(f"{project.id}/kv")
-
-
-def _ready(config, target, image):
-    digest = image.split("@", 1)[1]
-    state = resolve_state(
-        config,
-        resolver=lambda source: digest if source == target.image else DIGEST,
-    )
-    role = replace(state.roles[target.identity], installed=True)
-    state = replace(state, roles={**state.roles, target.identity: role})
-    write_state(config, state)
-    return state
-
-
-def _project_id(kind):
+def _project(kind: str) -> str:
     return f"{kind}-{uuid.uuid4().hex[:8]}-test-01"
 
 
-def _container_name(target):
-    return f"evdb-{target.project}-{target.role}-primary"
+def _http_project(kind: str, used: set[int]) -> str:
+    for _attempt in range(100):
+        project = _project(kind)
+        port = http_port(project)
+        if port not in used and _port_available(port):
+            used.add(port)
+            return project
+    pytest.skip("no derived HTTP loopback port is available")
+
+
+def _port_available(port: int) -> bool:
+    current = socket.socket()
+    try:
+        current.bind(("127.0.0.1", port))
+    except OSError:
+        return False
+    finally:
+        current.close()
+    return True
+
+
+class _network:
+    def __init__(self, monkeypatch):
+        self.name = f"evdb-it-{uuid.uuid4().hex[:12]}"
+        self.monkeypatch = monkeypatch
+
+    def __enter__(self):
+        self.monkeypatch.setattr(docker, "NETWORK", self.name)
+        run(["docker", "network", "create", self.name], timeout=60)
+        return self.name
+
+    def __exit__(self, *_error):
+        run(["docker", "network", "rm", self.name], timeout=60, check=False)
+
+
+def _clean(target, data_path: str) -> None:
+    docker.exec(
+        target.service("primary"),
+        ["chmod", "-R", "a+rwX", data_path],
+        timeout=30,
+        check=False,
+    )
+    run(
+        docker.compose_command(target.compose, target.compose_project, "down", "--volumes"),
+        timeout=120,
+        check=False,
+    )
+
+
+def _request(port: int, body: list[str], token: str | None = None):
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/",
+        data=json.dumps(body).encode(),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        data = exc.read()
+        return exc.code, json.loads(data) if data else {}
+
+
+def _require_docker() -> None:
+    if socket.gethostname().split(".", 1)[0] == "montreal-01":
+        pytest.skip("disposable Docker tests are forbidden on montreal-01")
+    if shutil.which("docker") is None:
+        pytest.skip("Docker is unavailable")
+    result = run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=30, check=False)
+    if result.code:
+        pytest.skip(f"Docker daemon is unavailable: {result.err.strip() or result.out.strip()}")

@@ -1,164 +1,398 @@
 from __future__ import annotations
 
-import os
-from contextlib import nullcontext
+import shutil
+from getpass import getpass
 from typing import Any
 
-from rich import box
-from rich.console import Console
-from rich.table import Table
-from rich.text import Text
+from .errors import Error
+from .models import Config, Database
+from .run import clean
 
 
-class Terminal:
-    def __init__(self, console: Console | None = None):
-        self.console = console or Console(highlight=False, markup=False)
-
-    def __call__(self, value: Any = "") -> None:
-        self.text(value)
-
-    def text(self, value: Any = "") -> None:
-        self.console.print(Text(str(value)))
-
-    def busy(self, message: str):
-        if not self.console.is_terminal:
-            return nullcontext()
-        return self.console.status(message)
-
-    def status(self, value: dict[str, Any] | str) -> None:
-        if not isinstance(value, dict):
-            self.text(value)
-            return
-        host = value["host"]
-        state = "healthy" if host["healthy"] else "needs attention"
-        self.console.print(
-            Text.assemble(
-                (f"Host {host['id']}", "bold"),
-                f"  tool {host['tool_version']}  ",
-                (state, "green" if host["healthy"] else "red"),
-            )
+def overview(value: dict[str, Any], *, width: int | None = None) -> str:
+    width = width or shutil.get_terminal_size((100, 24)).columns
+    identity_width = max(12, min(36, width - 41))
+    host_state = "healthy" if value["host"]["healthy"] else "needs attention"
+    lines = [
+        _fit(f"Host {value['host']['id']}  {host_state}", width),
+        "",
+        f"{'#':>2}  {'Database':<{identity_width}}  {'Engine':<9}  {'Status':<9}  Backup",
+    ]
+    for number, (identity, item) in enumerate(value["databases"].items(), 1):
+        lines.append(
+            f"{number:>2}  {_fit(identity, identity_width):<{identity_width}}  "
+            f"{_fit(item['engine'], 9):<9}  {_fit(item['health'], 9):<9}  "
+            f"{_backup_text(item['latest_backup'])}"
         )
-        table = Table(box=box.SIMPLE, expand=True, show_lines=False)
-        for header in (
-            "Database",
-            "Engine",
-            "Run",
-            "Health",
-            "Config",
-            "Local",
-            "Upload",
-            "Test",
-            "Error",
-            "Image",
-        ):
-            table.add_column(header, overflow="ellipsis", no_wrap=header != "Error")
-        for identity, item in value["databases"].items():
-            table.add_row(
-                identity,
-                item["engine"],
-                "yes" if item["running"] else "no",
-                item["health"],
-                "ok" if item["configuration_match"] else "differs",
-                _backup_cell(item.get("backup")),
-                _upload_cell(item.get("upload"), item.get("backup")),
-                _test_cell(item.get("backup_test")),
-                item.get("error") or "-",
-                item.get("image") or "-",
-            )
-        self.console.print(table)
-        for error in value["errors"]:
-            self.console.print(Text(f"{error['scope']}: {error['message']}", style="red"))
+    if not value["databases"]:
+        lines.append("    No databases configured")
+    return "\n".join(lines)
 
-    def menu(self, title: str | None, options: list[tuple[str, str]]) -> None:
-        if title:
-            self.console.print(Text(str(title), style="bold"))
-        table = Table.grid(padding=(0, 2))
-        table.add_column(justify="right", no_wrap=True)
-        table.add_column(overflow="fold")
-        for key, label in options:
-            table.add_row(f"[{key}]", Text(str(label)))
-        self.console.print(table)
 
-    def databases(self, values, health: dict[str, str], *, allow_add: bool) -> None:
-        table = Table(box=box.SIMPLE, show_header=True, expand=True)
-        table.add_column("#", justify="right", no_wrap=True)
-        table.add_column("Database", overflow="ellipsis")
-        table.add_column("Engine", no_wrap=True)
-        table.add_column("Health", no_wrap=True)
-        for number, item in enumerate(values, start=1):
-            table.add_row(
-                str(number), item.identity, item.engine, health.get(item.identity, "unknown")
-            )
-        if allow_add:
-            table.add_row(str(len(values) + 1), "Add database", "-", "-")
-        table.add_row("0", "Back", "-", "-")
-        self.console.print(table)
+def run(
+    config: Config,
+    *,
+    input_fn=input,
+    output=print,
+    password_fn=getpass,
+) -> int:
+    from . import status
 
-    def preview(self, text: str) -> None:
-        lines = str(text).splitlines()
-        table = Table(box=box.SIMPLE, show_header=False)
-        table.add_column("Field", style="bold", no_wrap=True)
-        table.add_column("Value", overflow="fold")
-        plain = []
-        for line in lines:
-            if ": " in line and not line.startswith("  "):
-                key, value = line.split(": ", 1)
-                table.add_row(key, value)
+    current = config
+    while True:
+        value = status.collect(current)
+        _screen(output, overview(value), heading="Databases")
+        rows = {str(index) for index, _identity in enumerate(value["databases"], 1)}
+        add = len(rows) + 1
+        host = add + 1
+        options = [(str(add), "Add database"), (str(host), "Host"), ("0", "Exit")]
+        _options(output, options)
+        choice = _choice(input_fn, output, "Select", rows | {key for key, _label in options})
+        if choice in {None, "0"}:
+            return 0
+        try:
+            if int(choice) <= len(value["databases"]):
+                identity = tuple(value["databases"])[int(choice) - 1]
+                current = _database(current, identity, input_fn, output)
+            elif int(choice) == add:
+                current = _add(current, input_fn, output, password_fn)
             else:
-                plain.append(line)
-        if table.row_count:
-            self.console.print(table)
-        for line in plain:
-            self.text(line)
-
-    def result(self, value: Any) -> None:
-        self.text(result(value))
+                _host(value, output)
+        except Error as exc:
+            _screen(output, f"evdb: {exc}", heading="Error")
 
 
-def result(value: Any) -> str:
-    if not isinstance(value, dict):
-        return str(value)
-    if database := value.get("database"):
-        state = value.get("status", "complete")
-        lines = [f"{database}: {state}" if state != "healthy" else f"{database} is healthy"]
-        if changed := value.get("changed"):
-            lines.append("Changed: " + ", ".join(map(str, changed)))
-        if snapshot := value.get("safety_snapshot"):
-            lines.append(f"Safety backup: {snapshot}")
-        return "\n".join(lines)
-    if value.get("status") == "healthy" and "backup" in value:
-        lines = [f"Restore complete: {value['backup']}"]
-        if snapshot := value.get("safety", {}).get("snapshot"):
-            lines.append(f"Safety backup: {snapshot}")
-        return "\n".join(lines)
-    if status := value.get("status"):
-        return f"Status: {status}"
-    return "\n".join(f"{key.replace('_', ' ').title()}: {item}" for key, item in value.items())
+def _database(config: Config, identity: str, input_fn, output) -> Config:
+    from . import database, status
+
+    current = config
+    while True:
+        target = current.select(identity)
+        local_error = None
+        try:
+            observed = database.observe(current, target)
+        except Error as exc:
+            observed = {"running": False, "healthy": False, "health": "unknown"}
+            local_error = clean(str(exc))
+        summary = {
+            "Database": target.identity,
+            "Engine": target.engine,
+            "Status": observed["health"],
+            "Backup": "enabled" if target.durable else "disabled",
+        }
+        if local_error:
+            summary["Error"] = local_error
+        _screen(
+            output,
+            _pairs(summary),
+            heading=target.identity,
+        )
+        state_action = "Stop" if observed["running"] else "Start"
+        options = [
+            ("1", "Details"),
+            ("2", "Connection"),
+            ("3", "Settings"),
+            ("4", state_action),
+            ("5", "Restart"),
+            ("6", "Backups"),
+            ("7", "Logs"),
+            ("0", "Back"),
+        ]
+        _options(output, options)
+        choice = _choice(input_fn, output, "Select", {key for key, _label in options})
+        if choice in {None, "0"}:
+            return current
+        try:
+            if choice == "1":
+                value = database.info(current, target)
+                selected = status.collect(current, target)["databases"][target.identity]
+                details = {key: item for key, item in value.items() if key != "connection"}
+                details["error"] = selected["error"] or "none"
+                _screen(output, _pairs(details), heading="Details")
+            elif choice == "2":
+                _screen(
+                    output,
+                    _pairs(database.info(current, target)["connection"]),
+                    heading="Connection",
+                )
+            elif choice == "3":
+                values = _settings(target, input_fn, output)
+                if values is not None:
+                    current = database.configure(current, target, values)
+                    _screen(
+                        output,
+                        f"{identity} settings saved and healthy",
+                        heading="Settings",
+                    )
+            elif choice == "4":
+                (database.stop if observed["running"] else database.start)(current, target)
+                _screen(
+                    output,
+                    f"{identity}: {state_action.lower()} complete",
+                    heading=state_action,
+                )
+            elif choice == "5":
+                database.restart(current, target)
+                _screen(output, f"{identity}: restart complete", heading="Restart")
+            elif choice == "6":
+                current = _backups(current, target, input_fn, output)
+            else:
+                _screen(output, database.logs(current, target), heading="Logs")
+        except Error as exc:
+            _screen(output, f"evdb: {exc}", heading=f"{target.identity} error")
 
 
-def terminal() -> Terminal:
-    return Terminal(Console(highlight=False, markup=False, no_color=_no_color()))
+def _add(config: Config, input_fn, output, password_fn) -> Config:
+    from . import database
+
+    project = _text(input_fn, "Project")
+    if not project:
+        return config
+    _screen(output, "1. Postgres\n2. KV\n0. Cancel", heading="Add database")
+    role_choice = _choice(input_fn, output, "Role", {"0", "1", "2"})
+    if role_choice in {None, "0"}:
+        return config
+    role = "postgres" if role_choice == "1" else "kv"
+    engine = None
+    password = None
+    if role == "kv":
+        _screen(output, "1. Dragonfly\n2. Redis\n0. Cancel", heading="KV engine")
+        selected = _choice(input_fn, output, "Engine", {"0", "1", "2"})
+        if selected in {None, "0"}:
+            return config
+        engine = "dragonfly" if selected == "1" else "redis"
+    else:
+        output("")
+        password = password_fn("Initial Postgres password (blank to generate): ") or None
+    _screen(
+        output,
+        _pairs({"Database": f"{project}/{role}", "Engine": engine or "postgres"}),
+        heading="Create database",
+    )
+    if not _yes(input_fn, "Create? [y/N] "):
+        return config
+    updated = database.add(config, project, role, engine=engine, password=password)
+    _screen(output, f"{project}/{role} is healthy", heading="Created")
+    return updated
 
 
-def _no_color() -> bool | None:
-    if os.getenv("NO_COLOR") is not None or os.getenv("TERM") == "dumb":
-        return True
-    return None
+def _settings(target: Database, input_fn, output) -> dict[str, Any] | None:
+    from . import database
+
+    current = database._setting_values(target)
+    values = {}
+    _screen(output, _pairs(current), heading="Settings")
+    for name, old in current.items():
+        while True:
+            entered = _text(input_fn, f"{name} [{old}]", blank=True)
+            if not entered:
+                break
+            try:
+                candidate = {**values, name: _parse(entered, old)}
+                database._settings(target, candidate, ())
+            except Error as exc:
+                _screen(output, str(exc), heading=f"Invalid {name}")
+                continue
+            values = candidate
+            break
+    if not values:
+        return None
+    _screen(
+        output,
+        _pairs({name: f"{current[name]} -> {value}" for name, value in values.items()}),
+        heading="Save settings",
+    )
+    return values if _yes(input_fn, "Save? [y/N] ") else None
 
 
-def _backup_cell(item: dict[str, Any] | None) -> str:
-    if not item or not item.get("ok"):
-        return "missing"
-    return item.get("backup") or "ok"
+def _backups(config: Config, target: Database, input_fn, output) -> Config:
+    from . import backup
+
+    if not target.durable:
+        _screen(output, "Backups are disabled for this cache database", heading="Backups")
+        return config
+    while True:
+        _screen(output, "1. Create\n2. History\n0. Back", heading="Backups")
+        choice = _choice(input_fn, output, "Select", {"0", "1", "2"})
+        if choice in {None, "0"}:
+            return config
+        try:
+            if choice == "1":
+                result = backup.create(config, target)
+                _screen(
+                    output,
+                    f"{target.identity}: backup {result['backup']} completed "
+                    f"at {result['finished']}\n"
+                    f"Snapshot: {result['snapshot']}\nRepository: {result['repository']}",
+                    heading="Backup complete",
+                )
+            else:
+                rows = backup.history(config, target)
+                text = (
+                    "No backups available"
+                    if not rows
+                    else "\n".join(
+                        f"{row['time']}  {row['backup']}  {row['source']}  "
+                        f"{row.get('snapshot') or '-'}"
+                        for row in rows
+                    )
+                )
+                _screen(output, text, heading="Backup history")
+        except Error as exc:
+            _screen(output, f"evdb: {exc}", heading=f"{target.identity} backup error")
 
 
-def _upload_cell(item: dict[str, Any] | None, backup: dict[str, Any] | None) -> str:
-    if not item or not item.get("ok"):
-        return "missing"
-    return item.get("snapshot") or (backup or {}).get("backup") or "ok"
+def _host(value: dict[str, Any], output) -> None:
+    host = value["host"]
+    infrastructure = host["infrastructure"]
+    errors = [
+        f"{item['scope']}: {item['message']}"
+        for item in value["errors"]
+        if item["scope"].startswith("host/")
+    ]
+    _screen(
+        output,
+        _pairs(
+            {
+                "Host": host["id"],
+                "Version": host["tool_version"],
+                "Source": {
+                    "config": host["source"]["config"],
+                    "valid": host["source"]["valid"],
+                },
+                "Disks": {
+                    name: (
+                        f"{item['free_gb']} GiB free ({'ok' if item['ok'] else 'low'})"
+                        if item.get("available", True)
+                        else "unknown"
+                    )
+                    for name, item in host["disks"].items()
+                },
+                "Listeners": {
+                    port: _state(ready, "listening", "missing")
+                    for port, ready in infrastructure["listeners"].items()
+                },
+                "Network": _state(infrastructure["network"], "healthy", "missing"),
+                "Traefik": _state(infrastructure["traefik"], "healthy", "unhealthy"),
+                "ACME": _state(infrastructure["acme"], "ready", "missing or unsafe"),
+                "Repository": {
+                    "url": host["repository"]["url"],
+                    "ready": _state(host["repository"]["ready"], "yes", "no"),
+                },
+                "Timer": {
+                    "unit": host["timer"]["unit"],
+                    "loaded": _state(host["timer"]["loaded"], "yes", "no"),
+                    "enabled": _state(host["timer"]["enabled"], "yes", "no"),
+                    "active": _state(host["timer"]["active"], "yes", "no"),
+                },
+                "Errors": "\n".join(errors) if errors else "none",
+            }
+        ),
+        heading="Host",
+    )
 
 
-def _test_cell(item: dict[str, Any] | None) -> str:
-    if not item or not item.get("ok"):
-        return "missing"
-    return item.get("backup") or "ok"
+def _state(value: bool | None, ready: str, missing: str) -> str:
+    if value is None:
+        return "unknown"
+    return ready if value else missing
+
+
+def _screen(output, text: str, *, heading: str | None = None) -> None:
+    output("")
+    if heading:
+        output(clean(heading))
+    output(clean(text))
+    output("")
+
+
+def _options(output, options: list[tuple[str, str]]) -> None:
+    output("\n".join(f"{key}. {label}" for key, label in options))
+    output("")
+
+
+def _choice(input_fn, output, prompt: str, allowed: set[str]) -> str | None:
+    while True:
+        try:
+            value = input_fn(f"{prompt}: ").strip()
+        except EOFError:
+            return None
+        if value in allowed:
+            return value
+        output("")
+        output(_invalid_choice(allowed))
+        output("")
+
+
+def _invalid_choice(allowed: set[str]) -> str:
+    if allowed and all(item.isdigit() for item in allowed):
+        numbers = sorted(int(item) for item in allowed)
+        if numbers == list(range(numbers[0], numbers[-1] + 1)):
+            return f"Invalid choice; enter {numbers[0]}-{numbers[-1]}"
+    return "Invalid choice; enter " + ", ".join(sorted(allowed))
+
+
+def _backup_text(value: dict[str, Any]) -> str:
+    state = value["state"]
+    if state != "current" or not value.get("time"):
+        return state
+    from datetime import datetime
+
+    try:
+        date = datetime.fromisoformat(value["time"].replace("Z", "+00:00"))
+    except ValueError:
+        return "current"
+    return date.strftime("%m-%d %H:%M")
+
+
+def _text(input_fn, prompt: str, *, blank: bool = False) -> str | None:
+    try:
+        value = input_fn(f"{prompt}: ").strip()
+    except EOFError:
+        return None
+    return value if value or blank else None
+
+
+def _yes(input_fn, prompt: str) -> bool:
+    try:
+        return input_fn(prompt).strip().lower() in {"y", "yes"}
+    except EOFError:
+        return False
+
+
+def _parse(value: str, current: Any) -> Any:
+    if isinstance(current, bool):
+        if value.lower() in {"true", "yes", "on", "1"}:
+            return True
+        if value.lower() in {"false", "no", "off", "0"}:
+            return False
+        raise Error("boolean value required")
+    if isinstance(current, int):
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise Error("integer value required") from exc
+    return value
+
+
+def _pairs(values: dict[str, Any]) -> str:
+    lines = []
+    for key, value in values.items():
+        label = key.replace("_", " ").title()
+        if isinstance(value, dict):
+            lines.append(f"{label}:")
+            lines.extend(
+                f"  {name.replace('_', ' ').title()}: {item}" for name, item in value.items()
+            )
+        else:
+            lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
+def _fit(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width < 7:
+        return value[:width]
+    left = (width - 1) // 2
+    return value[:left] + "~" + value[-(width - left - 1) :]
