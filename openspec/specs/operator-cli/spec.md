@@ -60,6 +60,30 @@ Missing human inputs MAY prompt only when stdin and stdout are terminals. In non
 - **WHEN** a non-interactive process omits a required database identity
 - **THEN** evdb exits nonzero immediately with a secret-free usage error
 
+### Requirement: Secure initial Postgres password input
+Direct Postgres creation SHALL accept an optional `--password-file PATH` whose content becomes the
+initial password for the fixed `default` login. Guided Postgres creation SHALL offer a masked password
+prompt where blank input selects generation. evdb SHALL NOT accept a password value as a command
+argument, environment variable, ordinary echoed prompt, preview field, log field, or machine-readable
+output. A supplied password SHALL be non-empty and contain no NUL, carriage return, or embedded line
+feed after one trailing line ending is removed.
+
+#### Scenario: Script supplies a password file
+- **WHEN** automation runs `evdb database add app-prod-01 postgres --password-file PATH` with a valid private file
+- **THEN** evdb reads the password from the file, protects it from subprocess output, and does not place it in the process arguments or operation preview
+
+#### Scenario: Guided creation keeps the entered password hidden
+- **WHEN** an operator enters a password in the guided Postgres add flow
+- **THEN** the terminal does not echo or redisplay the value and the confirmed operation uses it as the initial managed password
+
+#### Scenario: Guided creation requests generation
+- **WHEN** an operator leaves the guided Postgres password prompt blank
+- **THEN** evdb generates the initial managed password without requiring another credential input
+
+#### Scenario: Password file has invalid content
+- **WHEN** the selected password file is empty or contains a NUL or embedded line break
+- **THEN** evdb rejects creation before changing source, state, secrets, Compose, containers, routes, or data
+
 ### Requirement: Deliberate confirmations
 Every operation that starts, stops, restarts, reconfigures, restores, installs, or updates production services SHALL identify the host and affected database or host infrastructure and require confirmation unless `--yes` is supplied. `--yes` SHALL confirm a complete operation but SHALL NOT invent missing inputs. In an interactive terminal, confirmations SHALL be shown outside long-running progress indicators and SHALL present preview details in a readable human layout.
 
