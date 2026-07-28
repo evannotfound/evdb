@@ -9,7 +9,10 @@ description = "Host-local database management for self-hosters"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.14"
-dependencies = ["PyYAML>=6.0"]
+dependencies = [
+    "PyYAML>=6.0",
+    "rich>=15.0.0",
+]
 
 [dependency-groups]
 dev = [

@@ -41,23 +41,29 @@ class Actions:
     host_update: Callable[[str], ActionResult]
 
 
-def run(config: Config, actions: Actions, *, input_fn=input, output=print) -> int:
+def run(config: Config, actions: Actions, *, input_fn=input, output=print, presenter=None) -> int:
     while True:
-        output(actions.status())
-        output("\n1. Databases\n2. Backups\n3. Restore\n4. Host\n0. Exit")
+        _status(actions.status(), output, presenter)
+        _menu(
+            output,
+            presenter,
+            None,
+            [("1", "Databases"), ("2", "Backups"), ("3", "Restore"), ("4", "Host"), ("0", "Exit")],
+            "\n1. Databases\n2. Backups\n3. Restore\n4. Host\n0. Exit",
+        )
         choice = _choice(input_fn, output, "Select", {"0", "1", "2", "3", "4"})
         if choice in {None, "0"}:
             return 0
         if choice == "1":
-            updated = _databases(config, actions, input_fn, output)
+            updated = _databases(config, actions, input_fn, output, presenter=presenter)
             if updated is not None:
                 config = updated
         elif choice == "2":
-            updated = _backups(config, actions, input_fn, output)
+            updated = _backups(config, actions, input_fn, output, presenter=presenter)
             if updated is not None:
                 config = updated
         elif choice == "3":
-            target = _database(config, actions, input_fn, output, durable=True)
+            target = _database(config, actions, input_fn, output, presenter=presenter, durable=True)
             if target:
                 selected = _backup(actions, target, input_fn, output)
                 if selected:
@@ -65,23 +71,35 @@ def run(config: Config, actions: Actions, *, input_fn=input, output=print) -> in
                     if updated is not None:
                         config = updated
         else:
-            updated = _host(actions, input_fn, output)
+            updated = _host(actions, input_fn, output, presenter=presenter)
             if updated is not None:
                 config = updated
 
 
-def _databases(config, actions, input_fn, output):
-    target = _database(config, actions, input_fn, output, allow_add=True)
+def _databases(config, actions, input_fn, output, *, presenter=None):
+    target = _database(config, actions, input_fn, output, presenter=presenter, allow_add=True)
     if target is None:
         return
     if target is _ADD:
-        return _add(actions, input_fn, output)
+        return _add(actions, input_fn, output, presenter=presenter)
     current = config
     identity = target.identity
     while True:
-        output(
+        _menu(
+            output,
+            presenter,
+            f"{target.identity} ({target.engine})",
+            [
+                ("1", "Info"),
+                ("2", "Settings"),
+                ("3", "Start"),
+                ("4", "Stop"),
+                ("5", "Restart"),
+                ("6", "Logs"),
+                ("0", "Back"),
+            ],
             f"\n{target.identity} ({target.engine})\n"
-            "1. Info\n2. Settings\n3. Start\n4. Stop\n5. Restart\n6. Logs\n0. Back"
+            "1. Info\n2. Settings\n3. Start\n4. Stop\n5. Restart\n6. Logs\n0. Back",
         )
         choice = _choice(input_fn, output, "Select", {str(value) for value in range(7)})
         if choice in {None, "0"}:
@@ -108,11 +126,17 @@ def _databases(config, actions, input_fn, output):
                 target = current.select(identity)
 
 
-def _backups(config, actions, input_fn, output):
-    target = _database(config, actions, input_fn, output, durable=True)
+def _backups(config, actions, input_fn, output, *, presenter=None):
+    target = _database(config, actions, input_fn, output, presenter=presenter, durable=True)
     if target is None:
         return
-    output("\n1. Create\n2. List\n3. Test\n0. Back")
+    _menu(
+        output,
+        presenter,
+        None,
+        [("1", "Create"), ("2", "List"), ("3", "Test"), ("0", "Back")],
+        "\n1. Create\n2. List\n3. Test\n0. Back",
+    )
     choice = _choice(input_fn, output, "Select", {"0", "1", "2", "3"})
     if choice == "1":
         return _show(actions.backup(target.identity), output)
@@ -206,14 +230,19 @@ def setup(values=None, *, input_fn=input, output=print) -> dict | None:
     return result
 
 
-def _database(config, actions, input_fn, output, durable=False, allow_add=False):
+def _database(config, actions, input_fn, output, presenter=None, durable=False, allow_add=False):
     values = [item for item in config.databases if not durable or item.durable]
     health = actions.health()
-    for number, item in enumerate(values, start=1):
-        output(f"{number}. {item.identity} ({item.engine}; {health.get(item.identity, 'unknown')})")
-    if allow_add:
-        output(f"{len(values) + 1}. Add database")
-    output("0. Back")
+    if presenter:
+        presenter.databases(values, health, allow_add=allow_add)
+    else:
+        for number, item in enumerate(values, start=1):
+            output(
+                f"{number}. {item.identity} ({item.engine}; {health.get(item.identity, 'unknown')})"
+            )
+        if allow_add:
+            output(f"{len(values) + 1}. Add database")
+        output("0. Back")
     maximum = len(values) + (1 if allow_add else 0)
     choice = _choice(
         input_fn,
@@ -228,18 +257,30 @@ def _database(config, actions, input_fn, output, durable=False, allow_add=False)
     return values[int(choice) - 1]
 
 
-def _add(actions, input_fn, output):
+def _add(actions, input_fn, output, *, presenter=None):
     project = _text(input_fn, "Project")
     if project is None:
         return
-    output("1. Postgres\n2. KV\n0. Cancel")
+    _menu(
+        output,
+        presenter,
+        None,
+        [("1", "Postgres"), ("2", "KV"), ("0", "Cancel")],
+        "1. Postgres\n2. KV\n0. Cancel",
+    )
     role_choice = _choice(input_fn, output, "Select role", {"0", "1", "2"})
     if role_choice in {None, "0"}:
         return
     role = "postgres" if role_choice == "1" else "kv"
     engine = "dragonfly"
     if role == "kv":
-        output("1. Dragonfly (default)\n2. Redis\n0. Cancel")
+        _menu(
+            output,
+            presenter,
+            None,
+            [("1", "Dragonfly (default)"), ("2", "Redis"), ("0", "Cancel")],
+            "1. Dragonfly (default)\n2. Redis\n0. Cancel",
+        )
         engine_choice = _choice(input_fn, output, "Select engine", {"0", "1", "2"})
         if engine_choice in {None, "0"}:
             return
@@ -268,13 +309,19 @@ def _backup(actions, target, input_fn, output):
     return selected.get("snapshot") or selected["backup"]
 
 
-def _host(actions, input_fn, output):
-    output("\n1. Check\n2. Setup\n3. Update\n0. Back")
+def _host(actions, input_fn, output, *, presenter=None):
+    _menu(
+        output,
+        presenter,
+        None,
+        [("1", "Check"), ("2", "Setup"), ("3", "Update"), ("0", "Back")],
+        "\n1. Check\n2. Setup\n3. Update\n0. Back",
+    )
     choice = _choice(input_fn, output, "Select", {"0", "1", "2", "3"})
     if choice in {None, "0"}:
         return
     if choice == "1":
-        output(actions.host_check())
+        _status(actions.host_check(), output, presenter)
     elif choice == "2":
         return _show(actions.host_setup(), output)
     else:
@@ -291,6 +338,20 @@ def _show(result: ActionResult, output) -> Config | None:
         return config
     output(result)
     return None
+
+
+def _status(value, output, presenter) -> None:
+    if presenter:
+        presenter.status(value)
+    else:
+        output(value)
+
+
+def _menu(output, presenter, title, options, fallback) -> None:
+    if presenter:
+        presenter.menu(title, options)
+    else:
+        output(fallback)
 
 
 def _choice(input_fn, output, prompt, allowed):

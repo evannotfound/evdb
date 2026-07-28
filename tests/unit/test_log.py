@@ -3,6 +3,21 @@ import json
 from evdb.log import sanitize, write
 
 
+class _Stream:
+    def __init__(self, *, tty=False):
+        self.tty = tty
+        self.text = ""
+
+    def isatty(self):
+        return self.tty
+
+    def write(self, value):
+        self.text += value
+
+    def flush(self):
+        pass
+
+
 def test_structured_log_has_fields_and_redacts(capsys):
     write(
         "backup_failed",
@@ -21,6 +36,26 @@ def test_structured_log_has_fields_and_redacts(capsys):
     assert data["instance"] == "test-db"
     assert data["duration"] == 1.25
     assert data["error"] == "<redacted> failed"
+
+
+def test_structured_log_writes_jsonl_to_redirected_stderr(monkeypatch):
+    stream = _Stream(tty=False)
+    monkeypatch.setattr("sys.stderr", stream)
+
+    write("status_operation", host="test-host", command="status", result="healthy")
+
+    data = json.loads(stream.text)
+    assert data["event"] == "status_operation"
+    assert data["host"] == "test-host"
+
+
+def test_structured_log_suppresses_routine_json_on_terminal_stderr(monkeypatch):
+    stream = _Stream(tty=True)
+    monkeypatch.setattr("sys.stderr", stream)
+
+    write("status_operation", host="test-host", command="status", result="healthy")
+
+    assert stream.text == ""
 
 
 def test_generic_redaction_covers_urls_tokens_and_op_references(capsys):

@@ -9,6 +9,20 @@ from evdb.config import replace_role
 from evdb.run import Result
 
 
+class _TtyOutput:
+    def __init__(self):
+        self.text = ""
+
+    def isatty(self):
+        return True
+
+    def write(self, value):
+        self.text += value
+
+    def flush(self):
+        pass
+
+
 @pytest.mark.parametrize(
     ("argv", "command", "subcommand"),
     [
@@ -75,6 +89,20 @@ def test_status_json_prints_one_document_and_uses_health_exit(config, monkeypatc
     assert code == 0
     assert json.loads(output[0]) == value
     assert len(output) == 1
+
+
+def test_status_json_prints_one_document_even_when_stdout_is_terminal(config, monkeypatch):
+    monkeypatch.setattr(cli, "load", lambda path: config)
+    value = {"version": 1, "healthy": True, "host": {}, "databases": {}, "errors": []}
+    monkeypatch.setattr(cli.status, "collect", lambda *args: value)
+    stdout = _TtyOutput()
+    monkeypatch.setattr(cli.sys, "stdout", stdout)
+
+    code = cli.main(["status", "--json"])
+
+    assert code == 0
+    assert json.loads(stdout.text) == value
+    assert stdout.text.count("\n") == 1
 
 
 def test_database_info_refuses_non_terminal_output(config, monkeypatch):

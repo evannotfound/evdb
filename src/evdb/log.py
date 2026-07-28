@@ -28,6 +28,8 @@ def sanitize(text: str, secrets: tuple[str, ...] = ()) -> str:
 
 
 def write(event: str, *, secrets: tuple[str, ...] = (), **fields: Any) -> None:
+    if sys.stderr.isatty():
+        return
     data = {
         "time": datetime.now(UTC).isoformat(),
         "event": event,

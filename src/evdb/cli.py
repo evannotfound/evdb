@@ -6,11 +6,11 @@ import os
 import pwd
 import sys
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
-from . import __version__, backup, database, interactive, restic, restore, status
+from . import __version__, backup, database, interactive, restic, restore, status, ui
 from .config import CONFIG_DIR, Config, load, load_state, require_no_orphans
 from .errors import Error
 from .log import sanitize
@@ -125,8 +125,9 @@ def main(
     error=None,
 ) -> int:
     terminal_output = output is None and sys.stdout.isatty()
+    presenter = ui.terminal() if terminal_output else None
     input_fn = input_fn or input
-    output = output or print
+    output = output or presenter or print
     error = error or (lambda value: print(value, file=sys.stderr))
     args = parser().parse_args(argv)
     try:
@@ -164,6 +165,7 @@ def main(
                     args.yes,
                     input_fn,
                     output,
+                    presenter=presenter,
                 )
             )
             return 0
@@ -175,7 +177,7 @@ def main(
                 if values is None:
                     output("Cancelled")
                     return 0
-                output(_host_setup(source, values, False, input_fn, output))
+                output(_host_setup(source, values, False, input_fn, output, presenter=presenter))
                 return 0
         config = load(args.config)
         if _mutating(args) and not _uninstalling(args):
@@ -183,11 +185,25 @@ def main(
         if args.command is None:
             return interactive.run(
                 config,
-                _actions(config, input_fn, output, terminal_output=terminal_output),
+                _actions(
+                    config,
+                    input_fn,
+                    output,
+                    terminal_output=terminal_output,
+                    presenter=presenter,
+                ),
                 input_fn=input_fn,
                 output=output,
+                presenter=presenter,
             )
-        return _dispatch(config, args, input_fn, output, terminal_output=terminal_output)
+        return _dispatch(
+            config,
+            args,
+            input_fn,
+            output,
+            terminal_output=terminal_output,
+            presenter=presenter,
+        )
     except KeyboardInterrupt:
         output("Cancelled")
         return 130
@@ -196,7 +212,15 @@ def main(
         return 1
 
 
-def _dispatch(config: Config, args, input_fn, output, *, terminal_output: bool = False) -> int:
+def _dispatch(
+    config: Config,
+    args,
+    input_fn,
+    output,
+    *,
+    terminal_output: bool = False,
+    presenter=None,
+) -> int:
     started = time.monotonic()
     target = None
     selector = getattr(args, "database", None)
@@ -222,6 +246,7 @@ def _dispatch(config: Config, args, input_fn, output, *, terminal_output: bool =
             input_fn,
             output,
             terminal_output=terminal_output,
+            presenter=presenter,
         )
     except BaseException as exc:
         log_write(
@@ -244,7 +269,13 @@ def _dispatch(config: Config, args, input_fn, output, *, terminal_output: bool =
 
 
 def _dispatch_command(
-    config: Config, args, input_fn, output, *, terminal_output: bool = False
+    config: Config,
+    args,
+    input_fn,
+    output,
+    *,
+    terminal_output: bool = False,
+    presenter=None,
 ) -> int:
     if args.command == "status":
         if os.getenv("EVDB_COMPATIBILITY_CHECK") == "1":
@@ -252,40 +283,64 @@ def _dispatch_command(
 
             host.compatibility(config, Path(os.getenv("EVDB_UNIT_DIR", "/etc/systemd/system")))
         target = config.select(args.database) if args.database else None
-        value = status.collect(config, target)
-        output(status.dumps(value) if args.json else status.render(value))
+        with _busy(None if args.json else presenter, "Checking status..."):
+            value = status.collect(config, target)
+        _show_status(value, args.json, output, presenter)
         return 0 if value["healthy"] else 1
     if args.command == "database":
-        return _database(config, args, input_fn, output, terminal_output=terminal_output)
+        return _database(
+            config,
+            args,
+            input_fn,
+            output,
+            terminal_output=terminal_output,
+            presenter=presenter,
+        )
     if args.command == "backup":
-        return _backup(config, args, input_fn, output)
+        return _backup(config, args, input_fn, output, presenter=presenter)
     if args.command == "restore":
         selector = _required(args.database, "database", "app-prod-01/postgres", input_fn)
         target = config.select(selector)
         value = _required(args.backup, "backup", "latest", input_fn)
-        output(_restore(config, target, value, args.yes, input_fn, output))
+        output(_restore(config, target, value, args.yes, input_fn, output, presenter=presenter))
         return 0
     if args.command == "host":
         from . import host
 
         if args.host_command == "check":
-            value = host.check(config)
-            output(status.dumps(value) if args.json else status.render(value))
+            with _busy(None if args.json else presenter, "Checking host..."):
+                value = host.check(config)
+            _show_status(value, args.json, output, presenter)
             return 0 if value["healthy"] else 1
         if args.host_command == "uninstall":
-            output(_host_uninstall(config, args.purge, args.yes, input_fn, output))
+            result = (
+                _host_uninstall(config, args.purge, args.yes, input_fn, output)
+                if presenter is None
+                else _host_uninstall(
+                    config,
+                    args.purge,
+                    args.yes,
+                    input_fn,
+                    output,
+                    presenter=presenter,
+                )
+            )
+            output(result)
             return 0
         version = _required(args.version, "version", "1.2.3", input_fn)
-        output(_host_update(config, version, args.yes, input_fn, output))
+        output(_host_update(config, version, args.yes, input_fn, output, presenter=presenter))
         return 0
     raise Error("unknown command")
 
 
-def _database(config, args, input_fn, output, *, terminal_output=False):
+def _database(config, args, input_fn, output, *, terminal_output=False, presenter=None):
     command = args.database_command
     if command == "list":
-        for item in config.databases:
-            output(f"{item.identity}\t{item.engine}")
+        if presenter:
+            presenter.databases(config.databases, {}, allow_add=False)
+        else:
+            for item in config.databases:
+                output(f"{item.identity}\t{item.engine}")
         return 0
     if command == "add":
         project = _required(args.project, "project", "app-prod-01", input_fn)
@@ -301,6 +356,7 @@ def _database(config, args, input_fn, output, *, terminal_output=False):
                 args.yes,
                 input_fn,
                 output,
+                presenter=presenter,
             )
         )
         return 0
@@ -340,17 +396,19 @@ def _database(config, args, input_fn, output, *, terminal_output=False):
                 args.yes,
                 input_fn,
                 output,
+                presenter=presenter,
             )
         )
         return 0
     if command == "logs":
-        output(database.logs(config, target, lines=args.lines))
+        with _busy(presenter, f"Reading logs for {target.identity}..."):
+            output(database.logs(config, target, lines=args.lines))
         return 0
-    output(_lifecycle(config, target, command, args.yes, input_fn, output))
+    output(_lifecycle(config, target, command, args.yes, input_fn, output, presenter=presenter))
     return 0
 
 
-def _backup(config, args, input_fn, output):
+def _backup(config, args, input_fn, output, *, presenter=None):
     command = args.backup_command
     if command in {"prune", "repository-check"}:
         roles = (
@@ -367,10 +425,12 @@ def _backup(config, args, input_fn, output):
             ):
                 return 0
             for role in roles:
-                restic.prune(config, role)
+                with _busy(presenter, f"Pruning {role} repository..."):
+                    restic.prune(config, role)
         else:
             for role in roles:
-                restic.check(config, role, part=args.part, rotate=args.rotate)
+                with _busy(presenter, f"Checking {role} repository..."):
+                    restic.check(config, role, part=args.part, rotate=args.rotate)
         output(f"{', '.join(roles)}: {command} complete")
         return 0
     if command == "test" and args.due:
@@ -381,7 +441,8 @@ def _backup(config, args, input_fn, output):
         selector = _required(args.database, "database", "app-prod-01/postgres", input_fn)
         target = config.select(selector)
     if command == "list":
-        output(_history(backup.history(config, target)))
+        with _busy(presenter, f"Reading backups for {target.identity}..."):
+            output(_history(backup.history(config, target)))
         return 0
     if command == "retention":
         targets = [item for item in config.databases if item.durable] if args.all else [target]
@@ -394,19 +455,24 @@ def _backup(config, args, input_fn, output):
         ):
             return 0
         for item in targets:
-            result = restic.forget(config, item, dry_run=args.dry_run)
+            with _busy(presenter, f"Checking retention for {item.identity}..."):
+                result = restic.forget(config, item, dry_run=args.dry_run)
             if args.dry_run:
                 preview = sanitize(result.out).strip() or "No snapshots would be removed"
                 output(f"{item.identity}:\n{preview}")
                 restic.approve_retention(config, item)
         output("Retention dry run complete" if args.dry_run else "Retention complete")
         return 0
-    output(_backup_action(config, target, command, args.backup, args.yes, input_fn, output))
+    output(
+        _backup_action(
+            config, target, command, args.backup, args.yes, input_fn, output, presenter=presenter
+        )
+    )
     return 0
 
 
 def _actions(
-    config: Config, input_fn, output, *, terminal_output: bool = False
+    config: Config, input_fn, output, *, terminal_output: bool = False, presenter=None
 ) -> interactive.Actions:
     current = config
 
@@ -432,7 +498,8 @@ def _actions(
         }
         log_write("cli_operation", **fields, step="start", result="started")
         try:
-            result = call()
+            with _busy(presenter, f"Running {command} for {target.identity}..."):
+                result = call()
         except BaseException as exc:
             log_write(
                 "cli_operation",
@@ -454,15 +521,30 @@ def _actions(
 
     def show_status():
         active = refresh()
-        return status.render(status.collect(active))
+        with _busy(presenter, "Checking status..."):
+            value = status.collect(active)
+        return value if presenter else status.render(value)
 
     def show_health():
         value = status.collect(refresh())
         return {identity: item["health"] for identity, item in value["databases"].items()}
 
     def change(target, values, reset):
+        if presenter is None:
+            return mutation(
+                lambda active: _configure(active, target, values, reset, False, input_fn, output)
+            )
         return mutation(
-            lambda active: _configure(active, target, values, reset, False, input_fn, output)
+            lambda active: _configure(
+                active,
+                target,
+                values,
+                reset,
+                False,
+                input_fn,
+                output,
+                presenter=presenter,
+            )
         )
 
     def history(target):
@@ -476,7 +558,18 @@ def _actions(
         )
 
     def add(project, role, engine):
-        return mutation(lambda active: _add(active, project, role, engine, False, input_fn, output))
+        return mutation(
+            lambda active: _add(
+                active,
+                project,
+                role,
+                engine,
+                False,
+                input_fn,
+                output,
+                presenter=presenter,
+            )
+        )
 
     def lifecycle(target, command):
         return mutation(
@@ -487,6 +580,7 @@ def _actions(
                 False,
                 input_fn,
                 output,
+                presenter=presenter,
             )
         )
 
@@ -527,6 +621,7 @@ def _actions(
                 False,
                 input_fn,
                 output,
+                presenter=presenter,
             ),
         )
         return result, refresh()
@@ -550,6 +645,7 @@ def _actions(
                 False,
                 input_fn,
                 output,
+                presenter=presenter,
             )
         ),
         backup_list=lambda target: _history(history(target)),
@@ -563,35 +659,51 @@ def _actions(
                 False,
                 input_fn,
                 output,
+                presenter=presenter,
             )
         ),
         host_check=show_status,
         host_setup=lambda: mutation(
-            lambda active: _host_setup(active.paths.source, {}, False, input_fn, output)
+            lambda active: _host_setup(
+                active.paths.source,
+                {},
+                False,
+                input_fn,
+                output,
+                presenter=presenter,
+            )
         ),
         host_update=lambda version: mutation(
-            lambda active: _host_update(active, version, False, input_fn, output)
+            lambda active: _host_update(
+                active, version, False, input_fn, output, presenter=presenter
+            )
         ),
     )
 
 
-def _add(config, project, role, engine, yes, input_fn, output):
+def _add(config, project, role, engine, yes, input_fn, output, *, presenter=None):
     change = database.prepare_add(config, project, role, engine=engine)
     if not change.noop and not _confirm(change.preview(), yes, input_fn, output):
         change.cancel()
         return "Cancelled"
-    return _result(database.commit(change))
+    with _busy(presenter, f"Creating {change.database.identity}..."):
+        result = database.commit(change)
+    return _result(result, human=presenter is not None)
 
 
-def _configure(config, target, values, reset, yes, input_fn, output):
+def _configure(config, target, values, reset, yes, input_fn, output, *, presenter=None):
     change = database.prepare_configure(config, target, values, reset=reset)
     if change.noop:
         change.cancel()
-        return "No changes"
+        identity = _change_identity(change, target)
+        return f"{identity} unchanged" if presenter else "No changes"
     if not _confirm(_configure_preview(change), yes, input_fn, output):
         change.cancel()
         return "Cancelled"
-    return _result(database.commit(change))
+    identity = _change_identity(change, target)
+    with _busy(presenter, f"Updating {identity}..."):
+        result = database.commit(change)
+    return _result(result, human=presenter is not None)
 
 
 def _configure_preview(change):
@@ -605,25 +717,27 @@ def _configure_preview(change):
     return "\n".join(lines)
 
 
-def _lifecycle(config, target, command, yes, input_fn, output):
+def _lifecycle(config, target, command, yes, input_fn, output, *, presenter=None):
     effect = f"Host: {config.host.id}\nDatabase: {target.identity}\nAction: {command}"
     if not _confirm(effect, yes, input_fn, output):
         return "Cancelled"
-    getattr(database, command)(config, target)
+    with _busy(presenter, f"Running {command} for {target.identity}..."):
+        getattr(database, command)(config, target)
     return f"{target.identity}: {command} complete"
 
 
-def _backup_action(config, target, command, selected, yes, input_fn, output):
+def _backup_action(config, target, command, selected, yes, input_fn, output, *, presenter=None):
     effect = f"Host: {config.host.id}\nDatabase: {target.identity}\nBackup action: {command}"
     if selected:
         effect += f"\nBackup: {selected}"
     if not _confirm(effect, yes, input_fn, output):
         return "Cancelled"
-    result = (
-        backup.create(config, target, purpose="manual")
-        if command == "create"
-        else backup.test(config, target, selected)
-    )
+    with _busy(presenter, f"Running backup {command} for {target.identity}..."):
+        result = (
+            backup.create(config, target, purpose="manual")
+            if command == "create"
+            else backup.test(config, target, selected)
+        )
     if command == "create":
         return (
             f"{target.identity}: backup {result['backup']} completed at {result['finished']}; "
@@ -635,48 +749,64 @@ def _backup_action(config, target, command, selected, yes, input_fn, output):
     )
 
 
-def _restore(config, target, selected, yes, input_fn, output):
-    result = restore.restore(
-        config,
-        target,
-        selected,
-        yes=yes,
-        confirm=lambda preview: _confirm(_preview(preview), False, input_fn, output),
-    )
-    return _result(result)
+def _restore(config, target, selected, yes, input_fn, output, *, presenter=None):
+    def call():
+        return restore.restore(
+            config,
+            target,
+            selected,
+            yes=yes,
+            confirm=lambda preview: _confirm(_preview(preview), False, input_fn, output),
+        )
+
+    with _busy(presenter if yes else None, f"Restoring {target.identity}..."):
+        result = call()
+    return _result(result, human=presenter is not None)
 
 
-def _host_setup(source, values, yes, input_fn, output):
+def _host_setup(source, values, yes, input_fn, output, *, presenter=None):
     from . import host
 
-    return host.setup(
-        source,
-        values,
-        yes=yes,
-        confirm=lambda text: _confirm(text, False, input_fn, output),
-    )
+    def call():
+        return host.setup(
+            source,
+            values,
+            yes=yes,
+            confirm=lambda text: _confirm(text, False, input_fn, output),
+        )
+
+    with _busy(presenter if yes else None, "Setting up host..."):
+        return call()
 
 
-def _host_update(config, version, yes, input_fn, output):
+def _host_update(config, version, yes, input_fn, output, *, presenter=None):
     from . import host
 
-    return host.update(
-        config,
-        version,
-        yes=yes,
-        confirm=lambda text: _confirm(text, False, input_fn, output),
-    )
+    def call():
+        return host.update(
+            config,
+            version,
+            yes=yes,
+            confirm=lambda text: _confirm(text, False, input_fn, output),
+        )
+
+    with _busy(presenter if yes else None, f"Updating evdb to {version}..."):
+        return call()
 
 
-def _host_uninstall(config, purge, yes, input_fn, output):
+def _host_uninstall(config, purge, yes, input_fn, output, *, presenter=None):
     from . import host
 
-    return host.uninstall(
-        config,
-        purge=purge,
-        yes=yes,
-        confirm=lambda text: _confirm(text, False, input_fn, output),
-    )
+    def call():
+        return host.uninstall(
+            config,
+            purge=purge,
+            yes=yes,
+            confirm=lambda text: _confirm(text, False, input_fn, output),
+        )
+
+    with _busy(presenter if yes else None, "Uninstalling evdb..."):
+        return call()
 
 
 def _required(value, name, example, input_fn):
@@ -706,7 +836,10 @@ def _require_setup_values(values: dict[str, Any]) -> None:
 
 
 def _confirm(text, yes, input_fn, output):
-    output(text)
+    if preview := getattr(output, "preview", None):
+        preview(text)
+    else:
+        output(text)
     if yes:
         return True
     if not _tty():
@@ -768,7 +901,29 @@ def _preview(value: dict[str, Any]) -> str:
     return "\n".join(f"{key.replace('_', ' ').title()}: {item}" for key, item in value.items())
 
 
-def _result(value: Any) -> str:
+def _change_identity(change, fallback) -> str:
+    target = getattr(change, "database", None)
+    return getattr(target, "identity", fallback)
+
+
+def _show_status(value, json_output, output, presenter) -> None:
+    if json_output:
+        output(status.dumps(value))
+    elif presenter:
+        presenter.status(value)
+    else:
+        output(status.render(value))
+
+
+def _busy(presenter, message):
+    if presenter is None:
+        return nullcontext()
+    return presenter.busy(message)
+
+
+def _result(value: Any, *, human: bool = False) -> str:
+    if human:
+        return ui.result(value)
     return json.dumps(value, indent=2, sort_keys=True, default=str)
 
 
