@@ -182,7 +182,7 @@ def test_setup_failure_restores_prior_files_metadata_and_timer_state(config, tmp
     before_timers = {name: timer_state.get(name, (False, False)) for name in host.DEFAULT_TIMERS}
     monkeypatch.setattr(
         host,
-        "check",
+        "_wait_infrastructure",
         lambda config: {"host": {"infrastructure": {"healthy": False}}},
     )
     units = tmp_path / "systemd"
@@ -204,6 +204,35 @@ def test_setup_failure_restores_prior_files_metadata_and_timer_state(config, tmp
     assert not any(units.glob("*.timer"))
     assert not (units / "evdb-backup@.service.d" / host.DATA_DROPIN).exists()
     assert any(args[:2] == ["systemctl", "disable"] for args in calls)
+
+
+def test_setup_waits_for_native_infrastructure_health(config, tmp_path, monkeypatch):
+    paths = config.paths
+    paths.source.parent.mkdir(parents=True)
+    paths.source.write_text(dump(config))
+    write_state(config, resolve_state(config, resolver=lambda source: DIGEST))
+    _setup_mocks(monkeypatch)
+    checks = iter(
+        [
+            {"host": {"infrastructure": {"healthy": False}}},
+            {"host": {"infrastructure": {"healthy": True}}},
+        ]
+    )
+    sleeps = []
+    monkeypatch.setattr(host, "check", lambda config: next(checks))
+    monkeypatch.setattr(host.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    result = host.setup(
+        paths.source,
+        _values(tmp_path),
+        yes=True,
+        paths=paths,
+        unit_dir=tmp_path / "systemd",
+        resolver=lambda source: DIGEST,
+    )
+
+    assert result == "Host setup complete"
+    assert sleeps == [1]
 
 
 def test_setup_checks_prerequisites_ports_and_writable_roots_before_mutation(

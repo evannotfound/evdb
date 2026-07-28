@@ -286,7 +286,7 @@ def _setup_locked(
             compose.command(managed.traefik / "compose.yaml", compose.TRAEFIK_PROJECT, "up", "-d"),
             timeout=config.host.timeouts["command"],
         )
-        result = check(config)
+        result = _wait_infrastructure(config)
         if not result["host"]["infrastructure"]["healthy"]:
             raise HostError("native infrastructure check failed")
         shutil.rmtree(transaction)
@@ -565,6 +565,15 @@ def _directories(config: Config) -> None:
     ):
         path.mkdir(parents=True, exist_ok=True, mode=mode)
         path.chmod(mode)
+
+
+def _wait_infrastructure(config: Config) -> dict[str, Any]:
+    deadline = time.monotonic() + config.host.timeouts["health"]
+    result = check(config)
+    while not result["host"]["infrastructure"]["healthy"] and time.monotonic() < deadline:
+        time.sleep(1)
+        result = check(config)
+    return result
 
 
 def _account(paths: Paths) -> None:
