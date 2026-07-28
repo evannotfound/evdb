@@ -154,3 +154,48 @@ Repository development uses `uv sync --locked`, Ruff, pytest, disposable contain
 paths, and local Restic repositories. Development never runs setup, systemd changes, or production
 migration commands against a live host. Operator commands always use `/etc/evdb/host.yml`; alternate
 fixture paths are test inputs only.
+
+### Disposable VPS development
+
+Install `uv` once for the remote operator and create a writable checkout. This setup is deliberately
+outside production installation; the remote `uv` process creates a native environment for the VPS
+architecture.
+
+```sh
+ssh -t toronto-01 'sudo install -d -o "$USER" -g "$(id -gn)" /srv/evdb-dev'
+uv run python tools/dev_vps.py toronto-01 /srv/evdb-dev sync
+```
+
+The helper rejects `montreal-01` locally before any subprocess and checks the remote hostname before
+each action. Sync builds a NUL-delimited manifest of tracked and unignored files under `src/`, `tests/`,
+`pyproject.toml`, `uv.lock`, `Makefile`, and `README.md`, then runs
+`uv sync --project /srv/evdb-dev --locked`. It does not copy the repository, ignored files,
+credentials, or the local virtual environment. Because `.git` is intentionally absent, sync supplies
+the non-release build version `0.0.dev0` to `setuptools-scm` for the editable environment only.
+
+Use explicit-path execution for the normal fast loop:
+
+```sh
+uv run python tools/dev_vps.py toronto-01 /srv/evdb-dev test tests/unit -q
+uv run python tools/dev_vps.py toronto-01 /srv/evdb-dev check
+uv run python tools/dev_vps.py toronto-01 /srv/evdb-dev evdb --version
+```
+
+`test` and `check` run without sudo. `evdb` allocates a TTY and uses remote sudo because operator
+commands require host access; sudo credentials are entered remotely and never placed in command
+arguments. Each command resyncs and starts a fresh process with the checkout environment first on
+PATH. No persistent shell profile is changed.
+
+For a bounded systemd test window, activation changes only the stable command symlink used by the
+units. `/opt/evdb/current` remains untouched:
+
+```sh
+uv run python tools/dev_vps.py toronto-01 /srv/evdb-dev activate
+# Run the approved disposable-host checks.
+uv run python tools/dev_vps.py toronto-01 /srv/evdb-dev deactivate
+```
+
+Activation points `/usr/local/bin/evdb` at `/srv/evdb-dev/.venv/bin/evdb`; deactivation restores it
+to `/opt/evdb/current/bin/evdb`. Do not run `evdb host update` while development activation is active,
+because update requires the canonical stable link. Interrupted syncs remove their partial directory,
+and rerunning sync is idempotent. Always deactivate after a failed or completed systemd test window.

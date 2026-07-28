@@ -60,6 +60,14 @@ def test_grouped_parser_contract(argv, command, subcommand):
         assert args.host_command == subcommand
 
 
+def test_database_add_parser_accepts_password_file():
+    args = cli.parser().parse_args(
+        ["database", "add", "app-prod-01", "postgres", "--password-file", "/run/pw"]
+    )
+
+    assert args.password_file == "/run/pw"
+
+
 @pytest.mark.parametrize("removed", ["plan", "apply", "releases", "rollback", "promote", "remote"])
 def test_removed_commands_are_not_parsed(removed):
     with pytest.raises(SystemExit):
@@ -161,6 +169,73 @@ def test_yes_confirms_but_does_not_invent_missing_input(config, monkeypatch):
 
     assert code == 1
     assert "project is required" in errors[0]
+
+
+def test_postgres_add_reads_private_password_file_without_displaying_it(
+    config, tmp_path, monkeypatch
+):
+    password = 'p w "quoted" \\ slash'
+    source = tmp_path / "password"
+    source.write_text(password + "\n")
+    source.chmod(0o600)
+    calls = []
+    args = cli.parser().parse_args(
+        [
+            "database",
+            "add",
+            "new-prod-01",
+            "postgres",
+            "--password-file",
+            str(source),
+            "--yes",
+        ]
+    )
+    monkeypatch.setattr(
+        cli,
+        "_add",
+        lambda *args, **kwargs: calls.append(kwargs["initial_password"]) or "created",
+    )
+    output = []
+
+    assert cli._database(config, args, input, output.append) == 0
+
+    assert calls == [password]
+    assert output == ["created"]
+    assert password not in "".join(output)
+
+
+def test_password_file_must_be_private_and_single_line(tmp_path):
+    source = tmp_path / "password"
+    source.write_text("private\n")
+    source.chmod(0o644)
+
+    with pytest.raises(cli.Error, match="not private"):
+        cli._password_file(str(source))
+
+    source.chmod(0o600)
+    source.write_text("first\nsecond\n")
+    with pytest.raises(cli.Error, match="one line"):
+        cli._password_file(str(source))
+
+
+def test_password_file_rejects_symlinks(tmp_path):
+    source = tmp_path / "password"
+    source.write_text("private\n")
+    source.chmod(0o600)
+    link = tmp_path / "password-link"
+    link.symlink_to(source)
+
+    with pytest.raises(cli.Error, match="cannot be read"):
+        cli._password_file(str(link))
+
+
+def test_password_file_is_rejected_for_kv(config):
+    args = cli.parser().parse_args(
+        ["database", "add", "new-prod-01", "kv", "--password-file", "/run/pw", "--yes"]
+    )
+
+    with pytest.raises(cli.Error, match="only valid when adding a Postgres"):
+        cli._database(config, args, input, lambda value: None)
 
 
 def test_parser_contract_includes_grouped_public_options():

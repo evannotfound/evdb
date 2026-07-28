@@ -371,9 +371,22 @@ def _database(config: Config, target: Database, state) -> tuple[dict[str, Any], 
 
 def _engine_health(config: Config, target: Database) -> bool:
     name = f"evdb-{target.project}-{target.role}-primary"
-    if target.engine == "postgres":
-        return postgres.health(name, user=target.settings.user, database=target.settings.database)
     values = secrets.credentials(config, target)
+    if target.engine == "postgres":
+        primary_ok = postgres.health(
+            name,
+            user=target.settings.user,
+            database=target.settings.database,
+        )
+        return primary_ok and (
+            not target.settings.pgbouncer.enabled
+            or postgres.pool_health(
+                f"evdb-{target.project}-{target.role}-pgbouncer",
+                values.password,
+                user=target.settings.user,
+                database=target.settings.database,
+            )
+        )
     if target.engine == "redis":
         return redis.health(name, values.password)
     return dragonfly.health(name, values.password)

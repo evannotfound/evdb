@@ -204,6 +204,10 @@ make check
 make binary
 ```
 
+For an uncommitted revision on a disposable VPS, use the guarded source workflow in
+[Host setup and updates](docs/setup.md#disposable-vps-development). It keeps the installed release
+tree intact and rejects `montreal-01`.
+
 ## License
 
 [MIT](LICENSE) © Evan Luo

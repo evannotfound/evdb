@@ -3,7 +3,7 @@ from urllib.parse import unquote, urlparse
 import pytest
 
 from evdb.errors import ConfigError
-from evdb.secrets import Credentials, credentials, ensure, protected, render
+from evdb.secrets import Credentials, credentials, ensure, password_from_text, protected, render
 
 
 def test_credentials_are_generated_once_and_all_files_are_private(config):
@@ -41,10 +41,13 @@ def test_postgres_and_engine_files_are_explicit(config):
             pgbouncer=replace(postgres.settings.pgbouncer, enabled=True),
         ),
     )
-    files = {item.path.name: item.content for item in render(config, postgres, Credentials("pw"))}
+    files = {
+        item.path.name: item.content
+        for item in render(config, postgres, Credentials('p w "quoted" \\ slash'))
+    }
 
-    assert files["password"] == "pw\n"
-    assert files["pgbouncer-users"] == '"default" "pw"\n'
+    assert files["password"] == 'p w "quoted" \\ slash\n'
+    assert files["pgbouncer-users"] == '"default" "p w ""quoted"" \\ slash"\n'
 
     kv = config.select("app-test-01/kv")
     files = {item.path.name: item.content for item in render(config, kv, Credentials("pw", "t"))}
@@ -98,3 +101,12 @@ def test_repr_and_protected_values_do_not_expose_credentials():
     expanded = protected((values.password, values.http_token))
     assert "private-password" in expanded
     assert "private-token" in expanded
+
+
+def test_database_passwords_are_single_line():
+    assert password_from_text("pw\n") == "pw"
+    assert password_from_text("pw\r\n") == "pw"
+
+    for value in ("", "pw\nextra", "pw\r", "pw\0"):
+        with pytest.raises(ConfigError):
+            password_from_text(value)

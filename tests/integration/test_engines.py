@@ -4,16 +4,18 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
-from evdb import backup, restore, secrets
+from evdb import backup, compose, database, restore, secrets
 from evdb.config import resolve_state, write_state
 from evdb.engines import dragonfly, kv
 from tests.fixtures.containers import (
     DRAGONFLY_IMAGE,
+    PGBOUNCER_IMAGE,
     POSTGRES_IMAGE,
     REDIS_IMAGE,
     command,
     container,
     docker_exec,
+    network,
     require_image,
     wait_exec,
 )
@@ -84,6 +86,75 @@ def test_postgres_backup_and_restore_multiple_databases(config):
     assert set(checked["result"]["databases"]) == {"postgres", "app", "odd database"}
     assert checked["result"]["objects"]["app"] >= 1
     assert checked["result"]["objects"]["odd database"] >= 1
+
+
+def test_postgres_pgbouncer_uses_private_generated_files(config, tmp_path):
+    require_image(POSTGRES_IMAGE)
+    require_image(PGBOUNCER_IMAGE)
+    config, target, state = _postgres_pgbouncer_config(config)
+    password = 'pool password "quoted" \\ slash'
+    secrets.write(secrets.render(config, target, secrets.Credentials(password)))
+    config.paths.role_config(target.project, target.role).mkdir(parents=True, exist_ok=True)
+    pgbouncer_ini = config.paths.role_config(target.project, target.role) / "pgbouncer.ini"
+    pgbouncer_ini.write_text(compose.pool_config(target))
+    pgbouncer_ini.chmod(0o640)
+    target.data.mkdir(parents=True, exist_ok=True, mode=0o700)
+    data = compose.database(config, target, state)
+    path = tmp_path / "compose.yaml"
+
+    with network() as network_name:
+        data["networks"][compose.NETWORK]["name"] = network_name
+        compose.write(path, data)
+        try:
+            command(compose.command(path, target.compose_project, "up", "-d"), timeout=300)
+            primary = f"evdb-{target.project}-{target.role}-primary"
+            pooler = f"evdb-{target.project}-{target.role}-pgbouncer"
+            wait_exec(primary, ["pg_isready", "-U", "default", "-d", "postgres"])
+            wait_exec(
+                pooler,
+                [
+                    "pg_isready",
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    "5432",
+                    "-U",
+                    "default",
+                    "-d",
+                    "postgres",
+                ],
+            )
+            result = docker_exec(
+                pooler,
+                [
+                    "psql",
+                    "-X",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    "5432",
+                    "-U",
+                    "default",
+                    "-d",
+                    "postgres",
+                    "-c",
+                    "SELECT 1",
+                ],
+                env={"PGPASSWORD": password},
+                timeout=60,
+            )
+            assert "(1 row)" in result.stdout
+            database.health(config, target, state=state, timeout=60)
+        except BaseException as exc:
+            logs = command(
+                compose.command(path, target.compose_project, "logs", "--no-color"),
+                check=False,
+            )
+            raise AssertionError(logs.stdout or logs.stderr) from exc
+        finally:
+            command(compose.command(path, target.compose_project, "down", "--volumes"), check=False)
 
 
 def test_redis_backup_and_restore_types_databases_and_ttl(config):
@@ -204,6 +275,31 @@ def _postgres_config(config):
     project = replace(config.projects[0], id=_project_id("postgres"), kv=None)
     selected = replace(config, projects=(project,))
     return selected, selected.select(f"{project.id}/postgres")
+
+
+def _postgres_pgbouncer_config(config):
+    source = config.projects[0].postgres
+    settings = replace(
+        source,
+        image=POSTGRES_IMAGE.split("@", 1)[0],
+        pgbouncer=replace(
+            source.pgbouncer,
+            enabled=True,
+            image=PGBOUNCER_IMAGE.split("@", 1)[0],
+        ),
+    )
+    project = replace(config.projects[0], id=_project_id("pgbouncer"), postgres=settings, kv=None)
+    selected = replace(config, projects=(project,))
+    target = selected.select(f"{project.id}/postgres")
+    digests = {
+        target.settings.image: POSTGRES_IMAGE.split("@", 1)[1],
+        target.settings.pgbouncer.image: PGBOUNCER_IMAGE.split("@", 1)[1],
+    }
+    state = resolve_state(selected, resolver=lambda source: digests.get(source, DIGEST))
+    role = replace(state.roles[target.identity], installed=True)
+    state = replace(state, roles={**state.roles, target.identity: role})
+    write_state(selected, state)
+    return selected, target, state
 
 
 def _kv_config(config, engine, image):

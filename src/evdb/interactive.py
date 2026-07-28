@@ -3,10 +3,12 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from getpass import getpass
 
 from .config import DEFAULT_IMAGES, HTTP, KV, Config, Database, PgBouncer, Postgres
 
 _ADD = object()
+_CANCEL = object()
 _SETUP_FIELDS = (
     ("host_id", "Host ID"),
     ("domain", "Base domain"),
@@ -24,7 +26,7 @@ ActionResult = str | tuple[str, Config]
 class Actions:
     status: Callable[[], str]
     health: Callable[[], dict[str, str]]
-    add: Callable[[str, str, str], ActionResult]
+    add: Callable[[str, str, str, str | None], ActionResult]
     info: Callable[[str], str]
     configure: Callable[[str, dict, tuple[str, ...]], ActionResult]
     start: Callable[[str], ActionResult]
@@ -41,7 +43,15 @@ class Actions:
     host_update: Callable[[str], ActionResult]
 
 
-def run(config: Config, actions: Actions, *, input_fn=input, output=print, presenter=None) -> int:
+def run(
+    config: Config,
+    actions: Actions,
+    *,
+    input_fn=input,
+    output=print,
+    presenter=None,
+    password_fn=getpass,
+) -> int:
     while True:
         _status(actions.status(), output, presenter)
         _menu(
@@ -55,7 +65,14 @@ def run(config: Config, actions: Actions, *, input_fn=input, output=print, prese
         if choice in {None, "0"}:
             return 0
         if choice == "1":
-            updated = _databases(config, actions, input_fn, output, presenter=presenter)
+            updated = _databases(
+                config,
+                actions,
+                input_fn,
+                output,
+                presenter=presenter,
+                password_fn=password_fn,
+            )
             if updated is not None:
                 config = updated
         elif choice == "2":
@@ -76,12 +93,12 @@ def run(config: Config, actions: Actions, *, input_fn=input, output=print, prese
                 config = updated
 
 
-def _databases(config, actions, input_fn, output, *, presenter=None):
+def _databases(config, actions, input_fn, output, *, presenter=None, password_fn=getpass):
     target = _database(config, actions, input_fn, output, presenter=presenter, allow_add=True)
     if target is None:
         return
     if target is _ADD:
-        return _add(actions, input_fn, output, presenter=presenter)
+        return _add(actions, input_fn, output, presenter=presenter, password_fn=password_fn)
     current = config
     identity = target.identity
     while True:
@@ -257,7 +274,7 @@ def _database(config, actions, input_fn, output, presenter=None, durable=False, 
     return values[int(choice) - 1]
 
 
-def _add(actions, input_fn, output, *, presenter=None):
+def _add(actions, input_fn, output, *, presenter=None, password_fn=getpass):
     project = _text(input_fn, "Project")
     if project is None:
         return
@@ -273,6 +290,7 @@ def _add(actions, input_fn, output, *, presenter=None):
         return
     role = "postgres" if role_choice == "1" else "kv"
     engine = "dragonfly"
+    password = None
     if role == "kv":
         _menu(
             output,
@@ -285,7 +303,11 @@ def _add(actions, input_fn, output, *, presenter=None):
         if engine_choice in {None, "0"}:
             return
         engine = "dragonfly" if engine_choice == "1" else "redis"
-    result = actions.add(project, role, engine)
+    else:
+        password = _password(password_fn, output)
+        if password is _CANCEL:
+            return
+    result = actions.add(project, role, engine, password)
     return _show(result, output)
 
 
@@ -406,6 +428,15 @@ def _text(input_fn, prompt):
         value = input_fn(f"{prompt}: ").strip()
     except EOFError:
         return None
+    return value or None
+
+
+def _password(password_fn, output):
+    output("Initial password: leave blank to generate one.")
+    try:
+        value = password_fn("Postgres password: ")
+    except EOFError:
+        return _CANCEL
     return value or None
 
 

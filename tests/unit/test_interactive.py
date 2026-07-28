@@ -26,7 +26,9 @@ def _actions(calls):
             "app-test-01/postgres": "healthy",
             "app-test-01/kv": "stopped",
         },
-        add=lambda project, role, engine: calls.append(("add", project, role, engine)) or "added",
+        add=lambda project, role, engine, password: (
+            calls.append(("add", project, role, engine, password)) or "added"
+        ),
         info=lambda target: calls.append(("info", target)) or "info",
         configure=lambda target, values, reset: (
             calls.append(("configure", target, values, reset)) or "configured"
@@ -195,10 +197,51 @@ def test_guided_add_setup_and_update_call_actions(config):
     )
 
     assert calls == [
-        ("add", "queue-prod-01", "kv", "redis"),
+        ("add", "queue-prod-01", "kv", "redis", None),
         ("host_setup",),
         ("host_update", "1.2.3"),
     ]
+
+
+def test_guided_postgres_password_is_masked_and_blank_generates(config):
+    calls = []
+    output = []
+    actions = _actions(calls)
+
+    interactive._add(
+        actions,
+        _input(["pg-prod-01", "1"]),
+        output.append,
+        password_fn=lambda prompt: "private-password",
+    )
+    interactive._add(
+        actions,
+        _input(["generated-prod-01", "1"]),
+        output.append,
+        password_fn=lambda prompt: "",
+    )
+
+    assert calls == [
+        ("add", "pg-prod-01", "postgres", "dragonfly", "private-password"),
+        ("add", "generated-prod-01", "postgres", "dragonfly", None),
+    ]
+    assert "private-password" not in "\n".join(output)
+
+
+def test_guided_postgres_password_eof_cancels(config):
+    calls = []
+
+    def eof(prompt):
+        raise EOFError
+
+    interactive._add(
+        _actions(calls),
+        _input(["pg-prod-01", "1"]),
+        lambda value: None,
+        password_fn=eof,
+    )
+
+    assert calls == []
 
 
 def test_guided_backup_test_and_restore_select_exact_displayed_backup(config):
@@ -262,7 +305,7 @@ def test_added_database_is_selectable_in_same_menu_session(config):
             "app-test-01/kv": "healthy",
             "queue-prod-01/kv": "healthy",
         },
-        add=lambda project, role, engine: ("added", updated),
+        add=lambda project, role, engine, password: ("added", updated),
     )
 
     interactive.run(

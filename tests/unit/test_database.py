@@ -52,6 +52,91 @@ def test_add_defaults_kv_to_dragonfly_and_commits_once(config, monkeypatch):
     assert all("--remove-orphans" in args for args in calls if "up" in args)
     assert load_state(change.after).roles[added.identity].installed
     assert "engine: dragonfly" in change.after.paths.source.read_text()
+    assert result["credential"] == "generated"
+
+
+def test_add_postgres_accepts_supplied_initial_password(config, monkeypatch):
+    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(database, "run", lambda args, **kwargs: Result(tuple(args), 0, "", ""))
+
+    change = database.prepare_add(
+        config,
+        "pg-prod-01",
+        "postgres",
+        resolver=lambda source: DIGEST,
+        initial_password='p w "quoted" \\ slash',
+    )
+    files = {item.path.name: item.content for item in change.secret_files}
+
+    assert change.credential == "supplied"
+    assert "Credential: supplied" in change.preview()
+    assert 'p w "quoted" \\ slash' not in change.preview().replace("supplied", "")
+    assert files["password"] == 'p w "quoted" \\ slash\n'
+    assert files["pgbouncer-users"] == '"default" "p w ""quoted"" \\ slash"\n'
+
+    result = database.commit(change, check_health=lambda *args, **kwargs: None)
+
+    assert result["status"] == "healthy"
+    assert result["credential"] == "supplied"
+    persisted = (
+        change.after.paths.source.read_text()
+        + change.after.paths.machine_state.read_text()
+        + change.after.paths.activity.read_text()
+        + json.dumps(result)
+    )
+    assert 'p w "quoted" \\ slash' not in persisted
+
+
+@pytest.mark.parametrize("value", ["", "line\nbreak", "carriage\rreturn", "nul\0byte"])
+def test_add_rejects_invalid_initial_password(config, monkeypatch, value):
+    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
+
+    with pytest.raises(ConfigError, match="database password"):
+        database.prepare_add(
+            config,
+            "pg-prod-01",
+            "postgres",
+            resolver=lambda source: DIGEST,
+            initial_password=value,
+        )
+
+
+def test_matching_postgres_add_accepts_same_password_and_rejects_rotation(config, monkeypatch):
+    state = _prepare(config, monkeypatch)
+
+    same = database.prepare_add(
+        config,
+        "app-test-01",
+        "postgres",
+        state=state,
+        resolver=lambda source: DIGEST,
+        initial_password="private-value",
+    )
+
+    assert same.noop
+
+    with pytest.raises(DatabaseError, match="password rotation"):
+        database.prepare_add(
+            config,
+            "app-test-01",
+            "postgres",
+            state=state,
+            resolver=lambda source: DIGEST,
+            initial_password="different-value",
+        )
+
+
+def test_initial_password_is_only_valid_for_postgres(config, monkeypatch):
+    monkeypatch.setattr(compose, "validate", lambda *args, **kwargs: None)
+
+    with pytest.raises(DatabaseError, match="only valid for Postgres"):
+        database.prepare_add(
+            config,
+            "queue-prod-01",
+            "kv",
+            resolver=lambda source: DIGEST,
+            initial_password="private-value",
+        )
 
 
 def test_matching_add_is_idempotent(config, monkeypatch):
@@ -581,6 +666,68 @@ def test_info_includes_settings_live_version_health_and_postgres_url(config, mon
     assert unquote(parsed.password) == password
     assert parsed.path == f"/{target.settings.database}"
     assert parse_qs(parsed.query) == {"sslmode": ["require"]}
+
+
+def test_postgres_health_authenticates_through_pgbouncer(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    settings = replace(target.settings, pgbouncer=replace(target.settings.pgbouncer, enabled=True))
+    config = replace_role(config, target, settings)
+    state = _prepare(config, monkeypatch)
+    target = config.select(target.identity)
+    expected = compose.expected_services(compose.database(config, target, state), target)
+    calls = []
+
+    def docker_state(name, **kwargs):
+        item = next(value for value in expected.values() if value["container"] == name)
+        return {
+            "running": True,
+            "healthy": True,
+            "image": item["image"],
+            "labels": {compose.CONTRACT_LABEL: item["contract"]},
+        }
+
+    monkeypatch.setattr(database.docker, "state", docker_state)
+    monkeypatch.setattr(database.postgres, "health", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        database.postgres,
+        "pool_health",
+        lambda container, password, **kwargs: calls.append((container, password)) or True,
+    )
+
+    database.health(config, target, state=state)
+
+    assert calls == [("evdb-app-test-01-postgres-pgbouncer", "private-value")]
+
+
+def test_pgbouncer_health_keeps_password_out_of_arguments(monkeypatch):
+    calls = []
+
+    def docker_exec(container, args, **kwargs):
+        calls.append((container, args, kwargs))
+        return Result(tuple(args), 0, "1\n", "")
+
+    monkeypatch.setattr(database.postgres.docker, "exec", docker_exec)
+
+    assert database.postgres.pool_health("pooler", 'private "value" \\ test')
+
+    container, args, kwargs = calls[0]
+    assert container == "pooler"
+    assert 'private "value" \\ test' not in args
+    assert kwargs["env"]["PGPASSWORD"] == 'private "value" \\ test'
+    assert kwargs["secrets"] == ['private "value" \\ test']
+
+
+def test_database_info_health_requires_pgbouncer_authentication(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    settings = replace(
+        target.settings,
+        pgbouncer=replace(target.settings.pgbouncer, enabled=True),
+    )
+    target = replace(target, settings=settings)
+    monkeypatch.setattr(database.postgres, "health", lambda *args, **kwargs: True)
+    monkeypatch.setattr(database.postgres, "pool_health", lambda *args, **kwargs: False)
+
+    assert not database._engine_health(target, secrets.Credentials("private-value"))
 
 
 def test_info_includes_concrete_kv_http_credentials(config, monkeypatch):

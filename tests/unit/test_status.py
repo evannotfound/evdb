@@ -66,6 +66,7 @@ def _healthy(config, monkeypatch):
 
     monkeypatch.setattr(status.docker, "state", docker_state)
     monkeypatch.setattr(status.postgres, "health", lambda *args, **kwargs: True)
+    monkeypatch.setattr(status.postgres, "pool_health", lambda *args, **kwargs: True)
     monkeypatch.setattr(status.redis, "health", lambda *args, **kwargs: True)
     monkeypatch.setattr(status.dragonfly, "health", lambda *args, **kwargs: True)
     monkeypatch.setattr(
@@ -74,6 +75,24 @@ def _healthy(config, monkeypatch):
         lambda *args, **kwargs: secrets.Credentials("private", "token"),
     )
     return state
+
+
+def test_postgres_status_health_requires_pgbouncer_authentication(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    settings = replace(
+        target.settings,
+        pgbouncer=replace(target.settings.pgbouncer, enabled=True),
+    )
+    target = replace(target, settings=settings)
+    monkeypatch.setattr(status.postgres, "health", lambda *args, **kwargs: True)
+    monkeypatch.setattr(status.postgres, "pool_health", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        status.secrets,
+        "credentials",
+        lambda *args, **kwargs: secrets.Credentials("private-value"),
+    )
+
+    assert not status._engine_health(config, target)
 
 
 def _run(args):

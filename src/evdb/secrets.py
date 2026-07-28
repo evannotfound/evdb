@@ -44,7 +44,10 @@ def path(config: Config, database: Database, name: str) -> Path:
 
 
 def read(config: Config, database: Database, name: str) -> str:
-    return _read(path(config, database, name))
+    target = path(config, database, name)
+    if name == "password":
+        return validate_password(_read_line(target))
+    return _read(target)
 
 
 def read_host(config: Config, name: str) -> str:
@@ -85,9 +88,10 @@ def credentials(config: Config, database: Database) -> Credentials:
 
 
 def render(config: Config, database: Database, values: Credentials) -> tuple[SecretFile, ...]:
-    files = [SecretFile(path(config, database, "password"), values.password + "\n")]
+    password = validate_password(values.password)
+    files = [SecretFile(path(config, database, "password"), password + "\n")]
     if database.role == "postgres" and database.settings.pgbouncer.enabled:
-        users = f"{json.dumps(database.settings.user)} {json.dumps(values.password)}\n"
+        users = f"{_pgbouncer_quote(database.settings.user)} {_pgbouncer_quote(password)}\n"
         files.append(SecretFile(path(config, database, "pgbouncer-users"), users))
     if database.role == "kv":
         if database.engine == "redis":
@@ -101,17 +105,15 @@ def render(config: Config, database: Database, values: Credentials) -> tuple[Sec
                 "dbfilename dump.rdb\n"
                 "appendonly no\n"
                 f"{persistence}"
-                f"requirepass {json.dumps(values.password)}\n"
+                f"requirepass {json.dumps(password)}\n"
             )
             files.append(SecretFile(path(config, database, "redis.conf"), text))
         else:
             settings = database.settings
-            if "\n" in values.password or "\r" in values.password:
-                raise ConfigError("Dragonfly password must fit on one flagfile line")
             lines = [
                 "--dir=/data",
                 "--dbfilename=dump",
-                f"--requirepass={values.password}",
+                f"--requirepass={password}",
                 f"--proactor_threads={settings.threads}",
                 f"--maxmemory={settings.memory}",
             ]
@@ -124,7 +126,7 @@ def render(config: Config, database: Database, values: Credentials) -> tuple[Sec
             if values.http_token is None:
                 raise ConfigError(f"{database.identity}: HTTP token is missing")
             service = f"evdb-{database.project}-{database.role}-primary"
-            url = f"redis://default:{quote(values.password, safe='')}@{service}:6379"
+            url = f"redis://default:{quote(password, safe='')}@{service}:6379"
             env = (
                 f"SRH_TOKEN={json.dumps(values.http_token)}\n"
                 f"SRH_CONNECTION_STRING={json.dumps(url)}\n"
@@ -136,6 +138,23 @@ def render(config: Config, database: Database, values: Credentials) -> tuple[Sec
                 ]
             )
     return tuple(files)
+
+
+def validate_password(value: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ConfigError("database password must not be empty")
+    if "\0" in value or "\r" in value or "\n" in value:
+        raise ConfigError("database password must be one line")
+    return value
+
+
+def password_from_text(text: str) -> str:
+    """Remove one file terminator while rejecting embedded line breaks."""
+    if text.endswith("\r\n"):
+        text = text[:-2]
+    elif text.endswith("\n"):
+        text = text[:-1]
+    return validate_password(text)
 
 
 def write(files: Iterable[SecretFile]) -> None:
@@ -166,6 +185,21 @@ def _read(target: Path) -> str:
     if not value:
         raise ConfigError(f"secret file is empty: {target}")
     return value
+
+
+def _read_line(target: Path) -> str:
+    if target.is_symlink() or not target.is_file():
+        raise ConfigError(f"secret file is missing or unsafe: {target}")
+    if target.stat().st_mode & 0o077:
+        raise ConfigError(f"secret file is not private: {target}")
+    try:
+        return password_from_text(target.read_text())
+    except ConfigError as exc:
+        raise ConfigError(f"secret file is invalid: {target}") from exc
+
+
+def _pgbouncer_quote(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _existing_or_create(target: Path, create: Callable[[], str]) -> str:

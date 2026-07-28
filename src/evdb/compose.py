@@ -208,9 +208,23 @@ def _postgres(config, target, images, services, primary) -> None:
         "image": images["pgbouncer"].image,
         "container_name": name,
         "restart": "unless-stopped",
+        "user": _managed_user(config, target),
         "command": ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"],
         "depends_on": [_name(target, "primary")],
-        "healthcheck": _healthcheck(["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432"]),
+        "healthcheck": _healthcheck(
+            [
+                "CMD",
+                "pg_isready",
+                "-h",
+                "127.0.0.1",
+                "-p",
+                "5432",
+                "-U",
+                target.settings.user,
+                "-d",
+                target.settings.database,
+            ]
+        ),
         "volumes": [
             f"{config.paths.role_config(target.project, target.role)}/pgbouncer.ini:"
             "/etc/pgbouncer/pgbouncer.ini:ro",
@@ -218,6 +232,28 @@ def _postgres(config, target, images, services, primary) -> None:
         ],
         "networks": {NETWORK: {"aliases": [name]}},
     }
+
+
+def _managed_user(config: Config, target: Database) -> str:
+    """Match PgBouncer to the owner of its private bind-mounted files."""
+    owners = {
+        _owner(config.paths.role_config(target.project, target.role)),
+        _owner(config.paths.role_secrets(target.project, target.role)),
+    }
+    if len(owners) != 1:
+        raise ConfigError(f"{target.identity}: managed file owners differ")
+    uid, gid = owners.pop()
+    return f"{uid}:{gid}"
+
+
+def _owner(path: Path) -> tuple[int, int]:
+    current = path
+    while not current.exists():
+        if current.parent == current:
+            break
+        current = current.parent
+    stat = current.stat()
+    return stat.st_uid, stat.st_gid
 
 
 def _kv(config, target, role, services, primary) -> None:

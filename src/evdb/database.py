@@ -72,6 +72,7 @@ class Change:
     secret_files: tuple[secrets.SecretFile, ...]
     compose_data: dict[str, Any]
     fingerprint: str
+    credential: str | None = None
 
     @property
     def noop(self) -> bool:
@@ -81,14 +82,17 @@ class Change:
         changed = ", ".join(self.changed) if self.changed else "none"
         services = ", ".join(self.services) if self.services else "none"
         backup = "required" if self.safety_backup else "not required"
-        return (
-            f"Host: {self.after.host.id}\n"
-            f"Database: {self.database.identity}\n"
-            f"Settings: {changed}\n"
-            f"Services: {services}\n"
-            f"Interruption: {self.outage}\n"
-            f"Safety backup: {backup}"
-        )
+        lines = [
+            f"Host: {self.after.host.id}",
+            f"Database: {self.database.identity}",
+            f"Settings: {changed}",
+            f"Services: {services}",
+            f"Interruption: {self.outage}",
+            f"Safety backup: {backup}",
+        ]
+        if self.credential:
+            lines.append(f"Credential: {self.credential}")
+        return "\n".join(lines)
 
     def cancel(self) -> None:
         shutil.rmtree(self.transaction, ignore_errors=True)
@@ -103,8 +107,13 @@ def prepare_add(
     state: MachineState | None = None,
     resolver=None,
     generate=None,
+    initial_password: str | None = None,
 ) -> Change:
     require_no_orphans(config, state or load_state(config))
+    if initial_password is not None:
+        initial_password = secrets.validate_password(initial_password)
+        if role != "postgres":
+            raise DatabaseError("initial password is only valid for Postgres")
     identity = f"{project}/{role}"
     try:
         existing = config.select(identity)
@@ -112,6 +121,10 @@ def prepare_add(
         if "unknown database" not in str(exc):
             raise
     else:
+        if initial_password is not None:
+            current_password = secrets.credentials(config, existing).password
+            if current_password != initial_password:
+                raise DatabaseError("password rotation requires a separate operation")
         current = state or load_state(config)
         return _stage(
             config,
@@ -150,6 +163,7 @@ def prepare_add(
         ("create",),
         resolver=resolver,
         generate=generate,
+        initial_password=initial_password,
     )
 
 
@@ -428,7 +442,7 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
             duration=round(time.monotonic() - started, 3),
         )
         change.cancel()
-        return {
+        result = {
             "database": database.identity,
             "changed": list(change.changed),
             "safety_snapshot": (
@@ -438,6 +452,9 @@ def commit(change: Change, *, backup_create=None, check_health=None) -> dict[str
             ),
             "status": "healthy",
         }
+        if change.credential:
+            result["credential"] = change.credential
+        return result
 
 
 def start(config: Config, database: Database, *, state: MachineState | None = None) -> None:
@@ -652,10 +669,19 @@ def _info_settings(database: Database) -> dict[str, Any]:
 def _engine_health(database: Database, values: secrets.Credentials) -> bool:
     container = f"evdb-{database.project}-{database.role}-primary"
     if database.engine == "postgres":
-        return postgres.health(
+        primary_ok = postgres.health(
             container,
             user=database.settings.user,
             database=database.settings.database,
+        )
+        return primary_ok and (
+            not database.settings.pgbouncer.enabled
+            or postgres.pool_health(
+                f"evdb-{database.project}-{database.role}-pgbouncer",
+                values.password,
+                user=database.settings.user,
+                database=database.settings.database,
+            )
         )
     if database.engine == "redis":
         return redis.health(container, values.password)
@@ -706,11 +732,19 @@ def health(
                 user=database.settings.user,
                 database=database.settings.database,
             )
+            pool_ok = not database.settings.pgbouncer.enabled or postgres.pool_health(
+                f"evdb-{database.project}-{database.role}-pgbouncer",
+                values.password,
+                user=database.settings.user,
+                database=database.settings.database,
+            )
         elif database.engine == "redis":
             engine_ok = redis.health(primary, values.password)
+            pool_ok = True
         else:
             engine_ok = dragonfly.health(primary, values.password)
-        if services_ok and engine_ok:
+            pool_ok = True
+        if services_ok and engine_ok and pool_ok:
             return
         if time.monotonic() >= deadline:
             raise DatabaseError(f"database did not become healthy: {database.identity}")
@@ -727,6 +761,7 @@ def _stage(
     *,
     resolver=None,
     generate=None,
+    initial_password: str | None = None,
 ) -> Change:
     after_state = resolve_state(after, current, resolver=resolver)
     transaction = private_dir(
@@ -734,8 +769,14 @@ def _stage(
     )
     try:
         create = generate or (lambda: __import__("secrets").token_urlsafe(32))
+        credential = None
         if prior is None:
-            password = create()
+            if initial_password is not None:
+                password = initial_password
+                credential = "supplied"
+            else:
+                password = create()
+                credential = "generated"
             token = create() if target.role == "kv" and target.settings.http.enabled else None
             if not isinstance(password, str) or not password or token == "":
                 raise ConfigError("credential generator returned an empty value")
@@ -799,6 +840,7 @@ def _stage(
             secret_files,
             data,
             _fingerprint(before, prior),
+            credential,
         )
     except Exception:
         shutil.rmtree(transaction, ignore_errors=True)

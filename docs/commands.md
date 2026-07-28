@@ -19,6 +19,7 @@ status output is secret-free.
 
 ```sh
 sudo evdb database add app-prod-01 postgres
+sudo evdb database add app-prod-01 postgres --password-file /run/user/1000/evdb-password
 sudo evdb database add app-prod-01 kv --engine redis
 sudo evdb database configure app-prod-01/kv --memory 2gb --threads 4
 sudo evdb database start app-prod-01/postgres
@@ -26,6 +27,11 @@ sudo evdb database stop app-prod-01/postgres
 sudo evdb database restart app-prod-01/postgres
 sudo evdb database logs app-prod-01/postgres --lines 200
 ```
+
+Postgres creation generates a password by default. `--password-file` imports one non-empty,
+single-line initial password from a regular file with no group or other permissions. One trailing
+LF or CRLF is removed. The option is creation-only, is rejected for KV roles, and does not support
+password rotation. Guided Postgres creation offers the same choice through a masked prompt.
 
 ## Backup and restore
 

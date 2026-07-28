@@ -4,13 +4,14 @@ import argparse
 import json
 import os
 import pwd
+import stat
 import sys
 import time
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
-from . import __version__, backup, database, interactive, restic, restore, status, ui
+from . import __version__, backup, database, interactive, restic, restore, secrets, status, ui
 from .config import CONFIG_DIR, Config, load, load_state, require_no_orphans
 from .errors import Error
 from .log import sanitize
@@ -34,6 +35,7 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("project", nargs="?")
     add.add_argument("role", nargs="?", choices=("postgres", "kv"))
     add.add_argument("--engine", choices=("dragonfly", "redis"))
+    add.add_argument("--password-file")
     add.add_argument("--yes", action="store_true")
     info = database_commands.add_parser("info")
     info.add_argument("database", nargs="?")
@@ -347,6 +349,9 @@ def _database(config, args, input_fn, output, *, terminal_output=False, presente
         role = _required(args.role, "role", "postgres", input_fn)
         if role == "postgres" and args.engine is not None:
             raise Error("--engine is only valid when adding a kv database")
+        if role == "kv" and args.password_file is not None:
+            raise Error("--password-file is only valid when adding a Postgres database")
+        initial_password = _password_file(args.password_file) if role == "postgres" else None
         output(
             _add(
                 config,
@@ -357,6 +362,7 @@ def _database(config, args, input_fn, output, *, terminal_output=False, presente
                 input_fn,
                 output,
                 presenter=presenter,
+                initial_password=initial_password,
             )
         )
         return 0
@@ -557,7 +563,7 @@ def _actions(
             lambda: backup.history(active, selected),
         )
 
-    def add(project, role, engine):
+    def add(project, role, engine, initial_password):
         return mutation(
             lambda active: _add(
                 active,
@@ -568,6 +574,7 @@ def _actions(
                 input_fn,
                 output,
                 presenter=presenter,
+                initial_password=initial_password,
             )
         )
 
@@ -681,8 +688,25 @@ def _actions(
     )
 
 
-def _add(config, project, role, engine, yes, input_fn, output, *, presenter=None):
-    change = database.prepare_add(config, project, role, engine=engine)
+def _add(
+    config,
+    project,
+    role,
+    engine,
+    yes,
+    input_fn,
+    output,
+    *,
+    presenter=None,
+    initial_password=None,
+):
+    change = database.prepare_add(
+        config,
+        project,
+        role,
+        engine=engine,
+        initial_password=initial_password,
+    )
     if not change.noop and not _confirm(change.preview(), yes, input_fn, output):
         change.cancel()
         return "Cancelled"
@@ -817,6 +841,26 @@ def _required(value, name, example, input_fn):
         if entered:
             return entered
     raise Error(f"{name} is required; example: {example}")
+
+
+def _password_file(value: str | None) -> str | None:
+    """Read a creation password without placing the credential in argv."""
+    if value is None:
+        return None
+    path = Path(value)
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, encoding="utf-8") as source:
+            details = os.fstat(source.fileno())
+            if not stat.S_ISREG(details.st_mode):
+                raise Error("password file is missing or unsafe")
+            if details.st_mode & 0o077:
+                raise Error("password file is not private")
+            text = source.read()
+    except (OSError, UnicodeError) as exc:
+        raise Error("password file cannot be read") from exc
+    return secrets.password_from_text(text)
 
 
 def _require_setup_values(values: dict[str, Any]) -> None:

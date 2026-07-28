@@ -9,7 +9,7 @@ from urllib.parse import quote, unquote
 
 from .. import docker
 from ..config import Config, Database, MachineState
-from ..errors import BackupError, RestoreError
+from ..errors import BackupError, CommandError, RestoreError
 from ..run import run
 
 DATABASE_SQL = (
@@ -37,6 +37,46 @@ def health(
         check=False,
     )
     return result.code == 0
+
+
+def pool_health(
+    container: str,
+    password: str,
+    *,
+    user: str = "default",
+    database: str = "postgres",
+    timeout: int = 10,
+) -> bool:
+    environment = {"PGPASSWORD": password, "PGCONNECT_TIMEOUT": "5"}
+    try:
+        result = docker.exec(
+            container,
+            [
+                "psql",
+                "-X",
+                "-A",
+                "-t",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-h",
+                "127.0.0.1",
+                "-p",
+                "5432",
+                "-U",
+                user,
+                "-d",
+                database,
+                "-c",
+                "SELECT 1",
+            ],
+            env=environment,
+            timeout=timeout,
+            secrets=[password],
+            check=False,
+        )
+    except CommandError:
+        return False
+    return result.code == 0 and result.out.strip() == "1"
 
 
 def backup(

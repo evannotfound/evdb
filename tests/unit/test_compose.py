@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import replace
 
 import yaml
@@ -72,9 +73,13 @@ def test_postgres_routes_to_pgbouncer_and_mounts_private_files(config):
 
     assert primary["environment"]["POSTGRES_PASSWORD_FILE"] == "/run/secrets/postgres-password"
     assert any("/password:/run/secrets/postgres-password:ro" in item for item in primary["volumes"])
+    assert pooler["user"] == f"{os.getuid()}:{os.getgid()}"
+    assert pooler["healthcheck"]["test"][-4:] == ["-U", "default", "-d", "postgres"]
     assert any(key.startswith("traefik.tcp.routers.") for key in pooler["labels"])
     assert not any(key.startswith("traefik.tcp.routers.") for key in primary["labels"])
     assert "auth_file = /run/secrets/pgbouncer-users" in compose.pool_config(target)
+    text = json.dumps(data, sort_keys=True)
+    assert "private-value" not in text
 
 
 def test_kv_is_private_native_and_http_is_loopback_only(config):

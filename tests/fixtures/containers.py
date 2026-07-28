@@ -16,6 +16,10 @@ import pytest
 POSTGRES_IMAGE = (
     "postgres:16@sha256:46aa2ee5d664b275f05d1a963b30fff60fb422b4b594d509765c42db46d48881"
 )
+PGBOUNCER_IMAGE = (
+    "edoburu/pgbouncer:v1.25.1-p0"
+    "@sha256:4a8371e79d6627e74f553d0aaa8e4c5ace20e30034fb296e569b71c89c99e108"
+)
 REDIS_IMAGE = "redis:7.2.5@sha256:f5ef9e24a9ef3b7cc552ae0cbc3cbade4f2877502683496c5d775605ae071412"
 DRAGONFLY_IMAGE = (
     "docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1"
@@ -126,6 +130,7 @@ def container(
     publish: Sequence[str] = (),
     labels: Mapping[str, str] | None = None,
     memory: str = "1g",
+    user: str | None = None,
 ) -> Iterator[str]:
     require_image(image)
     run_args = [
@@ -141,6 +146,8 @@ def container(
         "--security-opt",
         "no-new-privileges",
     ]
+    if user is not None:
+        run_args.extend(["--user", user])
     if publish_http:
         run_args.extend(["--publish", "127.0.0.1::80"])
     for value in publish:
