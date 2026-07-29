@@ -45,7 +45,7 @@ def render(value: dict[str, Any], *, width: int | None = None) -> str:
     identity_width = max(12, min(36, width - 37))
     host = value["host"]
     lines = [
-        _fit(
+        fit(
             f"Host {host['id']}  evdb {host['tool_version']}  "
             f"{'healthy' if host['healthy'] else 'needs attention'}",
             width,
@@ -54,9 +54,9 @@ def render(value: dict[str, Any], *, width: int | None = None) -> str:
     ]
     for identity, item in value["databases"].items():
         lines.append(
-            f"{_fit(identity, identity_width):<{identity_width}}  "
-            f"{_fit(item['engine'], 9):<9}  {_fit(item['health'], 9):<9}  "
-            f"{_backup_text(item['latest_backup'])}"
+            f"{fit(identity, identity_width):<{identity_width}}  "
+            f"{fit(item['engine'], 9):<9}  {fit(item['health'], 9):<9}  "
+            f"{backup_text(item['latest_backup'])}"
         )
     if not value["databases"]:
         lines.append("No databases configured")
@@ -338,16 +338,16 @@ def _date(value: Any) -> datetime | None:
     return result if result.tzinfo else result.replace(tzinfo=UTC)
 
 
-def _backup_text(value: dict[str, Any]) -> str:
+def backup_text(value: dict[str, Any]) -> str:
     if value["state"] == "disabled":
         return "disabled"
     if value["state"] == "stale":
         return "stale/missing"
-    date = _date(value["time"])
+    date = _date(value.get("time"))
     return date.strftime("%m-%d %H:%M") if date else "current"
 
 
-def _fit(value: str, width: int) -> str:
+def fit(value: str, width: int) -> str:
     if len(value) <= width:
         return value
     if width < 7:

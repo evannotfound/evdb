@@ -251,27 +251,6 @@ def info(config: Config, database: Database) -> dict[str, Any]:
                 state="error",
                 error=clean(redact(str(exc), protected(config)))[:500],
             )
-    password = quote(database.credentials.password, safe="")
-    if database.role == "postgres":
-        url = f"postgresql://default:{password}@{database.domain}:5432/postgres?sslmode=require"
-        connection = {
-            "url": url,
-            "username": "default",
-            "password": database.credentials.password,
-            "database": "postgres",
-        }
-    else:
-        connection = {
-            "url": f"rediss://default:{password}@{database.domain}:6379/0",
-            "username": "default",
-            "password": database.credentials.password,
-        }
-        if database.settings.http.enabled:
-            connection.update(
-                http_url=f"https://{database.settings.http.domain or database.domain}",
-                http_loopback=f"http://127.0.0.1:{database.http_port}",
-                http_token=database.credentials.http_token,
-            )
     return {
         "database": database.identity,
         "engine": database.engine,
@@ -283,8 +262,32 @@ def info(config: Config, database: Database) -> dict[str, Any]:
         "settings": _setting_values(database),
         "engine_info": details,
         "backup": backup_summary,
-        "connection": connection,
+        "connection": connection(database),
     }
+
+
+def connection(database: Database) -> dict[str, Any]:
+    password = quote(database.credentials.password, safe="")
+    if database.role == "postgres":
+        url = f"postgresql://default:{password}@{database.domain}:5432/postgres?sslmode=require"
+        return {
+            "url": url,
+            "username": "default",
+            "password": database.credentials.password,
+            "database": "postgres",
+        }
+    value = {
+        "url": f"rediss://default:{password}@{database.domain}:6379/0",
+        "username": "default",
+        "password": database.credentials.password,
+    }
+    if database.settings.http.enabled:
+        value.update(
+            http_url=f"https://{database.settings.http.domain or database.domain}",
+            http_loopback=f"http://127.0.0.1:{database.http_port}",
+            http_token=database.credentials.http_token,
+        )
+    return value
 
 
 def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]):

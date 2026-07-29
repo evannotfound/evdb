@@ -350,6 +350,28 @@ def test_guided_database_details_errors_and_credentials_stay_in_context(config, 
     assert password in connection and token in connection
 
 
+def test_guided_connection_does_not_collect_database_info(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    monkeypatch.setattr(
+        database,
+        "observe",
+        lambda *args: {"running": False, "healthy": False, "health": "stopped"},
+    )
+    monkeypatch.setattr(
+        database,
+        "info",
+        lambda *args: pytest.fail("connection should not collect database information"),
+    )
+    choices = iter(["2", "0"])
+    output = []
+
+    ui._database(config, target.identity, lambda prompt: next(choices), output.append)
+
+    connection = output[output.index("Connection") + 1]
+    assert target.credentials.password in connection
+    assert target.credentials.http_token in connection
+
+
 def test_direct_terminal_info_includes_backup_summary(config, monkeypatch):
     target = config.select("app-test-01/kv")
     value = {

@@ -10,19 +10,21 @@ from .run import clean
 
 
 def overview(value: dict[str, Any], *, width: int | None = None) -> str:
+    from . import status
+
     width = width or shutil.get_terminal_size((100, 24)).columns
     identity_width = max(12, min(36, width - 41))
     host_state = "healthy" if value["host"]["healthy"] else "needs attention"
     lines = [
-        _fit(f"Host {value['host']['id']}  {host_state}", width),
+        status.fit(f"Host {value['host']['id']}  {host_state}", width),
         "",
         f"{'#':>2}  {'Database':<{identity_width}}  {'Engine':<9}  {'Status':<9}  Backup",
     ]
     for number, (identity, item) in enumerate(value["databases"].items(), 1):
         lines.append(
-            f"{number:>2}  {_fit(identity, identity_width):<{identity_width}}  "
-            f"{_fit(item['engine'], 9):<9}  {_fit(item['health'], 9):<9}  "
-            f"{_backup_text(item['latest_backup'])}"
+            f"{number:>2}  {status.fit(identity, identity_width):<{identity_width}}  "
+            f"{status.fit(item['engine'], 9):<9}  {status.fit(item['health'], 9):<9}  "
+            f"{status.backup_text(item['latest_backup'])}"
         )
     if not value["databases"]:
         lines.append("    No databases configured")
@@ -84,7 +86,7 @@ def _database(config: Config, identity: str, input_fn, output) -> Config:
             summary["Error"] = local_error
         _screen(
             output,
-            _pairs(summary),
+            pairs(summary),
             heading=target.identity,
         )
         state_action = "Stop" if observed["running"] else "Start"
@@ -108,11 +110,11 @@ def _database(config: Config, identity: str, input_fn, output) -> Config:
                 selected = status.collect(current, target)["databases"][target.identity]
                 details = {key: item for key, item in value.items() if key != "connection"}
                 details["error"] = selected["error"] or "none"
-                _screen(output, _pairs(details), heading="Details")
+                _screen(output, pairs(details), heading="Details")
             elif choice == "2":
                 _screen(
                     output,
-                    _pairs(database.info(current, target)["connection"]),
+                    pairs(database.connection(target)),
                     heading="Connection",
                 )
             elif choice == "3":
@@ -166,7 +168,7 @@ def _add(config: Config, input_fn, output, password_fn) -> Config:
         password = password_fn("Initial Postgres password (blank to generate): ") or None
     _screen(
         output,
-        _pairs({"Database": f"{project}/{role}", "Engine": engine or "postgres"}),
+        pairs({"Database": f"{project}/{role}", "Engine": engine or "postgres"}),
         heading="Create database",
     )
     if not _yes(input_fn, "Create? [y/N] "):
@@ -181,7 +183,7 @@ def _settings(target: Database, input_fn, output) -> dict[str, Any] | None:
 
     current = database._setting_values(target)
     values = {}
-    _screen(output, _pairs(current), heading="Settings")
+    _screen(output, pairs(current), heading="Settings")
     for name, old in current.items():
         while True:
             entered = _text(input_fn, f"{name} [{old}]", blank=True)
@@ -199,7 +201,7 @@ def _settings(target: Database, input_fn, output) -> dict[str, Any] | None:
         return None
     _screen(
         output,
-        _pairs({name: f"{current[name]} -> {value}" for name, value in values.items()}),
+        pairs({name: f"{current[name]} -> {value}" for name, value in values.items()}),
         heading="Save settings",
     )
     return values if _yes(input_fn, "Save? [y/N] ") else None
@@ -228,16 +230,7 @@ def _backups(config: Config, target: Database, input_fn, output) -> Config:
                 )
             else:
                 rows = backup.history(config, target)
-                text = (
-                    "No backups available"
-                    if not rows
-                    else "\n".join(
-                        f"{row['time']}  {row['backup']}  {row['source']}  "
-                        f"{row.get('snapshot') or '-'}"
-                        for row in rows
-                    )
-                )
-                _screen(output, text, heading="Backup history")
+                _screen(output, backup_history(rows), heading="Backup history")
         except Error as exc:
             _screen(output, f"evdb: {exc}", heading=f"{target.identity} backup error")
 
@@ -252,7 +245,7 @@ def _host(value: dict[str, Any], output) -> None:
     ]
     _screen(
         output,
-        _pairs(
+        pairs(
             {
                 "Host": host["id"],
                 "Version": host["tool_version"],
@@ -332,19 +325,6 @@ def _invalid_choice(allowed: set[str]) -> str:
     return "Invalid choice; enter " + ", ".join(sorted(allowed))
 
 
-def _backup_text(value: dict[str, Any]) -> str:
-    state = value["state"]
-    if state != "current" or not value.get("time"):
-        return state
-    from datetime import datetime
-
-    try:
-        date = datetime.fromisoformat(value["time"].replace("Z", "+00:00"))
-    except ValueError:
-        return "current"
-    return date.strftime("%m-%d %H:%M")
-
-
 def _text(input_fn, prompt: str, *, blank: bool = False) -> str | None:
     try:
         value = input_fn(f"{prompt}: ").strip()
@@ -375,7 +355,7 @@ def _parse(value: str, current: Any) -> Any:
     return value
 
 
-def _pairs(values: dict[str, Any]) -> str:
+def pairs(values: dict[str, Any]) -> str:
     lines = []
     for key, value in values.items():
         label = key.replace("_", " ").title()
@@ -386,13 +366,13 @@ def _pairs(values: dict[str, Any]) -> str:
             )
         else:
             lines.append(f"{label}: {value}")
-    return "\n".join(lines)
+    return clean("\n".join(lines))
 
 
-def _fit(value: str, width: int) -> str:
-    if len(value) <= width:
-        return value
-    if width < 7:
-        return value[:width]
-    left = (width - 1) // 2
-    return value[:left] + "~" + value[-(width - left - 1) :]
+def backup_history(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "No backups available"
+    return "\n".join(
+        f"{row['time']}  {row['backup']}  {row['source']}  {row.get('snapshot') or '-'}"
+        for row in rows
+    )

@@ -4,7 +4,6 @@ import json
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from .. import docker
 from ..errors import BackupError, ConfigError
@@ -25,7 +24,7 @@ def validate(settings: KV) -> None:
         raise ConfigError("Redis mode must be durable or cache")
     if settings.memory is not None or settings.threads is not None:
         raise ConfigError("Redis does not accept Dragonfly memory or thread settings")
-    _validate_http(settings)
+    kv.validate_http(settings)
 
 
 def files(database: Database) -> dict[str, str]:
@@ -43,7 +42,7 @@ def files(database: Database) -> dict[str, str]:
         )
     }
     if settings.http.enabled:
-        values["http.env"] = _http_env(database)
+        values["http.env"] = kv.http_env(database)
     return values
 
 
@@ -66,7 +65,7 @@ def services(database: Database) -> dict[str, Any]:
     }
     values = {primary: service}
     if database.settings.http.enabled:
-        values[database.service("http")] = _http_service(database)
+        values[database.service("http")] = kv.http_service(database)
     return values
 
 
@@ -129,39 +128,3 @@ def _wait(container: str, password: str, before: int, identity: str) -> None:
             raise BackupError(f"{identity}: Redis background save failed")
         time.sleep(0.5)
     raise BackupError(f"{identity}: Redis background save timed out")
-
-
-def _validate_http(settings: KV) -> None:
-    if type(settings.http.enabled) is not bool or settings.http.connections < 1:
-        raise ConfigError("HTTP settings are invalid")
-
-
-def _http_env(database: Database) -> str:
-    token = database.credentials.http_token
-    if not token:
-        raise ConfigError(f"{database.identity}: HTTP token is missing")
-    connection = (
-        f"redis://default:{quote(database.credentials.password, safe='')}@"
-        f"{database.service('primary')}:6379"
-    )
-    return f"SRH_TOKEN={json.dumps(token)}\nSRH_CONNECTION_STRING={json.dumps(connection)}\n"
-
-
-def _http_service(database: Database) -> dict[str, Any]:
-    name = database.service("http")
-    return {
-        "image": database.settings.http.image,
-        "container_name": name,
-        "restart": "unless-stopped",
-        "env_file": [str(database.generated / "http.env")],
-        "environment": {
-            "SRH_MODE": "env",
-            "SRH_MAX_CONNECTIONS": str(database.settings.http.connections),
-        },
-        "depends_on": [database.service("primary")],
-        "healthcheck": docker.healthcheck(
-            ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:80/"]
-        ),
-        "ports": [f"127.0.0.1:{database.http_port}:80"],
-        "networks": {docker.NETWORK: {"aliases": [name]}},
-    }

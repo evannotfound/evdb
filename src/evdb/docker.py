@@ -17,14 +17,6 @@ TRAEFIK_PROJECT = "evdb-traefik"
 TRAEFIK_CONTAINER = "evdb-traefik"
 
 
-def inspect(name: str, *, timeout: int = 30) -> dict[str, Any]:
-    result = run(["docker", "inspect", name], timeout=timeout)
-    try:
-        return json.loads(result.out)[0]
-    except (json.JSONDecodeError, IndexError, TypeError) as exc:
-        raise CommandError(f"invalid Docker inspection for {name}") from exc
-
-
 def state(name: str, *, timeout: int = 30, health: bool = False) -> dict[str, Any]:
     result = run(["docker", "inspect", name], timeout=timeout, check=False)
     value = {"running": False, "healthy": False if health else None, "image": None}

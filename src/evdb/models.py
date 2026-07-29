@@ -110,14 +110,6 @@ class Postgres:
     image: str
     pgbouncer: PgBouncer
 
-    @property
-    def user(self) -> str:
-        return "default"
-
-    @property
-    def database(self) -> str:
-        return "postgres"
-
 
 @dataclass(frozen=True)
 class KV:

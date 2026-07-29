@@ -6,7 +6,6 @@ import pwd
 import sys
 from getpass import getpass
 from pathlib import Path
-from typing import Any
 
 from . import __version__, backup, database, status, ui
 from .config import CONFIG_DIR, load
@@ -175,7 +174,7 @@ def _database(config, args, output, *, terminal: bool) -> int:
     if command == "info":
         if not terminal:
             raise Error("database info prints credentials and requires a terminal")
-        output(_pairs(database.info(config, target)))
+        output(ui.pairs(database.info(config, target)))
     elif command == "configure":
         values = {
             name: getattr(args, name)
@@ -209,14 +208,7 @@ def _backup(config, args, output) -> int:
     if args.backup_command == "list":
         target = config.select(args.database)
         rows = backup.history(config, target)
-        output(
-            "No backups available"
-            if not rows
-            else "\n".join(
-                f"{row['time']}  {row['backup']}  {row['source']}  {row.get('snapshot') or '-'}"
-                for row in rows
-            )
-        )
+        output(ui.backup_history(rows))
         return 0
     if args.all:
         if args.database:
@@ -243,20 +235,6 @@ def _backup(config, args, output) -> int:
         f"snapshot {value['snapshot']}; repository {value['repository']}"
     )
     return 0
-
-
-def _pairs(values: dict[str, Any]) -> str:
-    lines = []
-    for key, value in values.items():
-        label = key.replace("_", " ").title()
-        if isinstance(value, dict):
-            lines.append(f"{label}:")
-            lines.extend(
-                f"  {name.replace('_', ' ').title()}: {item}" for name, item in value.items()
-            )
-        else:
-            lines.append(f"{label}: {value}")
-    return clean("\n".join(lines))
 
 
 def _canonical(source: Path) -> bool:

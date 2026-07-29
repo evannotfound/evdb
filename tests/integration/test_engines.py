@@ -127,9 +127,8 @@ def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_pat
                     assert not dragonfly._sources(
                         target.service("primary"), f"evdb-{manifest['backup']}"
                     )
-                service = docker.inspect(target.service("http"))["NetworkSettings"]["Ports"][
-                    "80/tcp"
-                ]
+                inspected = run(["docker", "inspect", target.service("http")], timeout=30)
+                service = json.loads(inspected.out)[0]["NetworkSettings"]["Ports"]["80/tcp"]
                 assert service == [{"HostIp": "127.0.0.1", "HostPort": str(target.http_port)}]
             assert len({target.http_port for target in targets}) == 2
         finally:
