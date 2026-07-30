@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import pwd
 import sys
 from getpass import getpass
 from pathlib import Path
@@ -24,7 +23,6 @@ def parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init", help="initialize or refresh this host")
     init.add_argument("--host-id")
     init.add_argument("--domain")
-    init.add_argument("--data-root")
     init.add_argument("--acme-email")
     init.add_argument("--dns-provider")
     init.add_argument("--repository")
@@ -108,7 +106,6 @@ def main(
                 for name in (
                     "host_id",
                     "domain",
-                    "data_root",
                     "acme_email",
                     "dns_provider",
                     "repository",
@@ -263,12 +260,7 @@ def _require_access(source: Path, args) -> None:
 
 
 def _host_access_allowed() -> bool:
-    if os.geteuid() == 0:
-        return True
-    try:
-        return pwd.getpwuid(os.geteuid()).pw_name == "evdb"
-    except KeyError:
-        return False
+    return os.geteuid() == 0
 
 
 def _tty() -> bool:
@@ -279,7 +271,6 @@ def _init_values(values: dict[str, str], input_fn, password_fn=getpass) -> dict[
     prompts = (
         ("host_id", "Host ID"),
         ("domain", "Base domain"),
-        ("data_root", "Database data root"),
         ("acme_email", "ACME email"),
         ("dns_provider", "DNS provider"),
         ("repository", "Restic repository"),

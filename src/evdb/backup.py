@@ -409,7 +409,7 @@ def _restic(
                 *args,
             ],
             timeout=timeout,
-            env={"RCLONE_CONFIG": str(config.paths.rclone)},
+            env={"RCLONE_CONFIG": str(config.host.backup.rclone_config)},
             secrets=credentials,
             check=check,
         )

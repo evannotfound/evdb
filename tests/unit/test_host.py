@@ -15,15 +15,11 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
     calls = []
     order = []
     before = b"[remote]\ntype = local\ntoken = refreshed oauth state\n"
-    config.paths.rclone.write_bytes(before)
+    config.host.backup.rclone_config.write_bytes(before)
     host._install_units(tmp_path / "systemd")
     monkeypatch.setattr(host, "prerequisites", lambda: [])
     monkeypatch.setattr(host, "_require_ports", lambda current: None)
-    monkeypatch.setattr(host, "_account", lambda paths: None)
     monkeypatch.setattr(host, "_source_ownership", lambda current: order.append("source ownership"))
-    monkeypatch.setattr(
-        host, "_generated_ownership", lambda current: order.append("generated ownership")
-    )
     monkeypatch.setattr(host, "_traefik", lambda current: order.append("traefik"))
     monkeypatch.setattr(host.docker, "ensure_network", lambda **kwargs: order.append("network"))
     monkeypatch.setattr(host.backup, "initialize", lambda current: order.append("repository"))
@@ -52,13 +48,12 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
     )
 
     assert value["host"]["id"] == config.host.id
-    assert config.paths.rclone.read_bytes() == before
+    assert config.host.backup.rclone_config.read_bytes() == before
     assert order == [
         "source ownership",
         "network",
         "traefik",
         "repository",
-        "generated ownership",
         "timer",
     ]
     assert ["systemctl", "daemon-reload"] in calls
@@ -105,10 +100,10 @@ def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_pa
     dns.write_text("TESTDNS_TOKEN=private\n")
     rclone = tmp_path / "seed.conf"
     rclone.write_text("[local]\ntype = local\n")
+    rclone.chmod(0o600)
     values = {
         "host_id": "new-test-01",
         "domain": "storage.example.com",
-        "data_root": str(tmp_path / "data"),
         "acme_email": "ops@example.com",
         "dns_provider": "testdns",
         "repository": str(tmp_path / "repository"),
@@ -117,9 +112,7 @@ def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_pa
     }
     monkeypatch.setattr(host, "prerequisites", lambda: [])
     monkeypatch.setattr(host, "_require_ports", lambda current: None)
-    monkeypatch.setattr(host, "_account", lambda current: None)
     monkeypatch.setattr(host, "_source_ownership", lambda current: None)
-    monkeypatch.setattr(host, "_generated_ownership", lambda current: None)
     monkeypatch.setattr(host, "_traefik", lambda current: None)
     monkeypatch.setattr(host.docker, "ensure_network", lambda **kwargs: None)
     monkeypatch.setattr(host.backup, "initialize", lambda current: None)
@@ -161,10 +154,10 @@ def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, 
     dns.write_text("TESTDNS_TOKEN=private\n")
     rclone = tmp_path / "seed.conf"
     rclone.write_text("[local]\ntype = local\n")
+    rclone.chmod(0o600)
     values = {
         "host_id": "retry-test-01",
         "domain": "storage.example.com",
-        "data_root": str(tmp_path / "data"),
         "acme_email": "ops@example.com",
         "dns_provider": "testdns",
         "repository": str(tmp_path / "repository"),
@@ -175,9 +168,7 @@ def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, 
     attempts = iter([RuntimeError("injected network failure"), None])
     monkeypatch.setattr(host, "prerequisites", lambda: [])
     monkeypatch.setattr(host, "_require_ports", lambda current: None)
-    monkeypatch.setattr(host, "_account", lambda current: None)
     monkeypatch.setattr(host, "_source_ownership", lambda current: order.append("source"))
-    monkeypatch.setattr(host, "_generated_ownership", lambda current: order.append("generated"))
 
     def network(**kwargs):
         order.append("network")
@@ -199,7 +190,7 @@ def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, 
     with pytest.raises(RuntimeError, match="injected"):
         host.initialize(paths.source, values, paths=paths, unit_dir=tmp_path / "systemd")
 
-    assert paths.source.is_file() and paths.secrets.is_file() and paths.rclone.is_file()
+    assert paths.source.is_file() and paths.secrets.is_file() and rclone.is_file()
     assert order == ["source", "network"]
 
     result = host.initialize(
@@ -210,7 +201,7 @@ def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, 
     )
 
     assert result["healthy"]
-    assert order == ["source", "network", "source", "network", "traefik", "repository", "generated"]
+    assert order == ["source", "network", "source", "network", "traefik", "repository"]
 
 
 def test_unit_convergence_rejects_symlink_and_nonregular_destinations(tmp_path):
@@ -273,7 +264,6 @@ def test_initial_restic_password_file_is_private_and_existing_config_ignores_rep
     values = {
         "host_id": "password-test-01",
         "domain": "storage.example.com",
-        "data_root": str(tmp_path / "data"),
         "acme_email": "ops@example.com",
         "dns_provider": "testdns",
         "repository": str(tmp_path / "repository"),
@@ -282,6 +272,8 @@ def test_initial_restic_password_file_is_private_and_existing_config_ignores_rep
         "restic_password_file": str(password),
     }
 
+    Path(values["rclone_config"]).write_text("[local]\ntype = local\n")
+    Path(values["rclone_config"]).chmod(0o600)
     config = host._initial(values, paths)
 
     assert config.secrets.restic_password == "existing repository password"
@@ -316,33 +308,6 @@ def test_initial_restic_password_rejects_unsafe_file_shapes(tmp_path):
             host._restic_password({"restic_password_file": str(path)})
 
 
-def test_generated_ownership_never_recursively_chowns_database_data(config, monkeypatch):
-    descendant = config.host.data_root / "app-test-01/postgres/data/PG_VERSION"
-    descendant.parent.mkdir(parents=True)
-    descendant.write_text("16\n")
-    before = descendant.stat()
-    calls = []
-    monkeypatch.setattr(host, "CONFIG_DIR", config.paths.config)
-    monkeypatch.setattr(
-        host,
-        "run",
-        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
-    )
-
-    host._generated_ownership(config)
-
-    recursive = next(args for args in calls if "-R" in args)
-    assert str(config.host.data_root) not in recursive
-    assert ["chown", "evdb:evdb", str(config.host.data_root)] in calls
-    after = descendant.stat()
-    assert descendant.read_text() == "16\n"
-    assert (after.st_uid, after.st_gid, after.st_mode) == (
-        before.st_uid,
-        before.st_gid,
-        before.st_mode,
-    )
-
-
 def test_managed_directory_symlink_is_rejected_without_following(config, tmp_path):
     real = tmp_path / "real-state"
     real.mkdir()
@@ -357,7 +322,7 @@ def test_managed_directory_symlink_is_rejected_without_following(config, tmp_pat
         host._directories(unsafe)
 
 
-def test_canonical_source_directory_converges_to_sticky_group_writable(config, monkeypatch):
+def test_canonical_source_directory_converges_to_private_root_layout(config, monkeypatch):
     calls = []
     monkeypatch.setattr(host, "CONFIG_DIR", config.paths.config)
     monkeypatch.setattr(
@@ -369,8 +334,15 @@ def test_canonical_source_directory_converges_to_sticky_group_writable(config, m
     host._directories(config)
     host._source_ownership(config)
 
-    assert config.paths.config.stat().st_mode & 0o7777 == 0o1770
-    assert calls.count(["chmod", "01770", str(config.paths.config)]) == 1
+    assert config.paths.config.stat().st_mode & 0o7777 == 0o700
+    assert [
+        "chown",
+        "root:root",
+        str(config.paths.config),
+        str(config.paths.source),
+        str(config.paths.secrets),
+    ] in calls
+    assert ["chmod", "0700", str(config.paths.config)] in calls
 
 
 def test_ports_probe_uses_sockets_only_for_confirmed_absent_container(config, monkeypatch):
@@ -540,110 +512,7 @@ def test_ports_probe_stopped_owned_traefik_rejects_exact_occupied_port(config, m
         host._require_ports(config)
 
 
-def test_existing_service_account_is_validated_before_docker_membership(paths, monkeypatch):
-    calls = []
-    monkeypatch.setattr(host, "CONFIG_DIR", paths.config)
-
-    def run(args, **kwargs):
-        calls.append(args)
-        if args[:2] == ["getent", "group"]:
-            return Result(tuple(args), 0, "evdb:x:997:\n", "")
-        if args[:2] == ["getent", "passwd"]:
-            return Result(
-                tuple(args),
-                0,
-                "evdb:x:1001:997::/var/lib/evdb:/usr/sbin/nologin\n",
-                "",
-            )
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", run)
-
-    assert host._account(paths) == (1001, 997)
-    assert calls[-1] == ["usermod", "--append", "--groups", "docker", "evdb"]
-
-
-@pytest.mark.parametrize(
-    "entry",
-    [
-        "evdb:x:998:996::/var/lib/evdb:/usr/sbin/nologin\n",
-        "evdb:x:998:997::/home/evdb:/usr/sbin/nologin\n",
-        "evdb:x:998:997::/var/lib/evdb:/bin/bash\n",
-        "evdb:x:not-a-number:997::/var/lib/evdb:/usr/sbin/nologin\n",
-        "evdb:x:998:997:malformed\n",
-    ],
-)
-def test_invalid_existing_service_user_never_gets_docker_membership(paths, monkeypatch, entry):
-    calls = []
-    monkeypatch.setattr(host, "CONFIG_DIR", paths.config)
-
-    def run(args, **kwargs):
-        calls.append(args)
-        value = "evdb:x:997:\n" if args[:2] == ["getent", "group"] else entry
-        return Result(tuple(args), 0, value, "")
-
-    monkeypatch.setattr(host, "run", run)
-
-    with pytest.raises(host.HostError, match="evdb user"):
-        host._account(paths)
-
-    assert not any(args and args[0] == "usermod" for args in calls)
-
-
-@pytest.mark.parametrize("entry", ["evdb:x:0:\n", "evdb:x:not-a-number:\n", "bad\n"])
-def test_invalid_existing_service_group_never_gets_docker_membership(paths, monkeypatch, entry):
-    calls = []
-    monkeypatch.setattr(host, "CONFIG_DIR", paths.config)
-
-    def run(args, **kwargs):
-        calls.append(args)
-        return Result(tuple(args), 0, entry, "")
-
-    monkeypatch.setattr(host, "run", run)
-
-    with pytest.raises(host.HostError, match="evdb group"):
-        host._account(paths)
-
-    assert not any(args and args[0] in {"useradd", "usermod"} for args in calls)
-
-
-def test_missing_service_account_is_recreated_validated_then_joined_to_docker(paths, monkeypatch):
-    calls = []
-    created = {"group": False, "passwd": False}
-    monkeypatch.setattr(host, "CONFIG_DIR", paths.config)
-
-    def run(args, **kwargs):
-        calls.append(args)
-        if args[:2] == ["getent", "group"]:
-            return Result(
-                tuple(args),
-                0 if created["group"] else 2,
-                "evdb:x:997:\n" if created["group"] else "",
-                "",
-            )
-        if args[:2] == ["getent", "passwd"]:
-            return Result(
-                tuple(args),
-                0 if created["passwd"] else 2,
-                ("evdb:x:998:997::/var/lib/evdb:/usr/sbin/nologin\n" if created["passwd"] else ""),
-                "",
-            )
-        if args[0] == "groupadd":
-            created["group"] = True
-        if args[0] == "useradd":
-            created["passwd"] = True
-        return Result(tuple(args), 0, "", "")
-
-    monkeypatch.setattr(host, "run", run)
-
-    assert host._account(paths) == (998, 997)
-    actions = [args[0] for args in calls]
-    assert actions.index("groupadd") < actions.index("useradd") < actions.index("usermod")
-
-
-def test_existing_canonical_bootstrap_orders_guard_account_ownership_before_load(
-    config, monkeypatch
-):
+def test_existing_canonical_bootstrap_orders_guard_and_ownership_before_load(config, monkeypatch):
     order = []
     monkeypatch.setattr(host, "_guard_preload", lambda *args: order.append("guard"))
     monkeypatch.setattr(
@@ -653,18 +522,13 @@ def test_existing_canonical_bootstrap_orders_guard_account_ownership_before_load
     )
     monkeypatch.setattr(
         host,
-        "_account",
-        lambda *args, **kwargs: order.append("account") or (998, 997),
-    )
-    monkeypatch.setattr(
-        host,
         "_converge_canonical_source",
         lambda *args: order.append("ownership"),
     )
 
     host._bootstrap_existing(config.paths.source, config.paths)
 
-    assert order == ["guard", "paths", "account", "ownership"]
+    assert order == ["guard", "paths", "ownership"]
 
 
 def test_existing_canonical_initialize_bootstraps_before_strict_load(config, monkeypatch):

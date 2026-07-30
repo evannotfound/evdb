@@ -4,21 +4,16 @@
 
 Credentials are generated and read on the authoritative host. `/etc/evdb/secrets.yml` contains the
 Restic password, DNS values, database passwords, and HTTP tokens under matching host or project/role
-keys. It is `evdb:evdb` mode `0600` and never appears in status output.
+keys. It is `root:root` mode `0600` and never appears in status output.
 
-Generated private files live with each role under `/etc/evdb/projects/<project>/<role>`. Postgres
+Generated private files live with each role under `/var/lib/evdb/projects/<project>/<role>`. Postgres
 receives a password file and PgBouncer users file. Redis receives private native configuration,
 Dragonfly receives private flags, and HTTP-enabled KV receives a token and environment file. Generated
 Compose references private paths without embedding credential content.
 
-Mutable `/etc/evdb/rclone.conf` is seeded only when absent so refreshed OAuth state survives
-initialization and installer updates. It is `evdb:evdb` mode `0600` and is not regenerated from
-`secrets.yml`.
-
-The parent `/etc/evdb` directory is `root:evdb` mode `01770`. Its group write permission allows rclone
-to create a temporary sibling and atomically replace its own configuration during an OAuth refresh.
-The sticky bit and root ownership of `config.yml`, which is mode `0640`, prevent the evdb account from
-unlinking, renaming, or writing that source file.
+The native rclone configuration remains at the private root-owned path recorded in
+`host.backup.rclone_config`. evdb passes that path to Restic and never copies, replaces, chowns, or
+regenerates it. Direct and scheduled commands both run as root, so OAuth refreshes retain one owner.
 
 Credential values never belong in command arguments. Postgres creation may read the initial `default`
 user password from `--password-file` or a masked guided prompt. Password files must be regular,
@@ -33,8 +28,9 @@ is left blank. There is no inline or environment input, and neither supplied nor
 printed. Configured init preserves the existing `secrets.yml`; a replacement password-file option is
 ignored without reading the file.
 
-PgBouncer runs as an unprivileged identity that can read its private role-local configuration and
-authentication files without widening file modes or embedding credentials in environment values.
+PgBouncer keeps the image's unprivileged identity and receives the generated files' numeric host group
+as a supplementary group. Root-owned role directories remain private, generated files are mode
+`0640`, mounts are read-only, and credentials are not embedded in environment values.
 
 ## Deliberate terminal output
 

@@ -19,8 +19,8 @@ separate change and no implementation or validation may mutate `montreal-01`.
 
 - Make one rerunnable initialization command prepare the host, initialize the remote repository, and
   activate automatic backups without follow-up systemd or rclone directory commands.
-- Make `/etc/evdb/config.yml` and `/etc/evdb/secrets.yml` the two readable evdb sources, with
-  rclone's mutable native file beside them.
+- Make root-owned `/etc/evdb/config.yml` and `/etc/evdb/secrets.yml` the two readable evdb sources,
+  while referencing the host's private native rclone file in place.
 - Let concrete engine modules own database-specific behavior while generic database and backup
   modules perform only shared orchestration.
 - Fail with the original operational context and keep rerunnable declarative files rather than
@@ -41,14 +41,13 @@ separate change and no implementation or validation may mutate `montreal-01`.
 
 ## Decisions
 
-### Use two evdb source files and one native rclone file
+### Use two evdb source files and one external native rclone file
 
 The canonical files are:
 
 ```text
 /etc/evdb/config.yml
 /etc/evdb/secrets.yml
-/etc/evdb/rclone.conf
 ```
 
 `config.yml` contains host identity, routing, one backup repository URL, projects, roles, concrete
@@ -56,14 +55,15 @@ engines, images, and explicit settings. `secrets.yml` contains the Restic passwo
 database passwords, and HTTP tokens under matching project and role keys. Both loaders require a
 complete supported schema; the secret file is mode `0600` and is never emitted by status.
 
-`rclone.conf` remains separate because rclone writes refreshed OAuth state in its own INI format.
-evdb copies an initial native file only when absent and then never regenerates or translates it.
-Keeping mutable OAuth state synchronized through YAML was rejected because it would create a custom
-two-way configuration protocol.
+`config.yml` stores the absolute path to the host's native rclone file. evdb validates and passes that
+path to Restic without copying, replacing, chowning, or translating it. Root runs both direct and
+scheduled operations, so rclone refreshes OAuth state with the same identity that owns the source.
 
-Generated Compose and engine files live together under
-`/etc/evdb/projects/<project>/<role>`. Runtime state under `/var/lib/evdb` is limited to local backups
-and locks. There is no machine-state, activity, transaction, restore, or mutable-rclone subtree.
+Generated Compose and engine files live under `/var/lib/evdb/projects/<project>/<role>`, dedicated
+Traefik assets under `/var/lib/evdb/traefik`, database data under
+`/var/lib/evdb/databases/<project>/<role>/data`, and local backups and locks under `/var/lib/evdb`.
+There is no configurable data root, machine-state, activity, transaction, restore, or mutable-rclone
+subtree.
 
 ### Remove deployment state and render directly from configuration
 
@@ -106,7 +106,7 @@ removed.
 role, concrete engine, and backup tags. One repository lock serializes Restic work.
 
 Initialization requires Restic 0.17 or newer. `evdb init` runs `restic cat config` with the configured
-password and rclone file. Exit zero means the repository is ready; Restic's documented missing-repo
+password and external rclone file. Exit zero means the repository is ready; Restic's documented missing-repo
 exit code triggers `restic init --repository-version 1`; every other result fails with its original
 repository URL and stderr. Restic through rclone creates the missing remote path, so evdb does not run
 an independent `rclone mkdir` or ask the operator to prepare directories.
@@ -127,7 +127,7 @@ evdb-backup.timer    -> daily, persistent, randomized
 ```
 
 `evdb init` installs, reloads, and enables the timer with `--now` after the repository is ready. The
-service runs durable databases sequentially, records each result, continues after an individual
+root-owned service runs durable databases sequentially, records each result, continues after an individual
 failure, and exits nonzero if any database failed. A new database needs no timer instance or escaped
 unit name and is included automatically in the next run. Per-database, status, test, retention,
 prune, and repository-check timers and generated drop-ins are removed.
@@ -135,16 +135,17 @@ prune, and repository-check timers and generated drop-ins are removed.
 ### Make initialization rerunnable and updates installer-owned
 
 Top-level `evdb init` replaces `host setup`. On a new host it collects or accepts the required source
-values, creates the service identity and canonical files, initializes networking and Traefik,
+values, creates root-owned canonical files and runtime directories, initializes networking and Traefik,
 initializes Restic, installs the two units, enables the timer, and checks the resulting runtime. On an
 existing host it reads the canonical files and repeats those direct convergence steps without
-replacing existing credentials or rclone state.
+replacing existing credentials or external rclone state.
 
 `host check` becomes `status`; in-app update and uninstall commands are removed. The verified shell
-installer keeps checksums, archive validation, atomic `current` selection, and one `previous` release.
-It may update a configured host and then invokes `evdb init --yes` to refresh host assets. If refresh
-fails, the installer reports the error and leaves the selected release available; it does not run a
-second compatibility and rollback implementation inside Python.
+installer downloads one architecture-specific executable, verifies its checksum and reported version,
+and atomically replaces `/usr/local/bin/evdb`. It may update a configured host and then invokes
+`evdb init --yes` to refresh host assets. If refresh fails, the installer reports the error and leaves
+the selected executable active; it does not retain `/opt/evdb`, a previous release, or a second
+compatibility and rollback implementation.
 
 ### Use progressive terminal disclosure
 
@@ -185,18 +186,18 @@ TTY, while status and non-interactive output remain credential-free.
   failing command, expose health in the selected database view, and make start rerender and retry.
 - [The new schema cannot operate current hosts] -> Do not add compatibility branches; reset only
   approved disposable hosts and keep production migration separate.
-- [Secrets now share one YAML file] -> Require root/evdb ownership and mode `0600`, write atomically,
+- [Secrets now share one YAML file] -> Require root ownership and mode `0600`, write atomically,
   and never include the file or values in machine output.
-- [Installer refresh can fail after selecting a release] -> Report the direct initialization error and
-  let the operator repair config or rerun init; the previous verified release remains on disk.
+- [Installer refresh can fail after replacing the executable] -> Report the direct initialization error
+  and let the operator repair config or rerun init; automatic tool rollback remains outside v1.
 
 ## Migration Plan
 
 1. Archive the completed Postgres creation fix so its behavior is represented in the main specs.
 2. Remove restore, restore-based testing, maintenance commands, units, docs, and tests while preserving
    checked backup creation.
-3. Introduce the new config/secrets models and paths, then move engine ownership and direct lifecycle
-   behavior onto them.
+3. Introduce the new config/secrets models and fixed `/var/lib/evdb` paths, then move engine ownership
+   and direct lifecycle behavior onto them.
 4. Replace role repositories and timers with one initialized host repository and one all-database
    backup timer.
 5. Replace host setup/update flows and the guided CLI, then remove superseded modules and state.
@@ -211,5 +212,5 @@ existing hosts must retain their old executable and files until explicitly reset
 
 ## Open Questions
 
-None. The v1 engines, backup boundary, repository layout, systemd scheduler, update path, secret
-layout, rclone exception, and credential-output boundary are fixed by this change.
+None. The v1 engines, backup boundary, fixed host layout, root execution model, systemd scheduler,
+single-binary update path, external rclone reference, and credential-output boundary are fixed.

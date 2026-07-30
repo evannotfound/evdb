@@ -8,8 +8,11 @@ one Ubuntu host, run configured database containers reliably, and create automat
 ## What Changes
 
 - **BREAKING** Replace `/etc/evdb/host.yml`, the separate secret tree, and machine-owned deployment
-  state with `/etc/evdb/config.yml`, `/etc/evdb/secrets.yml`, and rclone's native mutable
-  `/etc/evdb/rclone.conf`.
+  state with root-owned `/etc/evdb/config.yml` and `/etc/evdb/secrets.yml`; use a configured native
+  rclone file in place rather than copying it into evdb storage.
+- **BREAKING** Run the host-local command and backup unit as root without an evdb service account,
+  store all generated and mutable runtime files under `/var/lib/evdb`, and fix database data at
+  `/var/lib/evdb/databases/<project>/<role>/data` without a configurable data root.
 - **BREAKING** Remove live restore, isolated backup testing, remote retention, prune, repository checks,
   safety backups, operation transactions, automatic rollback, drift contracts, and their commands,
   status fields, documentation, and scheduled jobs.
@@ -23,6 +26,8 @@ one Ubuntu host, run configured database containers reliably, and create automat
   enabling scheduled backups.
 - **BREAKING** Replace `host setup`, `host check`, `host update`, and `host uninstall` with top-level
   `evdb init`, `evdb status`, and installer-driven updates.
+- Replace versioned `/opt/evdb` releases with one checksummed standalone executable installed
+  atomically at `/usr/local/bin/evdb`; embed the two canonical systemd units in that executable.
 - Redesign the guided terminal flow around a compact database overview and progressive database,
   backup, and host details instead of one wide all-fields table.
 - Show repository URLs, remote names, paths, images, and subprocess errors; redact only exact password
@@ -58,8 +63,9 @@ None.
 - Core modules affected: `config.py`, `database.py`, `host.py`, `backup.py`, `status.py`, `cli.py`,
   `interactive.py`, `ui.py`, `compose.py`, `restic.py`, `restore.py`, `secrets.py`, `images.py`, engine
   modules, and low-level command error handling.
-- Runtime assets affected: canonical config and secret paths, generated database files, Restic repository
-  layout, packaged systemd units, release installation, and the standalone command contract.
+- Runtime assets affected: canonical config and secret paths, fixed `/var/lib/evdb` runtime and data
+  paths, external rclone configuration, packaged systemd units, release installation, and the
+  standalone command contract.
 - Tests and documentation will be reduced to the retained host initialization, engine lifecycle,
   routing, backup, installer, and guided/direct CLI behavior.
 - The existing pre-v1 on-disk schema is not migrated. Disposable hosts may be reset explicitly;

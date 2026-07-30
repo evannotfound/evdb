@@ -12,8 +12,6 @@ from pathlib import Path, PurePosixPath
 ROOT = Path(__file__).resolve().parents[1]
 SYNC_PATHS = ("src", "tests", "pyproject.toml", "uv.lock", "Makefile", "README.md")
 PRODUCTION_HOST = "montreal-01"
-CANONICAL_EVDB = "/opt/evdb/current/bin/evdb"
-STABLE_EVDB = "/usr/local/bin/evdb"
 DEV_VERSION = "0.0.dev0"
 
 
@@ -33,8 +31,6 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("args", nargs=argparse.REMAINDER)
     evdb = commands.add_parser("evdb", help="run the checkout's evdb explicitly with sudo")
     evdb.add_argument("args", nargs=argparse.REMAINDER)
-    commands.add_parser("activate", help="point the stable command at the checkout")
-    commands.add_parser("deactivate", help="restore the stable command to the installed release")
     return result
 
 
@@ -201,29 +197,11 @@ def execute(
     return result.returncode
 
 
-def activate(target: str, checkout: str, *, enabled: bool, run=subprocess.run) -> None:
-    target_host(target)
-    checkout = checkout_path(checkout)
-    selected = f"{checkout}/.venv/bin/evdb" if enabled else CANONICAL_EVDB
-    script = (
-        "set -eu; "
-        f'test "$(hostname -s)" != {PRODUCTION_HOST}; '
-        f"{_checkout_guard(checkout) if enabled else ''}"
-        f"test -x {shlex.quote(selected)}; "
-        f"expected=$(readlink -f {shlex.quote(selected)}); "
-        f"sudo ln -sfn {shlex.quote(selected)} {STABLE_EVDB}; "
-        f'test "$(readlink -f {STABLE_EVDB})" = "$expected"'
-    )
-    run(ssh_command(target, script, tty=True), check=True)
-
-
 def main() -> int:
     args = parser().parse_args()
     try:
         if args.command == "sync":
             sync(args.target, args.checkout)
-        elif args.command in {"activate", "deactivate"}:
-            activate(args.target, args.checkout, enabled=args.command == "activate")
         else:
             return execute(args.target, args.checkout, args.command, args.args)
     except subprocess.CalledProcessError as exc:

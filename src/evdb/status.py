@@ -14,7 +14,7 @@ from .files import free_gb
 from .models import Config, Database
 from .run import clean, redact, run
 
-VERSION = 1
+VERSION = 2
 
 
 def collect(config: Config, database: Database | None = None) -> dict[str, Any]:
@@ -65,27 +65,18 @@ def render(value: dict[str, Any], *, width: int | None = None) -> str:
 
 def _host(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
     paths = config.paths
-    disks = {}
-    for name, path in (("data", config.host.data_root), ("backup", paths.backups)):
-        try:
-            disks[name] = _disk(path, config.host.backup.min_free_gb)
-        except (Error, OSError) as exc:
-            disks[name] = {
-                "path": str(path),
-                "free_gb": None,
-                "ok": False,
-                "available": False,
-            }
-            errors.append(
-                _error(
-                    "disk_assessment_failed",
-                    f"host/{name}",
-                    _message(config, exc),
-                )
-            )
-    for name, item in disks.items():
-        if item["available"] and not item["ok"]:
-            errors.append(_error("disk_low", f"host/{name}", "free space is below policy"))
+    try:
+        storage = _disk(paths.state, config.host.backup.min_free_gb)
+    except (Error, OSError) as exc:
+        storage = {
+            "path": str(paths.state),
+            "free_gb": None,
+            "ok": False,
+            "available": False,
+        }
+        errors.append(_error("disk_assessment_failed", "host/storage", _message(config, exc)))
+    if storage["available"] and not storage["ok"]:
+        errors.append(_error("disk_low", "host/storage", "free space is below policy"))
     infrastructure = _infrastructure(config, errors)
     timer = _timer(config, errors)
     repository = {
@@ -109,10 +100,7 @@ def _host(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
             _error("repository_unavailable", "host/repository", config.host.backup.repository)
         )
     healthy = (
-        all(item["ok"] for item in disks.values())
-        and infrastructure["healthy"]
-        and timer["ok"]
-        and repository["ready"] is True
+        storage["ok"] and infrastructure["healthy"] and timer["ok"] and repository["ready"] is True
     )
     return {
         "id": config.host.id,
@@ -120,7 +108,7 @@ def _host(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
         "healthy": healthy,
         "source": {"config": str(paths.source), "valid": True},
         "infrastructure": infrastructure,
-        "disks": disks,
+        "storage": storage,
         "repository": repository,
         "timer": timer,
     }

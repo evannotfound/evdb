@@ -2,24 +2,17 @@
 
 ## Authoritative source
 
-Each host owns two complete evdb source files and one native rclone file:
+Each host owns two complete evdb source files:
 
 ```text
 /etc/evdb/config.yml
 /etc/evdb/secrets.yml
-/etc/evdb/rclone.conf
 ```
 
 `config.yml` is the readable non-secret source for host identity, routing, one backup repository,
-projects, roles, concrete engines, images, and explicit settings. Canonical ownership is
-`root:evdb` mode `0640` for `config.yml` and `evdb:evdb` mode `0600` for `secrets.yml` and
-`rclone.conf`.
-
-`/etc/evdb` is `root:evdb` mode `01770`: group-writable and sticky. Group write access lets the evdb
-account create a temporary file beside its own `rclone.conf` and atomically replace it when rclone
-persists OAuth refreshes. The service has no write bit on root-owned `config.yml`, and sticky-directory
-ownership prevents it from unlinking or renaming that file. `rclone.conf` remains in rclone's native
-mutable format so refreshed state survives initialization and installer updates.
+the absolute host rclone configuration path, projects, roles, concrete engines, images, and explicit
+settings. `/etc/evdb`, `config.yml`, and `secrets.yml` are private `root:root`; both files use mode
+`0600`. evdb validates and uses the rclone file in place without copying, replacing, or chowning it.
 
 The normal mutation interface is the installed host-local command. A representative non-secret
 structure is:
@@ -28,9 +21,9 @@ structure is:
 host:
   id: example-01
   domain: storage.example.com
-  data_root: /srv/databases
   backup:
     repository: rclone:remote:evdb/example-01
+    rclone_config: /root/.config/rclone/rclone.conf
   routing:
     acme_email: operations@example.com
     dns_provider: cloudflare
@@ -79,22 +72,21 @@ are explicit so a future package default cannot silently change it.
 ```text
 /etc/evdb/config.yml
 /etc/evdb/secrets.yml
-/etc/evdb/rclone.conf
-/etc/evdb/projects/<project>/<role>/compose.yaml
-/etc/evdb/traefik/compose.yaml
+/var/lib/evdb/projects/<project>/<role>/compose.yaml
+/var/lib/evdb/traefik/compose.yaml
 /var/lib/evdb/backups/<project>/<role>/
 /var/lib/evdb/locks/
-<data_root>/<project>/<role>/data/
+/var/lib/evdb/databases/<project>/<role>/data/
 ```
 
 Generated Compose and engine files are conventional tool-owned files derived directly from
 `config.yml` and `secrets.yml`. Configured non-`latest` image references are written into Compose as
-configured. Local backups and locks are the only mutable runtime files under `/var/lib/evdb`.
+configured. Generated files, local backups, locks, and database data share the fixed runtime root.
 
 Configuration writes validate complete candidates and atomically replace only the changed source
-file. Initialization copies a supplied native rclone file only when `/etc/evdb/rclone.conf` is absent;
-later runs preserve its bytes. Once configured, initialization also preserves `secrets.yml`; an
-additional `--restic-password-file` value is ignored rather than replacing the stored Restic password.
+file. Initialization validates the configured native rclone file but never writes it. Once configured,
+initialization also preserves `secrets.yml`; an additional `--restic-password-file` value is ignored
+rather than replacing the stored Restic password.
 
 ## Validation boundaries
 

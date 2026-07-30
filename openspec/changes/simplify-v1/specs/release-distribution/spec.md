@@ -1,25 +1,25 @@
 ## MODIFIED Requirements
 
-### Requirement: Complete release archive
-Each architecture archive SHALL contain exactly one executable at `bin/evdb` and exactly
-`units/evdb-backup.service` plus `units/evdb-backup.timer`. The executable SHALL run without host
-Python or a Python package manager.
+### Requirement: Complete release executable
+Each architecture asset SHALL be one executable with exactly the two canonical systemd unit templates
+embedded. The executable SHALL run and install those units without host Python or a Python package
+manager.
 
-#### Scenario: Release archive is inspected
-- **WHEN** the release workflow assembles an architecture archive
-- **THEN** it verifies the executable, two non-empty units, expected modes, and absence of unexpected members
+#### Scenario: Release executable is inspected
+- **WHEN** the release workflow builds an architecture executable
+- **THEN** it verifies the reported version and that both embedded units are available and non-empty
 
 ### Requirement: Release integrity and provenance
-Every architecture archive SHALL have a matching SHA-256 file and GitHub artifact attestation tied to
+Every architecture executable SHALL have a matching SHA-256 file and GitHub artifact attestation tied to
 the release workflow and source revision. Initial installation and configured-host installer updates
-SHALL verify the checksum before reading archive members or selecting executable content.
+SHALL verify the checksum before executing or installing the candidate.
 
-#### Scenario: Downloaded archive is corrupted
-- **WHEN** an archive digest differs from its checksum
+#### Scenario: Downloaded executable is corrupted
+- **WHEN** an executable digest differs from its checksum
 - **THEN** installation fails without creating or selecting the candidate release
 
 ### Requirement: Consistent version identity
-evdb SHALL expose `evdb --version`, and source package metadata, release tags, release archives, and
+evdb SHALL expose `evdb --version`, and source package metadata, release tags, release executables, and
 runtime status SHALL use the same exact semantic version. No machine-state tool-version field SHALL be
 required.
 
@@ -29,7 +29,7 @@ required.
 
 ### Requirement: Release-only OpenCode dependency
 OpenCode, Node.js, provider configuration, and model credentials SHALL remain release-CI dependencies
-only. Standalone archives, the installer, initialization, status, scheduled backup, database, and
+only. Standalone executables, the installer, initialization, status, scheduled backup, database, and
 backup commands SHALL operate without those dependencies.
 
 #### Scenario: Managed host installs OpenCode-authored release notes
@@ -38,8 +38,8 @@ backup commands SHALL operate without those dependencies.
 
 ### Requirement: Public initial installer
 Each release SHALL include an anonymously fetchable installer. It SHALL detect supported architecture,
-resolve latest by default or accept an exact version, verify checksum and executable version, stage the
-complete archive, atomically select it under `/opt/evdb`, and establish `/usr/local/bin/evdb` without
+resolve latest by default or accept an exact version, verify checksum and executable version, and
+atomically replace `/usr/local/bin/evdb` without
 Python or `uv`. A new host SHALL be directed to `sudo evdb init`. A configured host SHALL be updated
 and then refreshed automatically with `evdb init --yes`.
 
@@ -52,12 +52,12 @@ and then refreshed automatically with `evdb init --yes`.
 - **THEN** it downloads only that tag and rejects an executable reporting another version
 
 #### Scenario: Configured host updates
-- **WHEN** `config.yml` and a managed current release already exist
-- **THEN** the installer selects the verified requested release, records the prior release as previous, and runs `evdb init --yes`
+- **WHEN** `config.yml` and a managed executable already exist
+- **THEN** the installer installs the verified requested executable and runs `evdb init --yes`
 
 #### Scenario: Configured refresh fails
 - **WHEN** post-selection initialization returns nonzero
-- **THEN** the installer returns nonzero with that error and leaves both selected and previous verified releases available
+- **THEN** the installer returns nonzero with that error and leaves the verified selected executable installed
 
 ### Requirement: Development and production tool boundary
 The repository SHALL use `uv` and its lock file for development, checks, and release builds. Installed
@@ -72,8 +72,8 @@ Python, pip, pipx, `uv`, or a Python package registry.
 The repository SHALL retain a guarded workflow that syncs only explicit source, test, and locked
 project files to a disposable non-production VPS and runs a native `uv sync --locked` environment.
 It SHALL reject `montreal-01`, copy no ignored files or credentials, and leave
-`/opt/evdb/current` unchanged. Temporary stable-command activation SHALL restore
-`/usr/local/bin/evdb` to `/opt/evdb/current/bin/evdb` when deactivated.
+the installed `/usr/local/bin/evdb` unchanged. Development commands SHALL invoke the checkout's
+executable explicitly rather than temporarily replacing the installed command.
 
 #### Scenario: Developer tests an uncommitted source revision
 - **WHEN** explicit development files are synced to an approved VPS
@@ -83,9 +83,9 @@ It SHALL reject `montreal-01`, copy no ignored files or credentials, and leave
 - **WHEN** the target resolves to `montreal-01`
 - **THEN** the workflow refuses before any copy, command, or link change
 
-#### Scenario: Development activation is removed
-- **WHEN** the operator deactivates the checkout
-- **THEN** the stable command again resolves through the installed current release
+#### Scenario: Development command completes
+- **WHEN** a checkout command exits
+- **THEN** `/usr/local/bin/evdb` remains the installed release executable
 
 ### Requirement: Public project entry point
 The README SHALL describe evdb as pre-v1 Ubuntu tooling for Postgres and Redis-compatible containers,

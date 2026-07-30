@@ -12,7 +12,7 @@ from evdb.run import Result
 def _value(*, error=None):
     now = datetime.now(UTC).isoformat()
     return {
-        "version": 1,
+        "version": 2,
         "healthy": error is None,
         "host": {
             "id": "test-01",
@@ -27,10 +27,7 @@ def _value(*, error=None):
                 "image": "traefik:v3.7.8",
                 "healthy": True,
             },
-            "disks": {
-                "data": {"path": "/srv/data", "free_gb": 100.0, "ok": True},
-                "backup": {"path": "/var/lib/evdb", "free_gb": 50.0, "ok": True},
-            },
+            "storage": {"path": "/var/lib/evdb", "free_gb": 50.0, "ok": True},
             "repository": {"url": "rclone:remote:evdb/test-01", "ready": True},
             "timer": {
                 "unit": "evdb-backup.timer",
@@ -261,7 +258,7 @@ def test_status_uses_newest_confirmed_remote_snapshot(config, monkeypatch):
 def test_status_errors_redact_nested_rclone_tokens_and_strip_controls(config, monkeypatch):
     target = config.select("app-test-01/kv")
     secret = "nested OAuth token"
-    config.paths.rclone.write_text(
+    config.host.backup.rclone_config.write_text(
         '[remote]\ntype = local\ntoken = {"access_token":"nested OAuth token"}\n'
     )
     monkeypatch.setattr(
@@ -438,7 +435,7 @@ def test_host_screen_explicitly_shows_network_traefik_acme_and_runtime_fields():
 
     for expected in (
         "Source:",
-        "Disks:",
+        "Storage:",
         "Listeners:",
         "Network: healthy",
         "Traefik: healthy",
@@ -456,7 +453,6 @@ def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
         [
             "new-test-01",
             "storage.example.com",
-            str(tmp_path / "data"),
             "ops@example.com",
             "testdns",
             str(tmp_path / "repository"),
@@ -483,7 +479,6 @@ def test_guided_init_does_not_prompt_over_supplied_restic_password_file(tmp_path
         {
             "host_id": "new-test-01",
             "domain": "storage.example.com",
-            "data_root": str(tmp_path / "data"),
             "acme_email": "ops@example.com",
             "dns_provider": "testdns",
             "repository": str(tmp_path / "repository"),
@@ -533,7 +528,7 @@ def test_status_json_survives_unavailable_host_and_database_probes(config, monke
     parsed = json.loads(text)
 
     assert not parsed["healthy"]
-    assert parsed["host"]["disks"]["data"]["free_gb"] is None
+    assert parsed["host"]["storage"]["free_gb"] is None
     assert parsed["host"]["infrastructure"]["network"] is None
     assert parsed["host"]["infrastructure"]["traefik"] is None
     assert set(parsed["host"]["infrastructure"]["listeners"].values()) == {None}

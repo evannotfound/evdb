@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import configparser
-import grp
 import json
-import pwd
 import re
 import stat
 from dataclasses import replace
@@ -14,7 +12,7 @@ from urllib.parse import quote, quote_plus
 import yaml
 
 from .errors import ConfigError
-from .files import write_bytes, write_text
+from .files import write_text
 from .models import (
     CONFIG_DIR,
     HTTP,
@@ -63,27 +61,6 @@ _RCLONE_CREDENTIAL_FIELDS = {
     "refresh_token",
     "secret_access_key",
     "token",
-}
-_SYSTEM_DATA_ROOTS = tuple(
-    Path(value)
-    for value in (
-        "/bin",
-        "/boot",
-        "/dev",
-        "/etc",
-        "/lib",
-        "/lib64",
-        "/opt",
-        "/proc",
-        "/root",
-        "/run",
-        "/sbin",
-        "/sys",
-        "/usr",
-    )
-)
-_SHALLOW_DATA_ROOTS = {
-    Path(value) for value in ("/", "/data", "/home", "/media", "/mnt", "/srv", "/var", "/var/lib")
 }
 
 
@@ -234,9 +211,9 @@ def as_dict(config: Config) -> dict[str, Any]:
         "host": {
             "id": host.id,
             "domain": host.domain,
-            "data_root": str(host.data_root),
             "backup": {
                 "repository": host.backup.repository,
+                "rclone_config": str(host.backup.rclone_config),
                 "min_free_gb": host.backup.min_free_gb,
                 "max_age_hours": host.backup.max_age_hours,
             },
@@ -253,7 +230,7 @@ def as_dict(config: Config) -> dict[str, Any]:
 def write(config: Config, *, secrets: bool = True) -> None:
     require_valid(config)
     source_owner, secret_owner = _source_owners(config.paths)
-    write_text(config.paths.source, dump(config), mode=0o640, owner=source_owner)
+    write_text(config.paths.source, dump(config), mode=0o600, owner=source_owner)
     if secrets:
         write_text(
             config.paths.secrets,
@@ -263,28 +240,8 @@ def write(config: Config, *, secrets: bool = True) -> None:
         )
 
 
-def seed_rclone(config: Config, source: str | Path | None) -> None:
-    target = config.paths.rclone
-    if target.exists() or target.is_symlink():
-        if target.is_symlink() or not target.is_file():
-            raise ConfigError(f"rclone configuration is unsafe: {target}")
-        if target.stat().st_mode & 0o077:
-            raise ConfigError(f"rclone configuration must be private: {target}")
-        return
-    if source is None:
-        raise ConfigError("initialization requires --rclone-config when rclone.conf is absent")
-    candidate = Path(source)
-    if candidate.is_symlink() or not candidate.is_file():
-        raise ConfigError(f"rclone seed is missing or unsafe: {candidate}")
-    data = candidate.read_bytes()
-    if not data.strip():
-        raise ConfigError("rclone seed is empty")
-    _source_owner, secret_owner = _source_owners(config.paths)
-    write_bytes(target, data, mode=0o600, owner=secret_owner)
-
-
 def protected(config: Config) -> tuple[str, ...]:
-    values = [*config.secrets.values, *_rclone_credentials(config.paths.rclone)]
+    values = [*config.secrets.values, *_rclone_credentials(config.host.backup.rclone_config)]
     encoded = set()
     for value in values:
         encoded.update((value, quote(value, safe=""), quote_plus(value), json.dumps(value)[1:-1]))
@@ -411,42 +368,7 @@ def require_valid(config: Config) -> None:
         errors.append("host.id must be a safe lowercase name of at most 60 characters")
     if not _DOMAIN.fullmatch(host.domain) or len(host.domain) > 253:
         errors.append("host.domain must be a valid lowercase domain")
-    supplied_data_root = host.data_root
-    try:
-        data_root = supplied_data_root.resolve(strict=False)
-    except OSError, RuntimeError:
-        data_root = supplied_data_root
-        errors.append("host.data_root cannot be normalized safely")
-    if ".." in supplied_data_root.parts:
-        errors.append("host.data_root must not contain '..'")
-    if supplied_data_root != data_root:
-        errors.append("host.data_root must equal its normalized absolute path")
-    if (
-        not supplied_data_root.is_absolute()
-        or len(data_root.parts) < 3
-        or data_root in _SHALLOW_DATA_ROOTS
-    ):
-        errors.append("host.data_root must be a dedicated safe absolute path")
-    if any(data_root == root or data_root.is_relative_to(root) for root in _SYSTEM_DATA_ROOTS):
-        errors.append("host.data_root must not use a system path")
-    if config.paths.config == CONFIG_DIR and any(
-        data_root == root or data_root.is_relative_to(root)
-        for root in (Path("/tmp"), Path("/var/tmp"))
-    ):
-        errors.append("host.data_root must not use temporary storage")
     for managed in (config.paths.config, config.paths.state):
-        normalized_managed = managed.resolve(strict=False)
-        if (
-            data_root == normalized_managed
-            or data_root.is_relative_to(normalized_managed)
-            or normalized_managed.is_relative_to(data_root)
-        ):
-            errors.append(f"host.data_root overlaps managed path {normalized_managed}")
-    for managed in (
-        config.paths.config,
-        config.paths.state,
-        supplied_data_root,
-    ):
         unsafe = _unsafe_directory(managed)
         if unsafe is not None:
             errors.append(f"managed directory is symlinked or unsafe: {unsafe}")
@@ -456,6 +378,10 @@ def require_valid(config: Config) -> None:
         errors.append("host.backup.repository must be non-empty")
     if re.search(r"://[^/@\s]+@", host.backup.repository):
         errors.append("host.backup.repository must not contain credentials")
+    try:
+        _require_rclone(host.backup.rclone_config, canonical=config.paths.config == CONFIG_DIR)
+    except ConfigError as exc:
+        errors.append(str(exc))
     if type(host.backup.min_free_gb) is not int or host.backup.min_free_gb < 0:
         errors.append("host.backup.min_free_gb must be non-negative")
     if type(host.backup.max_age_hours) is not int or host.backup.max_age_hours < 1:
@@ -550,17 +476,21 @@ def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
         raise ConfigError("pre-v1 source schema is unsupported")
     _only(data, {"host", "projects"}, "config")
     host_data = _object(_required(data, "host", "config"), "host")
-    _only(host_data, {"id", "domain", "data_root", "backup", "routing"}, "host")
+    _only(host_data, {"id", "domain", "backup", "routing"}, "host")
     backup_data = _object(_required(host_data, "backup", "host"), "host.backup")
-    _only(backup_data, {"repository", "min_free_gb", "max_age_hours"}, "host.backup")
+    _only(
+        backup_data,
+        {"repository", "rclone_config", "min_free_gb", "max_age_hours"},
+        "host.backup",
+    )
     routing_data = _object(_required(host_data, "routing", "host"), "host.routing")
     _only(routing_data, {"acme_email", "dns_provider", "traefik_image"}, "host.routing")
     host = Host(
         _string(host_data, "id", "host"),
         _string(host_data, "domain", "host"),
-        Path(_string(host_data, "data_root", "host")),
         BackupSettings(
             _string(backup_data, "repository", "host.backup"),
+            Path(_string(backup_data, "rclone_config", "host.backup")),
             _integer(backup_data, "min_free_gb", "host.backup", minimum=0),
             _integer(backup_data, "max_age_hours", "host.backup", minimum=1),
         ),
@@ -663,19 +593,11 @@ def _require_source_mode(path: Path) -> None:
 def _require_canonical_layout(paths: Paths, source: Path, secrets: Path) -> None:
     if paths.config != CONFIG_DIR:
         return
-    try:
-        root_uid = pwd.getpwnam("root").pw_uid
-        evdb_uid = pwd.getpwnam("evdb").pw_uid
-        evdb_gid = grp.getgrnam("evdb").gr_gid
-    except KeyError as exc:
-        raise ConfigError("canonical configuration requires the evdb account and group") from exc
     expected = (
-        (paths.config, True, root_uid, evdb_gid, 0o1770),
-        (source, False, root_uid, evdb_gid, 0o640),
-        (secrets, False, evdb_uid, evdb_gid, 0o600),
+        (paths.config, True, 0, 0, 0o700),
+        (source, False, 0, 0, 0o600),
+        (secrets, False, 0, 0, 0o600),
     )
-    if paths.rclone.exists() or paths.rclone.is_symlink():
-        expected += ((paths.rclone, False, evdb_uid, evdb_gid, 0o600),)
     for path, directory, uid, gid, mode in expected:
         if path.is_symlink() or (not path.is_dir() if directory else not path.is_file()):
             raise ConfigError(f"canonical path is missing or unsafe: {path}")
@@ -689,13 +611,20 @@ def _require_canonical_layout(paths: Paths, source: Path, secrets: Path) -> None
 def _source_owners(paths: Paths) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
     if paths.config != CONFIG_DIR:
         return None, None
-    try:
-        root_uid = pwd.getpwnam("root").pw_uid
-        evdb_uid = pwd.getpwnam("evdb").pw_uid
-        evdb_gid = grp.getgrnam("evdb").gr_gid
-    except KeyError as exc:
-        raise ConfigError("canonical configuration requires the evdb account and group") from exc
-    return (root_uid, evdb_gid), (evdb_uid, evdb_gid)
+    return (0, 0), (0, 0)
+
+
+def _require_rclone(path: Path, *, canonical: bool) -> None:
+    if not path.is_absolute() or path != path.resolve(strict=False):
+        raise ConfigError("host.backup.rclone_config must be a normalized absolute path")
+    if path.is_symlink() or not path.is_file():
+        raise ConfigError(f"rclone configuration is missing or unsafe: {path}")
+    details = path.stat()
+    if details.st_mode & 0o077:
+        raise ConfigError(f"rclone configuration must have mode 0600: {path}")
+    parent = path.parent.stat()
+    if canonical and (details.st_uid != 0 or parent.st_uid != 0 or parent.st_mode & 0o022):
+        raise ConfigError(f"rclone configuration must be root-controlled: {path}")
 
 
 def _unsafe_directory(path: Path) -> Path | None:

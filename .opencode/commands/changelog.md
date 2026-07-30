@@ -1,6 +1,6 @@
 ---
 description: Generate repository-grounded notes for an evdb release
-model: openai/gpt-5.6-sol
+model: openai/gpt-5.4
 variant: high
 ---
 

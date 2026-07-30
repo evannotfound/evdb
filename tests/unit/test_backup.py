@@ -185,7 +185,7 @@ def test_restic_uses_private_password_file_without_secret_argv_or_environment(co
 def test_create_all_redacts_exact_and_encoded_credentials(config, monkeypatch):
     secret = "rclone value"
     encoded = quote(secret, safe="")
-    config.paths.rclone.write_text(f"[remote]\ntype = local\ntoken = {secret}\n")
+    config.host.backup.rclone_config.write_text(f"[remote]\ntype = local\ntoken = {secret}\n")
     monkeypatch.setattr(
         backup,
         "create",

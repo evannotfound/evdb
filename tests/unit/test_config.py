@@ -1,7 +1,5 @@
 import os
-import stat
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -19,7 +17,6 @@ from evdb.config import (
     protected,
     reject_legacy,
     require_valid,
-    seed_rclone,
     validate_image,
     write,
 )
@@ -34,10 +31,10 @@ def test_strict_two_file_round_trip_and_project_role_selectors(config):
         "app-test-01/kv",
     ]
     assert config.select("app-test-01/postgres").compose.name == "compose.yaml"
-    assert config.select("app-test-01/kv").data == (config.host.data_root / "app-test-01/kv/data")
+    assert config.select("app-test-01/kv").data == (config.paths.databases / "app-test-01/kv/data")
     assert config.paths.source.name == "config.yml"
     assert config.paths.secrets.name == "secrets.yml"
-    assert config.paths.rclone.name == "rclone.conf"
+    assert config.host.backup.rclone_config.name == "rclone.conf"
     assert yaml.safe_load(dump(config)) == as_dict(config)
     assert "local-restic-password" not in dump(config)
     assert "local-restic-password" in dump_secrets(config.secrets)
@@ -46,7 +43,7 @@ def test_strict_two_file_round_trip_and_project_role_selectors(config):
 def test_atomic_writes_keep_source_and_secret_modes(config):
     write(config)
 
-    assert config.paths.source.stat().st_mode & 0o777 == 0o640
+    assert config.paths.source.stat().st_mode & 0o777 == 0o600
     assert config.paths.secrets.stat().st_mode & 0o777 == 0o600
     assert not list(config.paths.config.glob(".*.yml.*"))
 
@@ -86,17 +83,14 @@ def test_image_with_registry_port_is_supported():
     validate_image("registry.example.com:5000/postgres:16.4")
 
 
-def test_rclone_is_seeded_once_and_preserved_byte_for_byte(config, tmp_path):
-    seed = tmp_path / "seed.conf"
-    seed.write_bytes(b"[remote]\ntype = local\n")
-    config.paths.rclone.unlink()
+def test_rclone_is_referenced_in_place_and_not_rewritten(config):
+    rclone = config.host.backup.rclone_config
+    before = (rclone.stat().st_ino, rclone.read_bytes())
 
-    seed_rclone(config, seed)
-    config.paths.rclone.write_bytes(b"refreshed oauth bytes\x00\n")
-    before = config.paths.rclone.read_bytes()
+    write(config)
 
-    seed_rclone(config, seed)
-    assert config.paths.rclone.read_bytes() == before
+    assert (rclone.stat().st_ino, rclone.read_bytes()) == before
+    assert as_dict(config)["host"]["backup"]["rclone_config"] == str(rclone)
 
 
 def test_matching_secrets_are_required_and_extras_rejected(config):
@@ -121,7 +115,7 @@ def test_matching_secrets_are_required_and_extras_rejected(config):
 
 
 def test_protected_values_are_exact_and_encoded_while_repository_is_visible(config):
-    config.paths.rclone.write_text(
+    config.host.backup.rclone_config.write_text(
         "[remote]\n"
         "type = local\n"
         'token = {"access_token":"nested access","refresh_token":"nested refresh",'
@@ -138,7 +132,7 @@ def test_protected_values_are_exact_and_encoded_while_repository_is_visible(conf
 
 
 def test_rclone_defaults_only_credentials_are_protected(config):
-    config.paths.rclone.write_text("[DEFAULT]\nclient_secret = defaults secret\n")
+    config.host.backup.rclone_config.write_text("[DEFAULT]\nclient_secret = defaults secret\n")
 
     assert "defaults secret" in protected(config)
 
@@ -151,7 +145,7 @@ def test_rclone_defaults_only_credentials_are_protected(config):
     ],
 )
 def test_rclone_credential_extraction_rejects_ambiguous_or_malformed_config(config, text):
-    config.paths.rclone.write_text(text)
+    config.host.backup.rclone_config.write_text(text)
 
     with pytest.raises(ConfigError, match="invalid rclone configuration"):
         protected(config)
@@ -160,7 +154,7 @@ def test_rclone_credential_extraction_rejects_ambiguous_or_malformed_config(conf
 def test_json_shaped_rclone_token_is_treated_as_opaque(config, monkeypatch):
     from evdb import backup
 
-    config.paths.rclone.write_text("[remote]\ntoken = {broken\n")
+    config.host.backup.rclone_config.write_text("[remote]\ntoken = {broken\n")
     seen = {}
 
     def run(args, **kwargs):
@@ -259,135 +253,51 @@ def test_every_derived_native_database_domain_must_be_valid(config, role):
 
 
 def test_canonical_layout_enforces_owner_group_and_modes(config, monkeypatch):
-    uid = os.getuid()
-    gid = os.getgid()
-    config.paths.config.chmod(0o1770)
-    config.paths.source.write_text(
-        config.paths.source.read_text().replace(str(config.host.data_root), "/srv/evdb-test")
-    )
+    config.paths.config.chmod(0o700)
+    config.paths.source.chmod(0o600)
     monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
-    monkeypatch.setattr(
-        config_module.pwd,
-        "getpwnam",
-        lambda name: SimpleNamespace(pw_uid=uid),
-    )
-    monkeypatch.setattr(
-        config_module.grp,
-        "getgrnam",
-        lambda name: SimpleNamespace(gr_gid=gid),
-    )
+    real_stat = config_module.Path.stat
+
+    def root_stat(path, *args, **kwargs):
+        details = real_stat(path, *args, **kwargs)
+        return SimpleNamespace(st_uid=0, st_gid=0, st_mode=details.st_mode)
+
+    monkeypatch.setattr(config_module.Path, "stat", root_stat)
 
     load(config.paths.source, paths=config.paths)
 
-    monkeypatch.setattr(
-        config_module.pwd,
-        "getpwnam",
-        lambda name: SimpleNamespace(pw_uid=uid + 1 if name == "root" else uid),
-    )
+    def foreign_stat(path, *args, **kwargs):
+        details = root_stat(path, *args, **kwargs)
+        if path == config.paths.source:
+            details.st_uid = 1
+        return details
+
+    monkeypatch.setattr(config_module.Path, "stat", foreign_stat)
     with pytest.raises(ConfigError, match="owner, group, or mode"):
         load(config.paths.source, paths=config.paths)
 
 
-@pytest.mark.parametrize(
-    "value",
-    ["/", "/var", "/var/lib", "/etc/evdb-data", "/usr/local/evdb-data", "/data"],
-)
-def test_data_root_rejects_shallow_and_system_paths(config, value):
-    unsafe = replace(config, host=replace(config.host, data_root=Path(value)))
+def test_rclone_path_must_be_private_regular_and_external(config, tmp_path):
+    rclone = config.host.backup.rclone_config
+    rclone.chmod(0o640)
+    with pytest.raises(ConfigError, match="mode 0600"):
+        require_valid(config)
 
-    with pytest.raises(ConfigError, match="data_root"):
-        require_valid(unsafe)
-
-
-def test_data_root_rejects_existing_symlink_components(config, tmp_path):
-    real = tmp_path / "real"
-    real.mkdir()
-    linked = tmp_path / "linked"
-    linked.symlink_to(real, target_is_directory=True)
-    unsafe = replace(config, host=replace(config.host, data_root=linked / "database-data"))
-
-    with pytest.raises(ConfigError, match="symlinked or unsafe"):
-        require_valid(unsafe)
-
-
-def test_data_root_rejects_existing_prefix_parent_traversal(config):
-    supplied = Path("/home/ubuntu/../../etc")
-    unsafe = replace(config, host=replace(config.host, data_root=supplied))
-
-    with pytest.raises(ConfigError) as caught:
-        require_valid(unsafe)
-
-    message = str(caught.value)
-    assert "must not contain '..'" in message
-    assert "must equal its normalized absolute path" in message
-    assert "must not use a system path" in message
-
-
-def test_canonical_sticky_directory_allows_atomic_rclone_replacement(config, monkeypatch):
-    uid = os.getuid()
-    gid = os.getgid()
-    config.paths.config.chmod(0o1770)
-    config.paths.source.write_text(
-        config.paths.source.read_text().replace(str(config.host.data_root), "/srv/evdb-test")
-    )
-    config.paths.source.chmod(0o640)
-    config.paths.secrets.chmod(0o600)
-    config.paths.rclone.chmod(0o600)
-    monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
-    monkeypatch.setattr(
-        config_module.pwd,
-        "getpwnam",
-        lambda name: SimpleNamespace(pw_uid=uid),
-    )
-    monkeypatch.setattr(
-        config_module.grp,
-        "getgrnam",
-        lambda name: SimpleNamespace(gr_gid=gid),
-    )
-    source_inode = config.paths.source.stat().st_ino
-    rclone_inode = config.paths.rclone.stat().st_ino
-
-    files_module.write_bytes(
-        config.paths.rclone,
-        b"[local]\ntype = local\nupdated = true\n",
-        mode=0o600,
-        owner=(uid, gid),
-    )
-
-    loaded = load(config.paths.source, paths=config.paths)
-    mode = config.paths.config.stat().st_mode
-    assert loaded.host.id == config.host.id
-    assert mode & 0o7777 == 0o1770
-    assert mode & stat.S_ISVTX
-    assert mode & stat.S_IWGRP
-    assert not mode & stat.S_IWOTH
-    assert config.paths.source.stat().st_ino == source_inode
-    assert config.paths.rclone.stat().st_ino != rclone_inode
-    assert not list(config.paths.config.glob(".rclone.conf.*"))
-
-    config.paths.config.chmod(0o750)
-    with pytest.raises(ConfigError, match="mode 1770"):
-        load(config.paths.source, paths=config.paths)
+    rclone.unlink()
+    target = tmp_path / "target.conf"
+    target.write_text("[local]\ntype = local\n")
+    target.chmod(0o600)
+    rclone.symlink_to(target)
+    with pytest.raises(ConfigError, match="unsafe"):
+        require_valid(config)
 
 
 def test_canonical_atomic_writes_apply_final_owners_before_replace(config, monkeypatch):
-    root_uid = 101
-    evdb_uid = 202
-    evdb_gid = 303
     current_uid = os.getuid()
     current_gid = os.getgid()
-    selected = replace(config, host=replace(config.host, data_root=Path("/srv/evdb-test")))
+    selected = config
     monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
-    monkeypatch.setattr(
-        config_module.pwd,
-        "getpwnam",
-        lambda name: SimpleNamespace(pw_uid=root_uid if name == "root" else evdb_uid),
-    )
-    monkeypatch.setattr(
-        config_module.grp,
-        "getgrnam",
-        lambda name: SimpleNamespace(gr_gid=evdb_gid),
-    )
+    monkeypatch.setattr(config_module, "_require_rclone", lambda *args, **kwargs: None)
     real_fchown = files_module.os.fchown
     owners = []
 
@@ -398,33 +308,24 @@ def test_canonical_atomic_writes_apply_final_owners_before_replace(config, monke
     monkeypatch.setattr(files_module.os, "fchown", fchown)
 
     write(selected)
-    selected.paths.rclone.unlink()
-    seed = config.paths.config.parent / "seed-rclone.conf"
-    seed.write_text("[local]\ntype = local\n")
-    seed_rclone(selected, seed)
 
     assert owners == [
-        (root_uid, evdb_gid),
-        (evdb_uid, evdb_gid),
-        (evdb_uid, evdb_gid),
+        (0, 0),
+        (0, 0),
     ]
-    assert selected.paths.source.stat().st_mode & 0o777 == 0o640
+    assert selected.paths.source.stat().st_mode & 0o777 == 0o600
     assert selected.paths.secrets.stat().st_mode & 0o777 == 0o600
-    assert selected.paths.rclone.stat().st_mode & 0o777 == 0o600
 
 
 def test_canonical_secret_write_failure_does_not_restore_source(config, monkeypatch):
-    selected = replace(config, host=replace(config.host, data_root=Path("/srv/evdb-test")))
+    selected = config
     monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(config_module, "_require_rclone", lambda *args, **kwargs: None)
+    real_fchown = os.fchown
     monkeypatch.setattr(
-        config_module.pwd,
-        "getpwnam",
-        lambda name: SimpleNamespace(pw_uid=os.getuid()),
-    )
-    monkeypatch.setattr(
-        config_module.grp,
-        "getgrnam",
-        lambda name: SimpleNamespace(gr_gid=os.getgid()),
+        files_module.os,
+        "fchown",
+        lambda descriptor, uid, gid: real_fchown(descriptor, os.getuid(), os.getgid()),
     )
     real_write = config_module.write_text
     owners = []
@@ -441,4 +342,4 @@ def test_canonical_secret_write_failure_does_not_restore_source(config, monkeypa
         write(selected)
 
     assert selected.paths.source.read_text() == dump(selected)
-    assert owners[0][1] == (os.getuid(), os.getgid())
+    assert owners[0][1] == (0, 0)

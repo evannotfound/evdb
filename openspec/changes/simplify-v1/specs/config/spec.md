@@ -24,18 +24,18 @@ written directly into generated Compose without separate resolution or image mac
 
 ### Requirement: Canonical host paths
 Non-secret source SHALL live at `/etc/evdb/config.yml`, secret source at
-`/etc/evdb/secrets.yml`, and mutable native rclone configuration at `/etc/evdb/rclone.conf`.
-Generated database assets SHALL live under `/etc/evdb/projects/<project>/<role>`, dedicated Traefik
-assets under `/etc/evdb/traefik`, mutable local backups and locks under `/var/lib/evdb`, and database
-data under `<data_root>/<project>/<role>/data`.
+`/etc/evdb/secrets.yml`, and `host.backup.rclone_config` SHALL reference a private native rclone file
+in place. Generated database assets SHALL live under `/var/lib/evdb/projects/<project>/<role>`,
+dedicated Traefik assets under `/var/lib/evdb/traefik`, mutable local backups and locks under
+`/var/lib/evdb`, and database data under `/var/lib/evdb/databases/<project>/<role>/data`.
 
 #### Scenario: Postgres paths are derived
 - **WHEN** project `example-prod-01` has a Postgres role
-- **THEN** its Compose path is `/etc/evdb/projects/example-prod-01/postgres/compose.yaml` and its data path ends in `/example-prod-01/postgres/data`
+- **THEN** its Compose path is `/var/lib/evdb/projects/example-prod-01/postgres/compose.yaml` and its data path is `/var/lib/evdb/databases/example-prod-01/postgres/data`
 
 #### Scenario: Operator locates host inputs
-- **WHEN** an operator reviews `/etc/evdb`
-- **THEN** evdb's desired settings, managed credentials, mutable rclone state, and generated project files are available under that one root
+- **WHEN** an operator reviews `/etc/evdb` and `/var/lib/evdb`
+- **THEN** evdb's desired settings and managed credentials are separated from generated runtime and database data
 
 ### Requirement: Command-owned atomic configuration
 Normal guided and direct configuration changes SHALL validate complete `config.yml` and
@@ -95,7 +95,7 @@ Postgres and KV; default KV HTTP domains SHALL use the same project hostname.
 
 ### Requirement: Configuration validation
 Validation SHALL reject unsafe project IDs, missing environment suffixes, duplicate roles, unsupported
-engines, unsafe or overlapping paths, colliding routes or HTTP identities, incomplete routing or
+engines, an unsafe external rclone path, colliding routes or HTTP identities, incomplete routing or
 backup settings, `latest` or unversioned images, invalid role-specific settings, missing matching
 secrets, unexpected secret keys, and source files with unsafe ownership or modes. `config.yml` SHALL
 contain no credential value; `secrets.yml` SHALL contain only supported credential fields and SHALL be

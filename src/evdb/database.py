@@ -26,7 +26,7 @@ def render(config: Config, database: Database) -> dict[str, Any]:
         raise DatabaseError(f"database data path is unsafe: {database.data}") from exc
     generated = private_dir(database.generated)
     for name, text in engine.files(database).items():
-        write_text(generated / name, text, mode=0o600)
+        write_text(generated / name, text, mode=0o640)
     data = {
         "name": database.compose_project,
         "services": engine.services(database),

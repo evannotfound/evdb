@@ -83,12 +83,11 @@ def services(database: Database) -> dict[str, Any]:
     route = service
     if database.settings.pgbouncer.enabled:
         pool = database.service("pgbouncer")
-        uid, gid = _owner(generated)
+        group = _group(generated)
         values[pool] = {
             "image": database.settings.pgbouncer.image,
             "container_name": pool,
             "restart": "unless-stopped",
-            "user": f"{uid}:{gid}",
             "command": ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"],
             "depends_on": [primary],
             "healthcheck": docker.healthcheck(
@@ -98,6 +97,9 @@ def services(database: Database) -> dict[str, Any]:
                 f"{generated / 'pgbouncer.ini'}:/etc/pgbouncer/pgbouncer.ini:ro",
                 f"{generated / 'pgbouncer-users'}:/run/secrets/pgbouncer-users:ro",
             ],
+            "group_add": [str(group)],
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
             "networks": {docker.NETWORK: {"aliases": [pool]}},
         }
         route = values[pool]
@@ -250,9 +252,8 @@ def _check_archive(image: str, archive: Path) -> None:
     )
 
 
-def _owner(path: Path) -> tuple[int, int]:
+def _group(path: Path) -> int:
     current = path
     while not current.exists() and current != current.parent:
         current = current.parent
-    details = current.stat()
-    return details.st_uid, details.st_gid
+    return current.stat().st_gid

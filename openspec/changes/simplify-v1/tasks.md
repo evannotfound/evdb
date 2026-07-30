@@ -82,3 +82,12 @@
 - [x] 8.6 Validate the `simplify-v1` OpenSpec change and run an independent code and terminal UX review with no unresolved findings.
 - [x] 8.7 Before remote reset, obtain explicit approval for disposable Toronto files and confirm the development helper still rejects `montreal-01` before subprocess execution.
 - [x] 8.8 On approved Toronto disposable state only, initialize the absent shared repository, create retained engine roles, prove native health and HTTP, run manual and all-role backups, verify timer activation and remote snapshots, inspect readable errors, and deactivate the development command.
+
+## 9. Unify Host Ownership, Storage, and Installation
+
+- [x] 9.1 Remove `host.data_root`, derive database data at `/var/lib/evdb/databases`, and move generated project and Traefik assets under `/var/lib/evdb` with updated status, fixtures, and tests.
+- [x] 9.2 Reference one configured private host rclone file in place and remove rclone seeding, copying, canonical ownership, and duplicate-path behavior.
+- [x] 9.3 Remove the evdb Unix account and Docker-group setup; make canonical files, runtime directories, direct commands, and the backup service consistently root-owned.
+- [x] 9.4 Preserve private non-root PgBouncer access to root-owned, group-readable generated files and cover the resulting Compose contract with focused unit and disposable-container tests.
+- [x] 9.5 Embed canonical units in one standalone executable, publish raw architecture assets, and atomically install `/usr/local/bin/evdb` without `/opt/evdb`, current/previous links, archives, or development activation.
+- [x] 9.6 Update operator documentation and run focused unit, config, Restic, release, installer, binary, integration, and strict OpenSpec validation without touching production hosts.

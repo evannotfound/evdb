@@ -29,16 +29,16 @@ class Paths:
         return self.config / "secrets.yml"
 
     @property
-    def rclone(self) -> Path:
-        return self.config / "rclone.conf"
-
-    @property
     def projects(self) -> Path:
-        return self.config / "projects"
+        return self.state / "projects"
 
     @property
     def traefik(self) -> Path:
-        return self.config / "traefik"
+        return self.state / "traefik"
+
+    @property
+    def databases(self) -> Path:
+        return self.state / "databases"
 
     @property
     def backups(self) -> Path:
@@ -64,6 +64,7 @@ class Paths:
 @dataclass(frozen=True)
 class BackupSettings:
     repository: str
+    rclone_config: Path
     min_free_gb: int = 5
     max_age_hours: int = 26
 
@@ -79,7 +80,6 @@ class Routing:
 class Host:
     id: str
     domain: str
-    data_root: Path
     backup: BackupSettings
     routing: Routing
 
@@ -209,7 +209,7 @@ class Database:
 
     @property
     def data(self) -> Path:
-        return self.host.data_root / self.project / self.role / "data"
+        return self.paths.databases / self.project / self.role / "data"
 
     @property
     def generated(self) -> Path:

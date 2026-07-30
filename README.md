@@ -32,10 +32,11 @@ curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install
 sudo evdb init
 ```
 
-Initialization creates or validates `/etc/evdb/config.yml`, private `/etc/evdb/secrets.yml`, and
-mutable `/etc/evdb/rclone.conf`. It initializes the host's one Restic repository, including a missing
-rclone-backed path, then enables one persistent randomized daily systemd timer that runs
-`evdb backup create --all`.
+Initialization creates or validates root-owned `/etc/evdb/config.yml` and
+`/etc/evdb/secrets.yml`, uses the supplied private host rclone file in place, and stores generated
+runtime and database data under `/var/lib/evdb`. It initializes the host's one Restic repository,
+including a missing rclone-backed path, then enables one persistent randomized daily systemd timer
+that runs `evdb backup create --all` as root.
 
 On first init, the guided masked Restic password prompt generates a password when left blank. Direct
 init can read one from a private file with `--restic-password-file PATH`; the credential is never

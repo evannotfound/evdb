@@ -3,7 +3,7 @@
 ### Requirement: Safe command execution
 External commands SHALL use argument arrays without `shell=True`, enforce finite timeouts, and check
 return codes. evdb SHALL redact exact credential values loaded from `secrets.yml` and credential fields
-in `rclone.conf`, including required encoded forms, while preserving repository URLs, remote names,
+in the configured external rclone file, including required encoded forms, while preserving repository URLs, remote names,
 paths, images, snapshot IDs, and unrelated stdout or stderr.
 
 #### Scenario: Tool prints a managed credential in an error
@@ -34,7 +34,7 @@ configuration comparison, and full errors until a database is selected or explic
 
 ### Requirement: Host status
 Status SHALL include host identity, running evdb version, Traefik and network health, native listeners,
-free data and backup disk space, one backup timer state, repository availability, and source validation.
+free `/var/lib/evdb` storage, one backup timer state, repository availability, and source validation.
 It SHALL NOT assess machine-state compatibility, tool-version match, generated contract hashes,
 transaction directories, restore state, or maintenance timers.
 
@@ -62,7 +62,7 @@ database health and SHALL NOT evaluate restore-test freshness.
 ### Requirement: Structured status output
 `evdb status --json` SHALL emit one credential-free JSON object containing integer `version`, boolean
 `healthy`, a host object, a databases object keyed by exact project/role, and an errors array. Host
-fields SHALL cover identity, tool version, infrastructure, disks, repository, and the one timer.
+fields SHALL cover identity, tool version, infrastructure, storage, repository, and the one timer.
 Database fields SHALL cover project, role, engine, running, health, configured image, latest backup,
 and bounded error. Output SHALL omit machine state, contract comparison, operation history, restore,
 backup tests, and maintenance units.
@@ -77,7 +77,7 @@ backup tests, and maintenance units.
 
 ### Requirement: Systemd jobs and timer preservation
 The package SHALL include exactly one `evdb-backup.service` and one `evdb-backup.timer`. The service
-SHALL run `evdb backup create --all` as the evdb account with finite timeout and low CPU and I/O
+SHALL run `evdb backup create --all` as root with finite timeout and low CPU and I/O
 priority. The timer SHALL be daily, persistent, randomized, and automatically enabled by `evdb init`.
 Initialization and installer refresh SHALL converge it to loaded, enabled, and active.
 

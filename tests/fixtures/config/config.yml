@@ -1,9 +1,9 @@
 host:
   id: test-01
   domain: storage.example.com
-  data_root: /srv/evdb-test
   backup:
     repository: /tmp/evdb-repository
+    rclone_config: /tmp/evdb-rclone.conf
     min_free_gb: 0
     max_age_hours: 26
   routing:

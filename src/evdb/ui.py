@@ -253,14 +253,12 @@ def _host(value: dict[str, Any], output) -> None:
                     "config": host["source"]["config"],
                     "valid": host["source"]["valid"],
                 },
-                "Disks": {
-                    name: (
-                        f"{item['free_gb']} GiB free ({'ok' if item['ok'] else 'low'})"
-                        if item.get("available", True)
-                        else "unknown"
-                    )
-                    for name, item in host["disks"].items()
-                },
+                "Storage": (
+                    f"{host['storage']['free_gb']} GiB free "
+                    f"({'ok' if host['storage']['ok'] else 'low'})"
+                    if host["storage"].get("available", True)
+                    else "unknown"
+                ),
                 "Listeners": {
                     port: _state(ready, "listening", "missing")
                     for port, ready in infrastructure["listeners"].items()

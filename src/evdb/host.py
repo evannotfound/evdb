@@ -6,17 +6,16 @@ import secrets as random
 import shutil
 import socket
 import stat
-import sys
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
 from . import backup, docker
-from .config import DEFAULT_IMAGES, dns_values, load, protected, reject_legacy, seed_rclone, write
+from .config import DEFAULT_IMAGES, dns_values, load, protected, reject_legacy, write
 from .errors import CommandError, ConfigError, Error, HostError
 from .files import managed_dir, private_line, write_text
 from .lock import operation
-from .models import CONFIG_DIR, STATE_DIR, BackupSettings, Config, Host, Paths, Routing, Secrets
+from .models import CONFIG_DIR, BackupSettings, Config, Host, Paths, Routing, Secrets
 from .run import redact, run
 
 TOOLS = ("docker", "restic", "rclone", "systemctl")
@@ -49,20 +48,17 @@ def initialize(
     _writable(config, Path(unit_dir))
     _require_ports(config)
     with operation(config, write=True, timeout=config.host.timeouts["backup"]):
-        _account(config.paths)
         _directories(config)
         if not existing:
             write(config)
         else:
             _assert_private(config.paths.secrets)
-        seed_rclone(config, (values or {}).get("rclone_config"))
         _source_ownership(config)
         _dns(config)
         docker.ensure_network(timeout=config.host.timeouts["command"])
         _traefik(config)
         backup.initialize(config)
         _install_units(Path(unit_dir))
-        _generated_ownership(config)
         run(["systemctl", "daemon-reload"], timeout=60)
         run(["systemctl", "enable", "--now", BACKUP_TIMER], timeout=120)
     return _wait_status(config)
@@ -86,7 +82,6 @@ def _initial(values: dict[str, Any], paths: Paths) -> Config:
     required = (
         "host_id",
         "domain",
-        "data_root",
         "acme_email",
         "dns_provider",
         "repository",
@@ -101,8 +96,7 @@ def _initial(values: dict[str, Any], paths: Paths) -> Config:
         Host(
             values["host_id"],
             values["domain"],
-            Path(values["data_root"]),
-            BackupSettings(values["repository"], 5, 26),
+            BackupSettings(values["repository"], Path(values["rclone_config"]), 5, 26),
             Routing(values["acme_email"], values["dns_provider"], DEFAULT_IMAGES["traefik"]),
         ),
         (),
@@ -117,7 +111,7 @@ def _initial(values: dict[str, Any], paths: Paths) -> Config:
 
 def _directories(config: Config) -> None:
     try:
-        config_mode = 0o1770 if config.paths.config == CONFIG_DIR else 0o750
+        config_mode = 0o700 if config.paths.config == CONFIG_DIR else 0o750
         for path, mode in (
             (config.paths.config, config_mode),
             (config.paths.projects, 0o700),
@@ -126,7 +120,7 @@ def _directories(config: Config) -> None:
             (config.paths.state, 0o700),
             (config.paths.backups, 0o700),
             (config.paths.locks, 0o700),
-            (config.host.data_root, 0o700),
+            (config.paths.databases, 0o700),
         ):
             managed_dir(path, mode)
     except OSError as exc:
@@ -204,77 +198,10 @@ def _wait_status(config: Config) -> dict[str, Any]:
     return value
 
 
-def _account(paths: Paths, *, docker_group: bool = True) -> tuple[int, int] | None:
-    if paths.config != CONFIG_DIR:
-        return None
-    group = _getent("group")
-    if group is None:
-        run(["groupadd", "--system", "evdb"], timeout=60)
-        group = _getent("group")
-    if group is None or len(group) != 4 or group[0] != "evdb":
-        raise HostError("evdb group entry is missing or malformed")
-    gid = _system_id(group[2], "evdb group")
-    user = _getent("passwd")
-    if user is None:
-        run(
-            [
-                "useradd",
-                "--system",
-                "--gid",
-                "evdb",
-                "--home-dir",
-                str(STATE_DIR),
-                "--shell",
-                "/usr/sbin/nologin",
-                "evdb",
-            ],
-            timeout=60,
-        )
-        user = _getent("passwd")
-    if user is None or len(user) != 7 or user[0] != "evdb":
-        raise HostError("evdb user entry is missing or malformed")
-    uid = _system_id(user[2], "evdb user")
-    primary_gid = _system_id(user[3], "evdb user primary group")
-    if primary_gid != gid:
-        raise HostError("evdb user primary group does not match the evdb group")
-    if user[5] != str(STATE_DIR):
-        raise HostError(f"evdb user home must be {STATE_DIR}")
-    if user[6] not in {"/usr/sbin/nologin", "/sbin/nologin", "/bin/false"}:
-        raise HostError("evdb user must use a non-login shell")
-    if docker_group:
-        run(["usermod", "--append", "--groups", "docker", "evdb"], timeout=60)
-    return uid, gid
-
-
-def _getent(database: str) -> list[str] | None:
-    result = run(["getent", database, "evdb"], timeout=30, check=False)
-    if result.code == 2 and not result.out.strip():
-        return None
-    if result.code != 0:
-        detail = result.err.strip() or result.out.strip() or "no output"
-        raise HostError(f"getent {database} evdb failed: {detail}")
-    lines = result.out.splitlines()
-    if len(lines) != 1 or "\0" in result.out:
-        raise HostError(f"evdb {database} entry is malformed")
-    return lines[0].split(":")
-
-
-def _system_id(value: str, name: str) -> int:
-    if not value.isascii() or not value.isdecimal():
-        raise HostError(f"{name} ID is invalid")
-    number = int(value)
-    if number < 1:
-        raise HostError(f"{name} ID is invalid")
-    return number
-
-
 def _bootstrap_existing(source: Path, paths: Paths) -> None:
     _guard_preload(source, paths)
     _require_safe_canonical_source(source, paths)
-    account = _account(paths, docker_group=False)
-    if account is None:
-        raise HostError("canonical initialization requires the evdb account")
-    _converge_canonical_source(paths, *account)
+    _converge_canonical_source(paths)
 
 
 def _guard_preload(source: Path, paths: Paths) -> None:
@@ -297,19 +224,9 @@ def _require_safe_canonical_source(source: Path, paths: Paths) -> None:
             or (directory.st_mode & 0o020 and not directory.st_mode & stat.S_ISVTX)
         ):
             raise HostError(f"canonical configuration directory is unsafe: {paths.config}")
-        for path, root_owned in (
-            (source, True),
-            (paths.secrets, False),
-            (paths.rclone, False),
-        ):
-            if path == paths.rclone and not path.exists() and not path.is_symlink():
-                continue
+        for path in (source, paths.secrets):
             details = path.lstat()
-            if (
-                not stat.S_ISREG(details.st_mode)
-                or (root_owned and details.st_uid != 0)
-                or details.st_mode & (0o022 if root_owned else 0o077)
-            ):
+            if not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or details.st_mode & 0o077:
                 raise HostError(f"canonical source file is unsafe: {path}")
     except OSError as exc:
         raise HostError(
@@ -317,37 +234,27 @@ def _require_safe_canonical_source(source: Path, paths: Paths) -> None:
         ) from exc
 
 
-def _converge_canonical_source(paths: Paths, uid: int, gid: int) -> None:
+def _converge_canonical_source(paths: Paths) -> None:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     directory = os.open(paths.config, flags | os.O_DIRECTORY)
     try:
         details = os.fstat(directory)
         if not stat.S_ISDIR(details.st_mode) or details.st_uid != 0:
             raise HostError(f"canonical configuration directory is unsafe: {paths.config}")
-        os.fchown(directory, 0, gid)
-        os.fchmod(directory, 0o1770)
-        for name, owner, mode in (
-            ("config.yml", 0, 0o640),
-            ("secrets.yml", uid, 0o600),
-            ("rclone.conf", uid, 0o600),
-        ):
-            try:
-                descriptor = os.open(name, flags, dir_fd=directory)
-            except FileNotFoundError:
-                if name == "rclone.conf":
-                    continue
-                raise
+        os.fchown(directory, 0, 0)
+        os.fchmod(directory, 0o700)
+        for name in ("config.yml", "secrets.yml"):
+            descriptor = os.open(name, flags, dir_fd=directory)
             try:
                 current = os.fstat(descriptor)
-                private = mode == 0o600
                 if (
                     not stat.S_ISREG(current.st_mode)
-                    or (not private and current.st_uid != 0)
-                    or current.st_mode & (0o077 if private else 0o022)
+                    or current.st_uid != 0
+                    or current.st_mode & 0o077
                 ):
                     raise HostError(f"canonical source file is unsafe: {paths.config / name}")
-                os.fchown(descriptor, owner, gid)
-                os.fchmod(descriptor, mode)
+                os.fchown(descriptor, 0, 0)
+                os.fchmod(descriptor, 0o600)
             finally:
                 os.close(descriptor)
     except OSError as exc:
@@ -359,36 +266,18 @@ def _converge_canonical_source(paths: Paths, uid: int, gid: int) -> None:
 def _source_ownership(config: Config) -> None:
     if config.paths.config != CONFIG_DIR:
         return
-    run(["chown", "root:evdb", str(config.paths.config), str(config.paths.source)], timeout=60)
-    run(["chmod", "01770", str(config.paths.config)], timeout=60)
-    run(["chmod", "0640", str(config.paths.source)], timeout=60)
     run(
         [
             "chown",
-            "evdb:evdb",
+            "root:root",
+            str(config.paths.config),
+            str(config.paths.source),
             str(config.paths.secrets),
-            str(config.paths.rclone),
         ],
         timeout=60,
     )
-    run(["chmod", "0600", str(config.paths.secrets), str(config.paths.rclone)], timeout=60)
-
-
-def _generated_ownership(config: Config) -> None:
-    if config.paths.config != CONFIG_DIR:
-        return
-    run(
-        [
-            "chown",
-            "-R",
-            "evdb:evdb",
-            str(config.paths.projects),
-            str(config.paths.traefik),
-            str(config.paths.state),
-        ],
-        timeout=120,
-    )
-    run(["chown", "evdb:evdb", str(config.host.data_root)], timeout=60)
+    run(["chmod", "0700", str(config.paths.config)], timeout=60)
+    run(["chmod", "0600", str(config.paths.source), str(config.paths.secrets)], timeout=60)
 
 
 def _install_units(target: Path) -> None:
@@ -423,10 +312,7 @@ def _install_units(target: Path) -> None:
 
 
 def _units() -> tuple[Path, ...]:
-    if getattr(sys, "frozen", False):
-        root = Path(sys.executable).resolve().parent.parent / "units"
-    else:
-        root = Path(str(files("evdb").joinpath("units")))
+    root = Path(str(files("evdb").joinpath("units")))
     return tuple(sorted((*root.glob("*.service"), *root.glob("*.timer"))))
 
 
@@ -503,7 +389,7 @@ def _env_file(path: Path) -> dict[str, str]:
 
 
 def _writable(config: Config, unit_dir: Path) -> None:
-    roots = (config.paths.config, config.paths.state, config.host.data_root, unit_dir)
+    roots = (config.paths.config, config.paths.state, unit_dir)
     for path in roots:
         current = path
         while True:

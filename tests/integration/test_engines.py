@@ -139,7 +139,7 @@ def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_pat
 def _config(base, tmp_path, projects, secrets) -> Config:
     selected = replace(
         base,
-        host=replace(base.host, data_root=tmp_path / "data"),
+        paths=replace(base.paths, state=tmp_path / "state"),
         projects=projects,
         secrets=replace(base.secrets, projects=secrets),
     )

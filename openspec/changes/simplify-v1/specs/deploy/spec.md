@@ -85,23 +85,23 @@ direct lifecycle and backup commands SHALL execute without a generic `--yes` con
 - **THEN** it fails before writing generated files or invoking Docker, Restic, or systemd
 
 ### Requirement: Production paths
-Canonical evdb source, mutable rclone configuration, generated services, and Traefik assets SHALL live
-under `/etc/evdb`; local backups and locks under `/var/lib/evdb`; managed tool versions under
-`/opt/evdb`; and database data under the configured project-first data root. No deployment machine
-state, activity record, restore staging, or transaction tree SHALL be created.
+Canonical evdb source SHALL live under `/etc/evdb`; generated services, Traefik assets, local backups,
+locks, and fixed database data SHALL live under `/var/lib/evdb`; and the verified tool SHALL be the
+regular executable `/usr/local/bin/evdb`. No copied rclone file, deployment machine state, activity
+record, restore staging, transaction tree, or configurable data root SHALL be created.
 
 #### Scenario: Tool version changes
-- **WHEN** the verified installer changes `/opt/evdb/current`
+- **WHEN** the verified installer atomically replaces `/usr/local/bin/evdb`
 - **THEN** every database continues using stable source, generated, credential, backup, and data paths
 
 ### Requirement: Mutable rclone configuration
-Initialization SHALL copy a provided native rclone file to `/etc/evdb/rclone.conf` only when absent.
-The service account-owned file SHALL remain mutable and SHALL NOT be regenerated from `secrets.yml` or
-overwritten by initialization, database changes, or installer updates.
+Initialization SHALL validate and persist the absolute path of a provided private native rclone file.
+evdb SHALL use that file in place and SHALL NOT copy, replace, chown, or regenerate it from
+`secrets.yml` during initialization, database changes, or installer updates.
 
 #### Scenario: Live OAuth token changed
 - **WHEN** initialization runs after rclone refreshes its token
-- **THEN** `/etc/evdb/rclone.conf` remains byte-for-byte unchanged
+- **THEN** evdb continues using the configured host file without creating another rclone configuration
 
 ### Requirement: Generated Compose and shared routing
 The system SHALL generate independent Compose YAML for every Postgres and KV role plus dedicated

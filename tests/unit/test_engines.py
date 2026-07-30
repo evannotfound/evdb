@@ -27,7 +27,9 @@ def test_postgres_owns_private_files_services_and_pgbouncer_access(config):
     assert '"default" "local-postgres-password"' in files["pgbouncer-users"]
     assert "local-postgres-password" not in text
     pool = services[target.service("pgbouncer")]
-    assert pool["user"] != "0"
+    assert "user" not in pool
+    assert pool["group_add"] == [str(target.generated.stat().st_gid)]
+    assert pool["cap_drop"] == ["ALL"]
     assert "pgbouncer.ini" in " ".join(pool["volumes"])
     assert services[target.service("primary")]["image"] == "postgres:16"
 

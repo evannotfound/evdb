@@ -5,8 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=evdb
-Group=evdb
 ExecStart=/usr/local/bin/evdb backup create --all
 TimeoutStartSec=12h
 Nice=10

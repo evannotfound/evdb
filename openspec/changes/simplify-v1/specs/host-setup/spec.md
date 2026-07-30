@@ -1,20 +1,20 @@
 ## MODIFIED Requirements
 
 ### Requirement: Published exact-version package
-evdb SHALL be distributed as checksummed architecture-specific standalone archives. Initial install
-and configured-host updates SHALL select and verify the exact version embedded in the archive. Each
-archive SHALL expose one `evdb` executable plus the two canonical backup systemd units.
+evdb SHALL be distributed as checksummed architecture-specific standalone executables with the two
+canonical backup systemd units embedded. Initial install and configured-host updates SHALL verify the
+exact version reported by the downloaded executable before activation.
 
 #### Scenario: Operator installs the first host version
 - **WHEN** the public installer downloads and verifies release `1.0.0` for the host architecture
-- **THEN** the selected release exposes one standalone command and the backup service and timer
+- **THEN** `/usr/local/bin/evdb` is one standalone command that can install the embedded service and timer
 
 ### Requirement: Idempotent host setup
-Top-level `sudo evdb init` SHALL validate prerequisites and canonical source, create the service
-account and directories, initialize routing and Traefik, initialize or verify the one Restic repository,
+Top-level `sudo evdb init` SHALL validate prerequisites and canonical source, create root-owned
+directories, initialize routing and Traefik, initialize or verify the one Restic repository,
 install the two systemd units, enable the backup timer, and finish with status. On an existing host it
-SHALL rerun those direct convergence steps without replacing `secrets.yml` values, mutable
-`rclone.conf`, database data, or healthy database Compose projects.
+SHALL rerun those direct convergence steps without replacing `secrets.yml` values, the configured
+external rclone file, database data, or healthy database Compose projects.
 
 #### Scenario: Initialization runs twice
 - **WHEN** an already initialized host runs `evdb init` with unchanged source
@@ -46,38 +46,36 @@ unrelated host packages.
 - **WHEN** the standalone release initializes a host without Python or `uv`
 - **THEN** neither development tool is reported as a missing prerequisite
 
-### Requirement: Least file privilege
-Initialization SHALL create a non-login evdb service account, root-controlled `config.yml`, private
-mode-`0600` `secrets.yml` and `rclone.conf`, service-owned generated and mutable paths, and the backup
-job running as evdb. Docker group access SHALL remain documented as root-equivalent.
+### Requirement: Consistent root ownership
+Canonical host commands and the backup job SHALL run as root. Initialization SHALL create root-owned
+private source, generated, and mutable paths and SHALL NOT create an evdb account or grant Docker-group
+access to another user. Database containers retain their image-specific runtime identities.
 
 #### Scenario: Backup timer starts
 - **WHEN** systemd launches the scheduled backup
-- **THEN** the job runs as evdb with Docker and required evdb file access
+- **THEN** the job runs as root with the same file and rclone identity as direct host commands
 
-### Requirement: Versioned tool installation
-Verified releases SHALL live under `/opt/evdb/versions/<version>`, `current` SHALL select the active
-release, `previous` SHALL identify one prior release after update, and `/usr/local/bin/evdb` SHALL
-resolve through `current`. Source, generated files, credentials, backups, and data SHALL remain outside
-tool versions. No installed application machine state SHALL duplicate the active version.
+### Requirement: Direct tool installation
+The verified release SHALL be one root-owned regular executable at `/usr/local/bin/evdb`. No
+`/opt/evdb`, current or previous link, version directory, or installed application machine state SHALL
+be created. Source, generated files, credentials, backups, and data SHALL remain outside the command.
 
 #### Scenario: Tool version changes
 - **WHEN** the installer changes from 1.0.0 to 1.1.0
 - **THEN** stable database files remain unchanged and new command invocations use 1.1.0
 
-### Requirement: Atomic tool activation and recovery
-The public installer SHALL fully download, verify, and extract a candidate before atomically changing
-`current`; it SHALL retain one previous verified release directory. After selection it SHALL run
-`evdb init --yes` on configured hosts. Initialization failure SHALL be reported directly and SHALL NOT
-trigger a second Python compatibility or rollback transaction.
+### Requirement: Atomic tool activation
+The public installer SHALL fully download and verify a candidate before atomically replacing
+`/usr/local/bin/evdb`. After selection it SHALL run `evdb init --yes` on configured hosts.
+Initialization failure SHALL be reported directly and SHALL NOT trigger an automatic tool rollback.
 
 #### Scenario: Archive validation fails
-- **WHEN** the candidate checksum, layout, or reported version is invalid
-- **THEN** the installer leaves current and previous links unchanged
+- **WHEN** the candidate checksum or reported version is invalid
+- **THEN** the installer leaves the installed executable unchanged
 
 #### Scenario: Post-selection initialization fails
 - **WHEN** the new command cannot refresh configured host assets
-- **THEN** the installer exits nonzero with the initialization error while the previous verified release remains on disk
+- **THEN** the installer exits nonzero with the initialization error while the verified new executable remains installed
 
 ### Requirement: Tool updates do not deploy databases
 Installer-driven updates and their `evdb init --yes` refresh SHALL NOT rewrite project source,

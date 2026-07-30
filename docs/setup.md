@@ -37,41 +37,39 @@ The anonymous installer works after the repository and its GitHub Releases are p
 first public release, download and inspect the matching release assets through authenticated GitHub
 access rather than piping a private URL.
 
-The installer detects ARM64 or x86_64, downloads the matching archive and SHA-256 file, rejects an
-unexpected archive layout, and confirms that `evdb --version` matches the selected release. It stages
-the complete version before changing managed links. Release assets use the stable names
-`evdb_linux_arm64.tar.gz` and `evdb_linux_amd64.tar.gz`.
+The installer detects ARM64 or x86_64, downloads the matching executable and SHA-256 file, and confirms
+that `evdb --version` matches the selected release before atomically replacing
+`/usr/local/bin/evdb`. Release assets use the stable names `evdb_linux_arm64` and
+`evdb_linux_amd64`.
 
 ## Initialize
 
 `sudo evdb init` opens a guided session when canonical source is absent. It collects or accepts the
-host identity, data root, routing settings, one Restic repository, DNS credentials, Restic password,
-and an initial native rclone configuration.
+host identity, routing settings, one Restic repository, DNS credentials, Restic password, and the
+absolute path of a private native rclone configuration.
 
 The guided Restic password prompt is masked; leaving it blank generates a password. Direct first init
 may use `--restic-password-file PATH`. The file must be a readable, non-symlinked regular file with no
 group or other permissions and exactly one non-empty UTF-8 line; one trailing LF is allowed. evdb has
 no inline or environment Restic password input and does not print the supplied or generated value.
 
-Initialization creates the non-login `evdb` service account and canonical files:
+Initialization creates the root-owned canonical files:
 
 ```text
 /etc/evdb/config.yml
 /etc/evdb/secrets.yml
-/etc/evdb/rclone.conf
 ```
 
-Canonical `/etc/evdb` is `root:evdb` mode `01770`. `config.yml` is `root:evdb` mode `0640`;
-`secrets.yml` and `rclone.conf` are `evdb:evdb` mode `0600`. The sticky, group-writable directory lets
-rclone atomically persist its evdb-owned OAuth state without allowing the service account to replace
-the root-owned configuration file.
+Canonical `/etc/evdb` is `root:root` mode `0700`; both files are `root:root` mode `0600`. Generated
+Compose, Traefik, backup, lock, and database files live below `/var/lib/evdb`. evdb validates the
+configured root-owned rclone file and uses it in place without copying or changing it.
 
 It creates required directories, converges the dedicated Docker network and Traefik project,
 initializes or verifies the one Restic repository, installs exactly `evdb-backup.service` and
-`evdb-backup.timer`, enables the timer with `systemctl enable --now`, and finishes with `evdb status`.
+`evdb-backup.timer`, enables the root-run timer with `systemctl enable --now`, and finishes with `evdb status`.
 Restic through rclone creates a configured missing repository path during initialization.
 
-Initialization is rerunnable. Repeated runs preserve existing credentials, mutable rclone OAuth state,
+Initialization is rerunnable. Repeated runs preserve existing credentials, external rclone OAuth state,
 database source, generated role files, and data, and do not restart healthy database projects. Once
 `config.yml` exists, init always uses the Restic password already in `secrets.yml`;
 `--restic-password-file` has no effect and its path is not read.
@@ -85,55 +83,46 @@ curl -fsSL https://github.com/evannotfound/evdb/releases/download/v1.3.0/install
   | sudo sh -s -- 1.3.0
 ```
 
-When `/etc/evdb/config.yml` and a managed current release already exist, the installer verifies and
-selects the requested release, records the prior release as `previous`, and invokes
-`evdb init --yes`. That refresh may update Traefik and the two packaged backup units from unchanged
+When `/etc/evdb/config.yml` and `/usr/local/bin/evdb` already exist, the installer verifies and
+atomically installs the requested executable, then invokes `evdb init --yes`. That refresh may update
+Traefik and the two embedded backup units from unchanged
 host source. It does not rewrite project settings or credentials, regenerate database Compose, change
 images or data, or restart database roles.
 
-If post-selection initialization fails, the installer exits nonzero with the direct error. The
-selected release and the prior verified release remain on disk so the operator can correct source and
-rerun initialization or the installer.
+If post-selection initialization fails, the installer exits nonzero with the direct error and leaves
+the verified selected executable installed so the operator can correct source and rerun initialization
+or the installer. Automatic tool rollback is outside v1.
 
-## Version layout
+## Installed command
 
-Each release archive contains exactly one standalone executable and two systemd units:
-
-```text
-bin/evdb
-units/evdb-backup.service
-units/evdb-backup.timer
-```
-
-Installation places that archive in the versioned tool layout:
+Each release is one standalone executable with the two systemd unit templates embedded. Installation
+creates one regular file:
 
 ```text
-/opt/evdb/versions/<version>/
-/opt/evdb/current -> versions/<version>
-/opt/evdb/previous -> versions/<previous-version>
-/usr/local/bin/evdb -> /opt/evdb/current/bin/evdb
+/usr/local/bin/evdb
 ```
 
-Configuration, generated files, credentials, local backups, and database data remain outside tool
-versions.
+Configuration, generated files, credentials, local backups, and database data remain outside the
+executable.
 
 ## Release trust
 
 Semantic-version tags build native ARM64 and x86_64 executables on Ubuntu 22.04 GitHub-hosted runners.
 The release workflow runs repository checks, verifies the tag against `evdb --version`, smoke-tests
-both executables, packages the two canonical units, publishes SHA-256 files, and records GitHub
+both executables and their embedded canonical units, publishes SHA-256 files, and records GitHub
 artifact attestations before creating the release.
 
-Checksums protect installation from corrupted or substituted archive content within the GitHub Release
+Checksums protect installation from corrupted or substituted executable content within the GitHub Release
 channel. Artifact attestations let operators inspect which workflow and source revision produced an
-archive. The repository and release account remain the trust root.
+asset. The repository and release account remain the trust root.
 
 ## Development boundary
 
 Repository development uses `uv sync --locked`, Ruff, pytest, disposable containers, temporary host
 paths, and local Restic repositories. Development never runs deployment, Restic, Docker, cron, or
 systemd changes on `montreal-01`. Operator commands use `/etc/evdb/config.yml`,
-`/etc/evdb/secrets.yml`, and `/etc/evdb/rclone.conf`; alternate paths are test inputs only.
+`/etc/evdb/secrets.yml`, the configured host rclone file, and `/var/lib/evdb`; alternate paths are test
+inputs only.
 
 ### Disposable VPS development
 
@@ -167,16 +156,6 @@ commands require host access; sudo credentials are entered remotely and never pl
 arguments. Each command resyncs and starts a fresh process with the checkout environment first on
 PATH. No persistent shell profile is changed.
 
-For a bounded systemd test window, activation changes only the stable command symlink used by the
-units. `/opt/evdb/current` remains untouched:
-
-```sh
-uv run python tools/dev_vps.py toronto-01 /srv/evdb-dev activate
-# Run the approved disposable-host checks.
-uv run python tools/dev_vps.py toronto-01 /srv/evdb-dev deactivate
-```
-
-Activation points `/usr/local/bin/evdb` at `/srv/evdb-dev/.venv/bin/evdb`; deactivation points it back
-to `/opt/evdb/current/bin/evdb`. Do not run the release installer while development activation is
-active because configured-host updates invoke the stable command. Rerun an interrupted sync directly.
-Always deactivate after a failed or completed systemd test window.
+The helper always invokes the checkout executable explicitly and never replaces
+`/usr/local/bin/evdb`. Release-level systemd checks use the installed release rather than temporarily
+activating development source.

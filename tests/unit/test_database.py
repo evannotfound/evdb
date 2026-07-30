@@ -1,10 +1,8 @@
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-import evdb.config as config_module
 from evdb import backup, database
 from evdb.config import load, write
 from evdb.errors import CommandError, DatabaseError
@@ -119,17 +117,12 @@ def test_kv_info_reports_public_and_loopback_http_endpoints(config, monkeypatch)
 def test_add_reloads_under_write_lock_and_preserves_concurrent_source(config, monkeypatch):
     calls = _runtime(monkeypatch)
     monkeypatch.setattr(database.random, "token_urlsafe", lambda size: "generated")
-    concurrent = config.__class__(
-        config.host.__class__(
-            config.host.id,
-            config.host.domain,
-            config.host.data_root,
-            config.host.backup.__class__(config.host.backup.repository, 0, 48),
-            config.host.routing,
+    concurrent = replace(
+        config,
+        host=replace(
+            config.host,
+            backup=replace(config.host.backup, max_age_hours=48),
         ),
-        config.projects,
-        config.secrets,
-        config.paths,
     )
     write(concurrent, secrets=False)
 
@@ -143,17 +136,12 @@ def test_add_reloads_under_write_lock_and_preserves_concurrent_source(config, mo
 def test_configure_reloads_under_write_lock_and_preserves_concurrent_source(config, monkeypatch):
     calls = _runtime(monkeypatch)
     stale = config.select("app-test-01/kv")
-    concurrent = config.__class__(
-        config.host.__class__(
-            config.host.id,
-            config.host.domain,
-            config.host.data_root,
-            config.host.backup.__class__(config.host.backup.repository, 0, 48),
-            config.host.routing,
+    concurrent = replace(
+        config,
+        host=replace(
+            config.host,
+            backup=replace(config.host.backup, max_age_hours=48),
         ),
-        config.projects,
-        config.secrets,
-        config.paths,
     )
     write(concurrent, secrets=False)
 
@@ -246,42 +234,26 @@ def test_existing_or_unchanged_role_does_not_succeed_when_unhealthy(config, monk
 def test_canonical_database_mutation_preserves_source_owner(config, monkeypatch):
     uid = config.paths.source.stat().st_uid
     gid = config.paths.source.stat().st_gid
-    canonical = replace(
-        config,
-        host=replace(config.host, data_root=Path("/srv/evdb-test")),
-    )
-    config.paths.config.chmod(0o1770)
-    monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
-    monkeypatch.setattr(
-        config_module.pwd,
-        "getpwnam",
-        lambda name: SimpleNamespace(pw_uid=uid),
-    )
-    monkeypatch.setattr(
-        config_module.grp,
-        "getgrnam",
-        lambda name: SimpleNamespace(gr_gid=gid),
-    )
-    write(canonical)
+    write(config)
     calls = _runtime(monkeypatch)
     monkeypatch.setattr(database, "render", lambda *args: None)
-    target = canonical.select("app-test-01/kv")
+    target = config.select("app-test-01/kv")
 
     database.configure(
-        canonical,
+        config,
         target,
         {"http_connections": target.settings.http.connections + 1},
     )
 
     details = config.paths.source.stat()
-    assert (details.st_uid, details.st_gid, details.st_mode & 0o777) == (uid, gid, 0o640)
+    assert (details.st_uid, details.st_gid, details.st_mode & 0o777) == (uid, gid, 0o600)
     assert len(calls) == 1
 
 
 @pytest.mark.parametrize("component", ["project", "role", "data"])
 def test_render_rejects_symlinked_data_components(config, tmp_path, monkeypatch, component):
     target = config.select("app-test-01/kv")
-    root = config.host.data_root
+    root = config.paths.databases
     root.mkdir(parents=True, exist_ok=True)
     outside = tmp_path / f"outside-{component}"
     if component == "project":

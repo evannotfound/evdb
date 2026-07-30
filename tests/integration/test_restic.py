@@ -13,7 +13,7 @@ from evdb import backup
 def test_missing_rclone_local_repository_is_initialized_without_mkdir(config, tmp_path):
     root = tmp_path / "remote"
     repository = root / "initially-absent/repository"
-    config.paths.rclone.write_text("[local]\ntype = local\n")
+    config.host.backup.rclone_config.write_text("[local]\ntype = local\n")
     config = replace(
         config,
         host=replace(
