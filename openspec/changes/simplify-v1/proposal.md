@@ -11,7 +11,8 @@ one Ubuntu host, run configured database containers reliably, and create automat
   state with root-owned `/etc/evdb/config.yml` and `/etc/evdb/secrets.yml`; use a configured native
   rclone file in place rather than copying it into evdb storage.
 - **BREAKING** Run the host-local command and backup unit as root without an evdb service account,
-  store all generated and mutable runtime files under `/var/lib/evdb`, and fix database data at
+  but run Restic and its rclone child as the non-root owner of the configured native rclone file.
+  Store runtime files under `/var/lib/evdb` and fix database data at
   `/var/lib/evdb/databases/<project>/<role>/data` without a configurable data root.
 - **BREAKING** Remove live restore, isolated backup testing, remote retention, prune, repository checks,
   safety backups, operation transactions, automatic rollback, drift contracts, and their commands,

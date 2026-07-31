@@ -33,10 +33,11 @@ sudo evdb init
 ```
 
 Initialization creates or validates root-owned `/etc/evdb/config.yml` and
-`/etc/evdb/secrets.yml`, uses the supplied private host rclone file in place, and stores generated
-runtime and database data under `/var/lib/evdb`. It initializes the host's one Restic repository,
-including a missing rclone-backed path, then enables one persistent randomized daily systemd timer
-that runs `evdb backup create --all` as root.
+`/etc/evdb/secrets.yml`, uses a supplied private non-root user's native rclone file in place, and stores
+generated runtime and database data under `/var/lib/evdb`. It initializes the host's one Restic
+repository, including a missing rclone-backed path, then enables one persistent randomized daily
+systemd timer. The service runs backup creation as root and drops only Restic and rclone to the rclone
+file owner.
 
 On first init, the guided masked Restic password prompt generates a password when left blank. Direct
 init can read one from a private file with `--restic-password-file PATH`; the credential is never

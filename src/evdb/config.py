@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import configparser
 import json
+import os
+import pwd
 import re
 import stat
 from dataclasses import replace
@@ -20,6 +22,7 @@ from .models import (
     BackupSettings,
     Config,
     Host,
+    Operator,
     Paths,
     PgBouncer,
     Postgres,
@@ -250,13 +253,13 @@ def protected(config: Config) -> tuple[str, ...]:
 
 
 def _rclone_credentials(path: Path) -> list[str]:
-    if not path.exists() and not path.is_symlink():
+    opened = _open_rclone(path, missing_ok=True)
+    if opened is None:
         return []
-    if path.is_symlink() or not path.is_file():
-        raise ConfigError(f"rclone configuration is unsafe: {path}")
+    descriptor, _details = opened
     parser = configparser.RawConfigParser(interpolation=None)
     try:
-        with path.open(encoding="utf-8") as source:
+        with os.fdopen(descriptor, encoding="utf-8") as source:
             parser.read_file(source)
     except (configparser.Error, OSError, UnicodeError) as exc:
         raise ConfigError(f"invalid rclone configuration: {path}") from exc
@@ -379,7 +382,7 @@ def require_valid(config: Config) -> None:
     if re.search(r"://[^/@\s]+@", host.backup.repository):
         errors.append("host.backup.repository must not contain credentials")
     try:
-        _require_rclone(host.backup.rclone_config, canonical=config.paths.config == CONFIG_DIR)
+        rclone_owner(host.backup.rclone_config)
     except ConfigError as exc:
         errors.append(str(exc))
     if type(host.backup.min_free_gb) is not int or host.backup.min_free_gb < 0:
@@ -614,17 +617,86 @@ def _source_owners(paths: Paths) -> tuple[tuple[int, int] | None, tuple[int, int
     return (0, 0), (0, 0)
 
 
-def _require_rclone(path: Path, *, canonical: bool) -> None:
-    if not path.is_absolute() or path != path.resolve(strict=False):
+def rclone_owner(path: Path) -> Operator:
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError("host.backup.rclone_config must be a normalized absolute path") from exc
+    if not path.is_absolute() or path != resolved:
         raise ConfigError("host.backup.rclone_config must be a normalized absolute path")
-    if path.is_symlink() or not path.is_file():
-        raise ConfigError(f"rclone configuration is missing or unsafe: {path}")
-    details = path.stat()
-    if details.st_mode & 0o077:
+    descriptor, details = _open_rclone(path)
+    os.close(descriptor)
+    if stat.S_IMODE(details.st_mode) != 0o600:
         raise ConfigError(f"rclone configuration must have mode 0600: {path}")
-    parent = path.parent.stat()
-    if canonical and (details.st_uid != 0 or parent.st_uid != 0 or parent.st_mode & 0o022):
-        raise ConfigError(f"rclone configuration must be root-controlled: {path}")
+    if details.st_uid == 0:
+        raise ConfigError(f"rclone configuration must be owned by a non-root user: {path}")
+    try:
+        account = pwd.getpwuid(details.st_uid)
+    except KeyError as exc:
+        raise ConfigError(f"rclone configuration owner is unknown: {path}") from exc
+    home = Path(account.pw_dir)
+    try:
+        resolved_home = home.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(f"rclone configuration owner has an unsafe home: {home}") from exc
+    if not home.is_absolute() or home != resolved_home:
+        raise ConfigError(f"rclone configuration owner has an unsafe home: {home}")
+    try:
+        home_details = home.lstat()
+        parent = path.parent.lstat()
+    except OSError as exc:
+        raise ConfigError(
+            f"rclone configuration owner has an unsafe home or parent: {path}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(home_details.st_mode)
+        or home_details.st_uid != account.pw_uid
+        or home_details.st_mode & 0o022
+    ):
+        raise ConfigError(f"rclone configuration owner has an unsafe home: {home}")
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != account.pw_uid
+        or parent.st_mode & 0o022
+        or parent.st_mode & 0o300 != 0o300
+    ):
+        raise ConfigError(
+            f"rclone configuration parent must be safely user-writable: {path.parent}"
+        )
+    for current in dict.fromkeys((*path.parent.parents, *home.parents)):
+        try:
+            ancestor = current.lstat()
+        except OSError as exc:
+            raise ConfigError(f"rclone configuration has an unsafe ancestor: {current}") from exc
+        shared = ancestor.st_uid == 0 and ancestor.st_mode & stat.S_ISVTX
+        if not stat.S_ISDIR(ancestor.st_mode) or (ancestor.st_mode & 0o022 and not shared):
+            raise ConfigError(f"rclone configuration has an unsafe ancestor: {current}")
+    try:
+        groups = tuple(
+            sorted(set(os.getgrouplist(account.pw_name, account.pw_gid)) - {account.pw_gid})
+        )
+    except OSError as exc:
+        raise ConfigError(f"rclone configuration owner groups are unavailable: {path}") from exc
+    return Operator(account.pw_uid, account.pw_gid, account.pw_name, home, groups)
+
+
+def _open_rclone(path: Path, *, missing_ok: bool = False) -> tuple[int, os.stat_result] | None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ConfigError(f"rclone configuration is missing or unsafe: {path}") from None
+    except OSError as exc:
+        raise ConfigError(f"rclone configuration is missing or unsafe: {path}") from exc
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ConfigError(f"rclone configuration is missing or unsafe: {path}")
+        return descriptor, details
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _unsafe_directory(path: Path) -> Path | None:

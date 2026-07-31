@@ -45,11 +45,12 @@ def hash(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def require_file(path: str | Path) -> Path:
+def require_file(path: str | Path, *, mode: int | None = 0o600) -> Path:
     file_path = Path(path)
     if not file_path.is_file() or file_path.stat().st_size == 0:
         raise BackupError(f"file is missing or empty: {file_path}")
-    file_path.chmod(0o600)
+    if mode is not None:
+        file_path.chmod(mode)
     return file_path
 
 
@@ -71,8 +72,14 @@ def private_line(value: str | Path) -> str:
     return text
 
 
-def write_json(path: str | Path, data: Any, *, mode: int = 0o600) -> None:
-    write_text(path, json.dumps(data, sort_keys=True, indent=2) + "\n", mode=mode)
+def write_json(
+    path: str | Path,
+    data: Any,
+    *,
+    mode: int = 0o600,
+    owner: tuple[int, int] | None = None,
+) -> None:
+    write_text(path, json.dumps(data, sort_keys=True, indent=2) + "\n", mode=mode, owner=owner)
 
 
 def write_text(

@@ -19,6 +19,12 @@ SHA-256 checks, and a valid `backup.json`; only then is the folder renamed. The 
 host, project, role, concrete engine, configured image, engine version, format, timestamps, purpose,
 files, checks, hashes, and upload state.
 
+Partial folders and files are root-owned mode `0700` and `0600`. After validation, completed
+directories become mode `0500` and regular files mode `0400` under the owner of the configured rclone
+file. Root-owned traverse-only backup ancestors let that user read a known completed path without
+listing backup directories or reaching root-only database data. These modes prevent accidental writes;
+because the completed tree is user-owned, they do not make it immutable against that owner.
+
 Postgres stores globals and one custom archive for every connectable non-template database. Redis
 waits for a successful new BGSAVE and checks the RDB. Dragonfly creates one uniquely named native
 DFS generation, copies its summary and every numbered shard, and removes only those temporary
@@ -30,6 +36,10 @@ source files. Backup records contain bounded facts and hashes, not credentials.
 role, concrete engine, backup, and purpose tags. `evdb init` checks that repository and initializes a
 missing format-v1 repository through rclone before enabling automatic backups. Restic creates an
 absent remote path as part of initialization; no separate remote-directory command is required.
+Every repository operation runs as the rclone configuration owner, and Restic launches
+`/usr/bin/rclone` under that same identity. Manual rclone and evdb therefore share one mutable OAuth
+configuration. Simultaneous manual and scheduled token refreshes can still race, but no second config
+can diverge.
 
 `backup list` merges valid local folders and matching tagged Restic snapshots in reverse chronological
 order. Each item shows purpose, local and remote availability, backup ID, and snapshot ID. A

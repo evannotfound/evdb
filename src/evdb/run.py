@@ -53,24 +53,36 @@ def run(
     stdout: IO[bytes] | None = None,
     secrets: Sequence[str] = (),
     check: bool = True,
+    user: int | None = None,
+    group: int | None = None,
+    extra_groups: Sequence[int] | None = None,
+    replace_env: bool = False,
+    pass_fds: Sequence[int] = (),
 ) -> Result:
     command = tuple(str(item) for item in args)
     if not command:
         raise CommandError("empty command")
-    command_env = os.environ.copy()
+    command_env = {} if replace_env else os.environ.copy()
     if env:
         command_env.update({str(key): str(value) for key, value in env.items()})
     input_data = input.encode() if isinstance(input, str) else input
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=command_env,
-            stdin=subprocess.PIPE if input_data is not None else None,
-            stdout=stdout if stdout is not None else subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        options = {
+            "cwd": cwd,
+            "env": command_env,
+            "stdin": subprocess.PIPE if input_data is not None else None,
+            "stdout": stdout if stdout is not None else subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "start_new_session": True,
+            "pass_fds": tuple(pass_fds),
+        }
+        if user is not None:
+            options["user"] = user
+        if group is not None:
+            options["group"] = group
+        if extra_groups is not None:
+            options["extra_groups"] = tuple(extra_groups)
+        process = subprocess.Popen(command, **options)
     except OSError as exc:
         safe = redact(" ".join(command), secrets)
         raise CommandError(f"command failed to start: {safe}: {exc}") from exc

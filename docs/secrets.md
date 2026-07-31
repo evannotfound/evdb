@@ -11,9 +11,15 @@ receives a password file and PgBouncer users file. Redis receives private native
 Dragonfly receives private flags, and HTTP-enabled KV receives a token and environment file. Generated
 Compose references private paths without embedding credential content.
 
-The native rclone configuration remains at the private root-owned path recorded in
-`host.backup.rclone_config`. evdb passes that path to Restic and never copies, replaces, chowns, or
-regenerates it. Direct and scheduled commands both run as root, so OAuth refreshes retain one owner.
+The native rclone configuration remains at the private non-root user-owned path recorded in
+`host.backup.rclone_config`. evdb never copies, replaces, chowns, or regenerates it. Direct and
+scheduled backup orchestration runs as root, but every Restic operation and its rclone child run as the
+file owner with that user's home, groups, canonical rclone path, and `~/.cache/restic`. OAuth refreshes
+therefore remain available to normal manual rclone use.
+
+evdb passes the Restic repository password through an inherited Linux memory-file descriptor. The
+password is absent from arguments, the sanitized child environment, and persistent operator-readable
+files; the descriptor is closed when the Restic operation ends.
 
 Credential values never belong in command arguments. Postgres creation may read the initial `default`
 user password from `--password-file` or a masked guided prompt. Password files must be regular,

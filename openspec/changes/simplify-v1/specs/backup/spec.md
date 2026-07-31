@@ -36,6 +36,21 @@ repository lock, and every external command SHALL have a finite timeout.
 - **WHEN** a backup reaches Restic while another role is uploading
 - **THEN** it waits for the repository lock or fails clearly after the lock timeout
 
+### Requirement: Backup ownership handoff
+Backup creation SHALL keep partial directories and their files root-owned and private. After engine and
+manifest validation, evdb SHALL make each completed directory and its regular files owned and readable
+but not writable by the configured rclone owner before invoking Restic. Root-owned traverse-only backup
+ancestors SHALL permit access to a known completed path without permitting directory listing or access
+to database data, generated files, Traefik state, or locks.
+
+#### Scenario: Checked backup reaches upload
+- **WHEN** root completes and validates a partial backup
+- **THEN** its completed directories are operator-owned mode `0500`, its files are operator-owned mode `0400`, and Restic can read it without database-data access
+
+#### Scenario: Upload fails
+- **WHEN** dropped Restic cannot upload a handed-off completed backup
+- **THEN** the operator-readable local folder remains read-only with an unconfirmed upload record
+
 ### Requirement: Direct database backup
 `evdb backup create PROJECT/ROLE` SHALL run the selected durable database's checked engine backup and
 upload it to the configured host repository. `evdb backup create --all` SHALL run the same operation

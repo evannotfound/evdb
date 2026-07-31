@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
@@ -33,6 +34,8 @@ def test_checked_backup_manifest_upload_and_local_cleanup(config, monkeypatch):
     _ready(config, target)
     monkeypatch.setattr(backup, "get", lambda engine: Engine)
     uploaded = []
+    handed = []
+    monkeypatch.setattr(backup, "_handoff", lambda folder, owner: handed.append((folder, owner)))
     monkeypatch.setattr(
         backup,
         "_upload",
@@ -46,14 +49,47 @@ def test_checked_backup_manifest_upload_and_local_cleanup(config, monkeypatch):
     assert record["checks"] == ["size", "sha256", "postgres"]
     assert record["upload"]["snapshot"] == "snapshot-1"
     assert uploaded == [backup.Path(value["folder"])]
+    assert [folder for folder, _owner in handed] == [
+        backup.Path(value["folder"]),
+        backup.Path(value["folder"]),
+    ]
+    folder = backup.Path(value["folder"])
+    assert config.paths.state.stat().st_mode & 0o777 == 0o711
+    assert config.paths.backups.stat().st_mode & 0o777 == 0o711
+    assert folder.parent.stat().st_mode & 0o777 == 0o711
     assert "verification" not in json.dumps(record).lower()
     assert "machine" not in json.dumps(record).lower()
+
+
+def test_completed_backup_handoff_is_recursive_and_rejects_symlinks(config, tmp_path):
+    operator = backup.rclone_owner(config.host.backup.rclone_config)
+    folder = tmp_path / "complete"
+    nested = folder / "nested"
+    nested.mkdir(parents=True)
+    (folder / "data.bin").write_bytes(b"data")
+    (nested / "part.bin").write_bytes(b"part")
+
+    backup._handoff(folder, operator)
+
+    assert folder.stat().st_mode & 0o777 == 0o500
+    assert nested.stat().st_mode & 0o777 == 0o500
+    assert all(path.stat().st_mode & 0o777 == 0o400 for path in folder.rglob("*.bin"))
+    assert all(
+        path.stat().st_uid == operator.uid for path in (folder, nested, *folder.rglob("*.bin"))
+    )
+
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir()
+    (unsafe / "linked").symlink_to(folder / "data.bin")
+    with pytest.raises(BackupError, match="cannot be handed"):
+        backup._handoff(unsafe, operator)
 
 
 def test_upload_failure_keeps_complete_local_folder(config, monkeypatch):
     target = config.select("app-test-01/postgres")
     _ready(config, target)
     monkeypatch.setattr(backup, "get", lambda engine: Engine)
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
     monkeypatch.setattr(
         backup,
         "_upload",
@@ -157,29 +193,56 @@ def test_repository_missing_exit_initializes_format_one_and_verifies(config, mon
     assert not any(call[:2] == ["rclone", "mkdir"] for call in calls)
 
 
-def test_restic_uses_private_password_file_without_secret_argv_or_environment(config, monkeypatch):
+def test_restic_uses_operator_identity_and_memory_password_descriptor(config, monkeypatch):
     seen = {}
 
     def run(args, **kwargs):
         password_path = args[args.index("--password-file") + 1]
+        descriptor = kwargs["pass_fds"][0]
+        details = os.fstat(descriptor)
         seen.update(
             args=args,
             env=kwargs["env"],
             password_path=password_path,
+            descriptor=descriptor,
+            descriptor_mode=details.st_mode & 0o777,
+            descriptor_owner=(details.st_uid, details.st_gid),
             password=backup.Path(password_path).read_text(),
+            kwargs=kwargs,
         )
         return Result(tuple(args), 0, '{"version":1}\n', "")
 
     monkeypatch.setattr(backup, "run", run)
+    monkeypatch.setattr(backup.os, "geteuid", lambda: 0)
 
     result = backup._restic(config, ["cat", "config"])
 
     assert result.code == 0
     assert seen["password"] == config.secrets.restic_password + "\n"
+    owner = backup.rclone_owner(config.host.backup.rclone_config)
+    assert seen["descriptor_mode"] == 0o400
+    assert seen["descriptor_owner"] == (owner.uid, owner.gid)
+    assert seen["password_path"] == f"/proc/self/fd/{seen['descriptor']}"
+    assert seen["args"][0] == "/usr/bin/restic"
+    assert "rclone.program=/usr/bin/rclone" in seen["args"]
     assert config.secrets.restic_password not in seen["args"]
     assert config.secrets.restic_password not in seen["env"].values()
     assert "RESTIC_PASSWORD" not in seen["env"]
-    assert not backup.Path(seen["password_path"]).exists()
+    assert seen["env"] == {
+        "HOME": str(backup.rclone_owner(config.host.backup.rclone_config).home),
+        "USER": backup.rclone_owner(config.host.backup.rclone_config).name,
+        "LOGNAME": backup.rclone_owner(config.host.backup.rclone_config).name,
+        "RCLONE_CONFIG": str(config.host.backup.rclone_config),
+        "RESTIC_CACHE_DIR": str(
+            backup.rclone_owner(config.host.backup.rclone_config).home / ".cache/restic"
+        ),
+    }
+    assert seen["kwargs"]["replace_env"] is True
+    assert seen["kwargs"]["user"] == owner.uid
+    assert seen["kwargs"]["group"] == owner.gid
+    assert seen["kwargs"]["extra_groups"] == owner.groups
+    with pytest.raises(OSError):
+        os.fstat(seen["descriptor"])
 
 
 def test_create_all_redacts_exact_and_encoded_credentials(config, monkeypatch):
@@ -210,6 +273,7 @@ def test_cleanup_counts_only_valid_matching_uploaded_manifests(config, monkeypat
     clean = backup._clean
     monkeypatch.setattr(backup, "get", lambda engine: Engine)
     monkeypatch.setattr(backup, "_upload", lambda *args: "snapshot")
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
     monkeypatch.setattr(backup, "_clean", lambda *args, **kwargs: None)
     root = config.paths.role_backups(target.project, target.role)
     folders = []
@@ -238,6 +302,7 @@ def test_matched_remote_snapshot_time_drives_history_and_freshness(config, monke
     target = config.select("app-test-01/postgres")
     _ready(config, target)
     monkeypatch.setattr(backup, "get", lambda engine: Engine)
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
     monkeypatch.setattr(backup, "_upload", lambda *args: "snapshot-after-long-upload")
     created = backup.create(config, target)
     record = backup.manifest_read(created["folder"])

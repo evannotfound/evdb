@@ -15,6 +15,7 @@ from evdb.config import (
     dump_secrets,
     load,
     protected,
+    rclone_owner,
     reject_legacy,
     require_valid,
     validate_image,
@@ -292,12 +293,75 @@ def test_rclone_path_must_be_private_regular_and_external(config, tmp_path):
         require_valid(config)
 
 
+@pytest.mark.parametrize("mode", [0o400, 0o640, 0o601])
+def test_rclone_path_requires_exact_0600(config, mode):
+    config.host.backup.rclone_config.chmod(mode)
+
+    with pytest.raises(ConfigError, match="mode 0600"):
+        require_valid(config)
+
+
+def test_rclone_owner_derives_current_account_and_groups(config):
+    owner = rclone_owner(config.host.backup.rclone_config)
+
+    assert owner.uid == os.getuid()
+    assert owner.gid == os.getgid()
+    assert owner.name
+    assert owner.home.is_dir()
+    assert owner.gid not in owner.groups
+
+
+def test_rclone_path_rejects_root_owner(config, monkeypatch):
+    real_fstat = config_module.os.fstat
+
+    def root_fstat(descriptor):
+        details = real_fstat(descriptor)
+        values = list(details)
+        values[4] = 0
+        return os.stat_result(values)
+
+    monkeypatch.setattr(config_module.os, "fstat", root_fstat)
+
+    with pytest.raises(ConfigError, match="non-root"):
+        require_valid(config)
+
+
+def test_rclone_path_rejects_unknown_owner(config, monkeypatch):
+    monkeypatch.setattr(
+        config_module.pwd,
+        "getpwuid",
+        lambda uid: (_ for _ in ()).throw(KeyError(uid)),
+    )
+
+    with pytest.raises(ConfigError, match="owner is unknown"):
+        require_valid(config)
+
+
+def test_rclone_path_rejects_unsafe_mutable_parent(config):
+    parent = config.host.backup.rclone_config.parent
+    parent.chmod(0o770)
+
+    with pytest.raises(ConfigError, match="parent.*user-writable"):
+        require_valid(config)
+
+
+def test_rclone_credential_read_does_not_follow_symlink(config, tmp_path):
+    rclone = config.host.backup.rclone_config
+    target = tmp_path / "target.conf"
+    target.write_text("[remote]\ntoken = must-not-be-read\n")
+    target.chmod(0o600)
+    rclone.unlink()
+    rclone.symlink_to(target)
+
+    with pytest.raises(ConfigError, match="missing or unsafe"):
+        protected(config)
+
+
 def test_canonical_atomic_writes_apply_final_owners_before_replace(config, monkeypatch):
     current_uid = os.getuid()
     current_gid = os.getgid()
     selected = config
     monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
-    monkeypatch.setattr(config_module, "_require_rclone", lambda *args, **kwargs: None)
     real_fchown = files_module.os.fchown
     owners = []
 
@@ -320,7 +384,6 @@ def test_canonical_atomic_writes_apply_final_owners_before_replace(config, monke
 def test_canonical_secret_write_failure_does_not_restore_source(config, monkeypatch):
     selected = config
     monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
-    monkeypatch.setattr(config_module, "_require_rclone", lambda *args, **kwargs: None)
     real_fchown = os.fchown
     monkeypatch.setattr(
         files_module.os,

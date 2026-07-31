@@ -70,6 +70,15 @@ class BackupSettings:
 
 
 @dataclass(frozen=True)
+class Operator:
+    uid: int
+    gid: int
+    name: str
+    home: Path
+    groups: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class Routing:
     acme_email: str
     dns_provider: str

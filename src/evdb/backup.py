@@ -5,23 +5,33 @@ import json
 import os
 import re
 import shutil
-import tempfile
+import stat
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .config import protected, validate_image
+from .config import protected, rclone_owner, validate_image
 from .engines import get
 from .errors import BackupError, ConfigError, Error, ResticError
-from .files import finish, private_dir, read_json, require_file, require_space, write_json
+from .files import (
+    finish,
+    managed_dir,
+    private_dir,
+    read_json,
+    require_file,
+    require_space,
+    write_json,
+)
 from .files import hash as file_hash
 from .lock import lock, operation
-from .models import Config, Database
+from .models import Config, Database, Operator
 from .run import Result, redact, run
 
 MANIFEST = "backup.json"
 RESTIC_MINIMUM = (0, 17, 0)
 MISSING_REPOSITORY = 10
+RESTIC = Path("/usr/bin/restic")
+RCLONE = Path("/usr/bin/rclone")
 
 
 def initialize(config: Config) -> None:
@@ -41,7 +51,7 @@ def initialize(config: Config) -> None:
 
 
 def require_version() -> None:
-    result = run(["restic", "version"], timeout=30, check=False)
+    result = run([str(RESTIC), "version"], timeout=30, check=False)
     match = re.search(r"restic ([0-9]+)\.([0-9]+)\.([0-9]+)", result.out)
     if result.code or not match:
         raise ResticError(
@@ -78,12 +88,14 @@ def create(
         raise BackupError(f"invalid backup purpose: {purpose}")
     if not database.compose.is_file():
         raise BackupError(f"database generated files are missing: {database.identity}")
-    root = private_dir(config.paths.role_backups(database.project, database.role))
+    operator = rclone_owner(config.host.backup.rclone_config)
+    root = _backup_root(config, database)
     require_space(root, config.host.backup.min_free_gb)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     partial = root / f"{run_id}.partial"
     with operation(config, database, timeout=config.host.timeouts["backup"]):
         private_dir(partial)
+        folder = None
         started = datetime.now(UTC).isoformat()
         try:
             facts = get(database.engine).backup(database, partial, run_id)
@@ -108,8 +120,9 @@ def create(
             }
             manifest_write(partial, record)
             folder = finish(partial)
+            _handoff(folder, operator)
         except BaseException:
-            shutil.rmtree(partial, ignore_errors=True)
+            shutil.rmtree(folder or partial, ignore_errors=True)
             raise
         try:
             snapshot = _upload(config, database, folder)
@@ -124,7 +137,10 @@ def create(
             "snapshot": snapshot,
             "time": datetime.now(UTC).isoformat(),
         }
-        manifest_write(folder, record)
+        try:
+            manifest_write(folder, record, mode=0o400, owner=(operator.uid, operator.gid))
+        finally:
+            _handoff(folder, operator)
         _clean(config, database, root, keep=2)
         return {
             **record,
@@ -233,9 +249,15 @@ def snapshots(config: Config, database: Database) -> list[dict[str, Any]]:
     ]
 
 
-def manifest_write(folder: str | Path, data: dict[str, Any]) -> Path:
+def manifest_write(
+    folder: str | Path,
+    data: dict[str, Any],
+    *,
+    mode: int = 0o600,
+    owner: tuple[int, int] | None = None,
+) -> Path:
     path = Path(folder) / MANIFEST
-    write_json(path, data)
+    write_json(path, data, mode=mode, owner=owner)
     return path
 
 
@@ -344,7 +366,7 @@ def manifest_check(folder: str | Path) -> dict[str, Any]:
         ):
             raise BackupError(f"unsafe backup file record: {name}")
         recorded.add(name)
-        target = require_file(root / name)
+        target = require_file(root / name, mode=None)
         if target.stat().st_size != size or file_hash(target) != checksum:
             raise BackupError(f"backup file changed: {name}")
     actual = {
@@ -389,32 +411,59 @@ def _restic(
     timeout: int = 7200,
     check: bool = True,
 ) -> Result:
+    operator = rclone_owner(config.host.backup.rclone_config)
     credentials = protected(config)
-    private_dir(config.paths.locks)
-    descriptor, name = tempfile.mkstemp(prefix=".restic-password.", dir=config.paths.locks)
-    password_file = Path(name)
+    descriptor = os.memfd_create("evdb-restic-password", os.MFD_CLOEXEC)
     try:
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            output.write(config.secrets.restic_password + "\n")
-            output.flush()
-            os.fsync(output.fileno())
+        with os.fdopen(descriptor, "wb", closefd=False) as password:
+            password.write((config.secrets.restic_password + "\n").encode())
+            password.flush()
+            password.seek(0)
+        os.fchown(descriptor, operator.uid, operator.gid)
+        os.fchmod(descriptor, 0o400)
+        identity = {}
+        if os.geteuid() == 0:
+            identity = {
+                "user": operator.uid,
+                "group": operator.gid,
+                "extra_groups": operator.groups,
+            }
+        elif os.geteuid() != operator.uid:
+            raise ResticError(
+                f"Restic must run as root or rclone owner {operator.name} ({operator.uid})"
+            )
+        elif os.getegid() != operator.gid or set(os.getgroups()) - {operator.gid} != set(
+            operator.groups
+        ):
+            raise ResticError(f"Restic process groups do not match rclone owner {operator.name}")
         return run(
             [
-                "restic",
+                str(RESTIC),
                 "--password-file",
-                str(password_file),
+                f"/proc/self/fd/{descriptor}",
+                "-o",
+                f"rclone.program={RCLONE}",
                 "-r",
                 config.host.backup.repository,
                 *args,
             ],
             timeout=timeout,
-            env={"RCLONE_CONFIG": str(config.host.backup.rclone_config)},
+            env={
+                "HOME": str(operator.home),
+                "USER": operator.name,
+                "LOGNAME": operator.name,
+                "RCLONE_CONFIG": str(config.host.backup.rclone_config),
+                "RESTIC_CACHE_DIR": str(operator.home / ".cache/restic"),
+            },
+            replace_env=True,
+            pass_fds=(descriptor,),
             secrets=credentials,
             check=check,
+            **identity,
         )
     finally:
-        password_file.unlink(missing_ok=True)
+        os.close(descriptor)
 
 
 def _require_format(config: Config, result: Result) -> None:
@@ -448,6 +497,48 @@ def _snapshot_id(result: Result) -> str:
 def _repository_lock(config: Config) -> Path:
     digest = hashlib.sha256(config.host.backup.repository.encode()).hexdigest()[:16]
     return config.paths.locks / f"restic-{digest}.lock"
+
+
+def _backup_root(config: Config, database: Database) -> Path:
+    project = config.paths.backups / database.project
+    root = project / database.role
+    for folder in (config.paths.state, config.paths.backups, project, root):
+        managed_dir(folder, 0o711)
+    return root
+
+
+def _handoff(folder: Path, operator: Operator) -> None:
+    def failed(error: OSError) -> None:
+        raise error
+
+    try:
+        for current, directories, files in os.walk(
+            folder, topdown=False, onerror=failed, followlinks=False
+        ):
+            root = Path(current)
+            for name in files:
+                _readonly(root / name, operator, directory=False)
+            for name in directories:
+                _readonly(root / name, operator, directory=True)
+        _readonly(folder, operator, directory=True)
+    except OSError as exc:
+        raise BackupError(f"completed backup cannot be handed to rclone owner: {folder}") from exc
+
+
+def _readonly(path: Path, operator: Operator, *, directory: bool) -> None:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    if directory:
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        details = os.fstat(descriptor)
+        expected = stat.S_ISDIR if directory else stat.S_ISREG
+        if not expected(details.st_mode):
+            raise OSError(f"completed backup contains an unsafe path: {path}")
+        os.fchown(descriptor, operator.uid, operator.gid)
+        os.fchmod(descriptor, 0o500 if directory else 0o400)
+    finally:
+        os.close(descriptor)
 
 
 def _identity_tags(config: Config, database: Database) -> set[str]:

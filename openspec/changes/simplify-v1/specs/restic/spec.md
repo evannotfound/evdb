@@ -1,5 +1,21 @@
 ## ADDED Requirements
 
+### Requirement: User-run repository subprocesses
+Every Restic repository operation SHALL run as the non-root owner of
+`host.backup.rclone_config`, using that account's primary and supplementary groups. evdb SHALL replace
+the inherited root environment with explicit `HOME`, `USER`, `LOGNAME`, `RCLONE_CONFIG`, and a
+user-writable Restic cache location. It SHALL invoke trusted absolute Restic and rclone executables and
+configure Restic to launch that rclone path. The Restic password SHALL be supplied through an inherited
+Linux memory-file descriptor, not arguments, environment variables, or a persistent file.
+
+#### Scenario: Scheduled repository inspection runs
+- **WHEN** the root backup service checks the configured repository
+- **THEN** Restic and its rclone child run with the rclone file owner's identity and canonical mutable configuration
+
+#### Scenario: Restic reads its password
+- **WHEN** evdb starts any Restic operation
+- **THEN** Restic reads the password from an inherited memory descriptor that is closed when the operation ends
+
 ### Requirement: Automatic host repository initialization
 `evdb init` SHALL initialize the one configured host Restic repository before enabling scheduled
 backups. It SHALL run `restic cat config`; success SHALL reuse the repository, the documented

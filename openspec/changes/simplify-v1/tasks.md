@@ -87,7 +87,16 @@
 
 - [x] 9.1 Remove `host.data_root`, derive database data at `/var/lib/evdb/databases`, and move generated project and Traefik assets under `/var/lib/evdb` with updated status, fixtures, and tests.
 - [x] 9.2 Reference one configured private host rclone file in place and remove rclone seeding, copying, canonical ownership, and duplicate-path behavior.
-- [x] 9.3 Remove the evdb Unix account and Docker-group setup; make canonical files, runtime directories, direct commands, and the backup service consistently root-owned.
+- [x] 9.3 Remove the evdb Unix account and Docker-group setup; keep canonical files, database runtime paths, direct orchestration, and the backup service root-owned.
 - [x] 9.4 Preserve private non-root PgBouncer access to root-owned, group-readable generated files and cover the resulting Compose contract with focused unit and disposable-container tests.
 - [x] 9.5 Embed canonical units in one standalone executable, publish raw architecture assets, and atomically install `/usr/local/bin/evdb` without `/opt/evdb`, current/previous links, archives, or development activation.
 - [x] 9.6 Update operator documentation and run focused unit, config, Restic, release, installer, binary, integration, and strict OpenSpec validation without touching production hosts.
+
+## 10. Run Repository Work as the Rclone Owner
+
+- [x] 10.1 Validate the canonical mutable rclone file as exact mode `0600` under a known non-root owner with a safe writable parent, and derive that account's UID, GID, name, home, and supplementary groups.
+- [x] 10.2 Extend the subprocess wrapper for numeric identities, supplementary groups, exact environment replacement, and inherited descriptors; invoke trusted absolute Restic and rclone paths.
+- [x] 10.3 Run every Restic operation under the rclone owner with a sanitized identity environment, user cache, and an inherited Linux memory descriptor for the repository password.
+- [x] 10.4 Keep partial backups root-only, make backup ancestors traverse-only, and hand validated completed trees to the rclone owner as read-only before upload.
+- [x] 10.5 Update focused config, runner, backup, host, Restic integration, and systemd tests for the privilege and ownership boundary.
+- [x] 10.6 Update operator documentation and run focused tests, lint, integration collection, binary checks, and strict OpenSpec validation without touching production hosts.

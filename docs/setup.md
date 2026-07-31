@@ -5,8 +5,8 @@
 evdb v1 supports Ubuntu 22.04 or newer with systemd on ARM64 and x86_64. A database host needs:
 
 - Docker with Compose
-- Restic 0.17 or newer
-- rclone
+- Restic 0.17 or newer at `/usr/bin/restic`
+- rclone at `/usr/bin/rclone`
 - systemd
 - DNS-01 credentials for native TLS routing
 - writable configuration, local backup, tool, and data filesystems
@@ -44,6 +44,17 @@ that `evdb --version` matches the selected release before atomically replacing
 
 ## Initialize
 
+Configure rclone as the normal user who will own remote repository access before running root
+initialization:
+
+```sh
+rclone config
+chmod 0600 "$HOME/.config/rclone/rclone.conf"
+```
+
+The file must be a non-symlink regular file under a safe directory owned and writable by that user.
+Root-owned rclone files are rejected because token refreshes must remain owned by the normal operator.
+
 `sudo evdb init` opens a guided session when canonical source is absent. It collects or accepts the
 host identity, routing settings, one Restic repository, DNS credentials, Restic password, and the
 absolute path of a private native rclone configuration.
@@ -62,12 +73,14 @@ Initialization creates the root-owned canonical files:
 
 Canonical `/etc/evdb` is `root:root` mode `0700`; both files are `root:root` mode `0600`. Generated
 Compose, Traefik, backup, lock, and database files live below `/var/lib/evdb`. evdb validates the
-configured root-owned rclone file and uses it in place without copying or changing it.
+configured user-owned rclone file and uses it in place without copying or changing it.
 
 It creates required directories, converges the dedicated Docker network and Traefik project,
 initializes or verifies the one Restic repository, installs exactly `evdb-backup.service` and
-`evdb-backup.timer`, enables the root-run timer with `systemctl enable --now`, and finishes with `evdb status`.
-Restic through rclone creates a configured missing repository path during initialization.
+`evdb-backup.timer`, enables the root-run timer with `systemctl enable --now`, and finishes with
+`evdb status`. Restic and rclone repository subprocesses drop to the rclone file owner with an exact
+environment and a user-writable `~/.cache/restic`. Restic through rclone creates a configured missing
+repository path during initialization.
 
 Initialization is rerunnable. Repeated runs preserve existing credentials, external rclone OAuth state,
 database source, generated role files, and data, and do not restart healthy database projects. Once

@@ -79,7 +79,14 @@ def test_init_refuses_production_before_subprocesses(config, monkeypatch):
     assert calls == []
 
 
-def test_prerequisites_require_restic_017_without_python_or_uv(monkeypatch):
+def test_prerequisites_require_restic_017_without_python_or_uv(tmp_path, monkeypatch):
+    restic = tmp_path / "restic"
+    rclone = tmp_path / "rclone"
+    for path in (restic, rclone):
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+    monkeypatch.setattr(host.backup, "RESTIC", restic)
+    monkeypatch.setattr(host.backup, "RCLONE", rclone)
     monkeypatch.setattr(host.shutil, "which", lambda name: f"/usr/bin/{name}")
     calls = []
     monkeypatch.setattr(
@@ -320,6 +327,20 @@ def test_managed_directory_symlink_is_rejected_without_following(config, tmp_pat
 
     with pytest.raises(host.HostError, match="unsafe"):
         host._directories(unsafe)
+
+
+def test_host_directories_expose_only_backup_traversal(config):
+    host._directories(config)
+
+    assert config.paths.state.stat().st_mode & 0o777 == 0o711
+    assert config.paths.backups.stat().st_mode & 0o777 == 0o711
+    for path in (
+        config.paths.projects,
+        config.paths.traefik,
+        config.paths.databases,
+        config.paths.locks,
+    ):
+        assert path.stat().st_mode & 0o777 == 0o700
 
 
 def test_canonical_source_directory_converges_to_private_root_layout(config, monkeypatch):

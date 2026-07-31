@@ -101,6 +101,11 @@ secrets, unexpected secret keys, and source files with unsafe ownership or modes
 contain no credential value; `secrets.yml` SHALL contain only supported credential fields and SHALL be
 mode `0600`. The same role invariants SHALL apply before source writes or generated service changes.
 
+The external rclone file SHALL be a normalized absolute, non-symlink regular file with exact mode
+`0600`, owned by a known non-root user. Its immediate parent SHALL be safe, owned and writable by that
+user so rclone can atomically refresh OAuth state. evdb SHALL derive that user's numeric identity,
+primary and supplementary groups, username, and existing home from the host account database.
+
 #### Scenario: Project suffix is absent
 - **WHEN** a project ID does not end in `-dev-N`, `-test-N`, or `-prod-N`
 - **THEN** validation fails before generated files or live services change
@@ -112,6 +117,10 @@ mode `0600`. The same role invariants SHALL apply before source writes or genera
 #### Scenario: Enabled KV HTTP domains collide
 - **WHEN** two enabled KV HTTP sidecars use the same intended public HTTPS hostname
 - **THEN** validation fails before generated files or live services change
+
+#### Scenario: Root owns the rclone file
+- **WHEN** `host.backup.rclone_config` names an otherwise private root-owned file
+- **THEN** validation rejects it before Restic or rclone starts
 
 ### Requirement: Old source schema is not supported
 The loader SHALL reject `/etc/evdb/host.yml`, separate generated secret trees, machine-owned host

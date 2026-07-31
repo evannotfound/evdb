@@ -18,7 +18,7 @@ from .lock import operation
 from .models import CONFIG_DIR, BackupSettings, Config, Host, Paths, Routing, Secrets
 from .run import redact, run
 
-TOOLS = ("docker", "restic", "rclone", "systemctl")
+TOOLS = ("docker", "systemctl")
 BACKUP_SERVICE = "evdb-backup.service"
 BACKUP_TIMER = "evdb-backup.timer"
 UNIT_DIR = Path("/etc/systemd/system")
@@ -66,6 +66,9 @@ def initialize(
 
 def prerequisites() -> list[str]:
     missing = [name for name in TOOLS if shutil.which(name) is None]
+    for name, path in (("restic", backup.RESTIC), ("rclone", backup.RCLONE)):
+        if not path.is_file() or not os.access(path, os.X_OK):
+            missing.append(name)
     if "docker" not in missing:
         result = run(["docker", "compose", "version"], timeout=30, check=False)
         if result.code:
@@ -117,8 +120,8 @@ def _directories(config: Config) -> None:
             (config.paths.projects, 0o700),
             (config.paths.traefik, 0o700),
             (config.paths.traefik / "acme", 0o700),
-            (config.paths.state, 0o700),
-            (config.paths.backups, 0o700),
+            (config.paths.state, 0o711),
+            (config.paths.backups, 0o711),
             (config.paths.locks, 0o700),
             (config.paths.databases, 0o700),
         ):

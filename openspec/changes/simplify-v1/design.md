@@ -55,9 +55,17 @@ engines, images, and explicit settings. `secrets.yml` contains the Restic passwo
 database passwords, and HTTP tokens under matching project and role keys. Both loaders require a
 complete supported schema; the secret file is mode `0600` and is never emitted by status.
 
-`config.yml` stores the absolute path to the host's native rclone file. evdb validates and passes that
-path to Restic without copying, replacing, chowning, or translating it. Root runs both direct and
-scheduled operations, so rclone refreshes OAuth state with the same identity that owns the source.
+`config.yml` stores the absolute path to the host's native rclone file. The file remains the canonical
+mutable configuration for manual and evdb use. evdb requires an exact mode-`0600`, non-symlink regular
+file owned by a known non-root user in a safe user-writable parent, derives that user's primary and
+supplementary groups and home, and never copies, replaces, or chowns the file.
+
+Direct commands and the scheduled service remain root-run for Docker and private database backup work.
+Every Restic repository operation drops to the rclone file owner with an exact environment containing
+that user's identity, home, rclone path, and Restic cache path. Restic receives the repository password
+through an inherited Linux memory-file descriptor and launches an explicitly selected absolute rclone
+executable as the same user. This keeps OAuth refreshes user-owned and visible to normal manual rclone
+use.
 
 Generated Compose and engine files live under `/var/lib/evdb/projects/<project>/<role>`, dedicated
 Traefik assets under `/var/lib/evdb/traefik`, database data under
@@ -113,8 +121,11 @@ an independent `rclone mkdir` or ask the operator to prepare directories.
 
 Backup creation retains native engine checks, private partial directories, manifests, file sizes and
 SHA-256 hashes, confirmed Restic snapshot IDs, merged local/remote history, and cleanup that keeps the
-two newest uploaded local backups. Remote snapshots are not deleted in v1 and repository growth is
-documented explicitly.
+two newest uploaded local backups. Root-owned traverse-only backup ancestors expose no directory
+listing. After validation, completed directories become mode `0500` and files mode `0400`, owned by the
+rclone operator so dropped Restic can read them; partial backups and database data remain root-only.
+Root records a successful snapshot in the local read-only manifest after upload. Remote snapshots are
+not deleted in v1 and repository growth is documented explicitly.
 
 ### Keep systemd but install one automatic backup schedule
 
@@ -190,6 +201,11 @@ TTY, while status and non-interactive output remain credential-free.
   and never include the file or values in machine output.
 - [Installer refresh can fail after replacing the executable] -> Report the direct initialization error
   and let the operator repair config or rerun init; automatic tool rollback remains outside v1.
+- [Manual and scheduled rclone may update one file concurrently] -> Keep one canonical file to prevent
+  persistent divergence and document that simultaneous token refreshes can still race.
+- [A user-owned read-only backup can be chmodded by its owner] -> Treat the rclone owner as the backup
+  operator; read-only modes prevent accidental writes but are not an immutability boundary against that
+  user.
 
 ## Migration Plan
 
@@ -212,5 +228,6 @@ existing hosts must retain their old executable and files until explicitly reset
 
 ## Open Questions
 
-None. The v1 engines, backup boundary, fixed host layout, root execution model, systemd scheduler,
-single-binary update path, external rclone reference, and credential-output boundary are fixed.
+None. The v1 engines, backup boundary, fixed host layout, root orchestration with user-run repository
+subprocesses, systemd scheduler, single-binary update path, external rclone reference, and
+credential-output boundary are fixed.

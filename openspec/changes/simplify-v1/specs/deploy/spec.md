@@ -97,7 +97,9 @@ record, restore staging, transaction tree, or configurable data root SHALL be cr
 ### Requirement: Mutable rclone configuration
 Initialization SHALL validate and persist the absolute path of a provided private native rclone file.
 evdb SHALL use that file in place and SHALL NOT copy, replace, chown, or regenerate it from
-`secrets.yml` during initialization, database changes, or installer updates.
+`secrets.yml` during initialization, database changes, or installer updates. The file SHALL remain
+owned and atomically writable by its non-root operator; evdb repository subprocesses SHALL use that
+identity so token refreshes preserve normal manual rclone use.
 
 #### Scenario: Live OAuth token changed
 - **WHEN** initialization runs after rclone refreshes its token

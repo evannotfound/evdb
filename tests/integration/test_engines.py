@@ -20,6 +20,7 @@ from evdb.run import run
 def test_postgres_and_private_pgbouncer_run_in_disposable_compose(config, tmp_path, monkeypatch):
     _require_docker()
     monkeypatch.setattr(backup, "_upload", lambda *args: "integration-snapshot")
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
     project = _project("postgres")
     password = 'pool password "quoted" \\ slash'
     selected = _config(
@@ -78,6 +79,7 @@ def test_postgres_and_private_pgbouncer_run_in_disposable_compose(config, tmp_pa
 def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_path, monkeypatch):
     _require_docker()
     monkeypatch.setattr(backup, "_upload", lambda *args: "integration-snapshot")
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
     used = set()
     projects = []
     secrets = []

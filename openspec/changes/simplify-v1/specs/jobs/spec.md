@@ -4,7 +4,8 @@
 External commands SHALL use argument arrays without `shell=True`, enforce finite timeouts, and check
 return codes. evdb SHALL redact exact credential values loaded from `secrets.yml` and credential fields
 in the configured external rclone file, including required encoded forms, while preserving repository URLs, remote names,
-paths, images, snapshot IDs, and unrelated stdout or stderr.
+paths, images, snapshot IDs, and unrelated stdout or stderr. Repository subprocesses SHALL use numeric
+user and group identities, exact environment replacement, and explicit inherited file descriptors.
 
 #### Scenario: Tool prints a managed credential in an error
 - **WHEN** stderr contains an exact managed password or token
@@ -78,7 +79,8 @@ backup tests, and maintenance units.
 ### Requirement: Systemd jobs and timer preservation
 The package SHALL include exactly one `evdb-backup.service` and one `evdb-backup.timer`. The service
 SHALL run `evdb backup create --all` as root with finite timeout and low CPU and I/O
-priority. The timer SHALL be daily, persistent, randomized, and automatically enabled by `evdb init`.
+priority, while only its Restic and rclone subprocesses drop to the configured rclone owner. The timer
+SHALL be daily, persistent, randomized, and automatically enabled by `evdb init`.
 Initialization and installer refresh SHALL converge it to loaded, enabled, and active.
 
 #### Scenario: Host was offline at backup time

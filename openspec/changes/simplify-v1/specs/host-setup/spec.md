@@ -48,12 +48,15 @@ unrelated host packages.
 
 ### Requirement: Consistent root ownership
 Canonical host commands and the backup job SHALL run as root. Initialization SHALL create root-owned
-private source, generated, and mutable paths and SHALL NOT create an evdb account or grant Docker-group
-access to another user. Database containers retain their image-specific runtime identities.
+private source, generated, database, lock, and partial-backup paths and SHALL NOT create an evdb account
+or grant Docker-group access to another user. Backup ancestors SHALL be root-owned and traverse-only;
+completed backups SHALL be handed to the configured rclone owner read-only. Database containers retain
+their image-specific runtime identities, and only Restic and its rclone child SHALL drop to the rclone
+owner.
 
 #### Scenario: Backup timer starts
 - **WHEN** systemd launches the scheduled backup
-- **THEN** the job runs as root with the same file and rclone identity as direct host commands
+- **THEN** the service runs as root while each Restic and rclone repository subprocess runs as the configured non-root rclone owner
 
 ### Requirement: Direct tool installation
 The verified release SHALL be one root-owned regular executable at `/usr/local/bin/evdb`. No
