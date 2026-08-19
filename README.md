@@ -6,9 +6,83 @@
 [![Release](https://img.shields.io/github/v/release/evannotfound/evdb)](https://github.com/evannotfound/evdb/releases)
 [![License](https://img.shields.io/github/license/evannotfound/evdb)](LICENSE)
 
-evdb turns a Linux server into a platform for Postgres and Redis-compatible databases. (More dbs to come)
+evdb turns a Linux server into a platform for Postgres and Redis-compatible databases.
 
-Create a database, get a private TLS connection URL, and use it with any standard Postgres or Redis client. evdb handles the infrastructure around it: provisioning, routing, credentials, backups, health checks, and updates.
+It manages the infrastructure around them:
+
+- Docker-based database services
+- TLS routing and generated credentials
+- Health checks and lifecycle operations
+- Automatic Restic backups through your rclone remote
+
+## Before you install
+
+evdb requires a Linux server with systemd and root access. Ubuntu is the tested path. Native database
+connections use ports `5432` and `6379`, which must be free on the host and reachable by your clients.
+
+Install these prerequisites using their official instructions:
+
+- [Docker Engine](https://docs.docker.com/engine/install/) with the
+  [Docker Compose plugin](https://docs.docker.com/compose/install/linux/)
+- [Restic](https://restic.readthedocs.io/en/stable/020_installation.html) 0.17 or newer at
+  `/usr/bin/restic`
+- [rclone](https://rclone.org/install/) at `/usr/bin/rclone`
+
+You also need a domain managed by a DNS provider supported by
+[Traefik's DNS challenge](https://doc.traefik.io/traefik/reference/install-configuration/tls/certificate-resolvers/acme/#providers)
+and remote storage
+supported by rclone.
+
+## Prepare DNS and backups
+
+Choose a host ID and base domain. For a host ID of `example-01` and a base domain of
+`storage.example.com`, arrange for `*.example-01.storage.example.com` to resolve to the server from
+your clients. evdb uses DNS-01 to issue certificates but does not create DNS records.
+
+Create a private file containing the environment variables Traefik requires for your DNS provider,
+one `KEY=VALUE` per line. Keep its path for initialization.
+
+Configure your backup remote as the normal non-root user who will own remote access:
+
+```sh
+rclone config
+rclone config file
+rclone lsd remote:
+```
+
+Replace `remote` with the configured remote name. Set the reported rclone configuration file to mode
+`0600`; evdb requires its absolute path and uses it without copying it. A typical Restic repository is
+`rclone:remote:evdb/example-01`.
+
+## Install evdb
+
+Install the latest standalone release:
+
+```sh
+curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install.sh | sudo sh
+```
+
+The installer verifies the downloaded executable and installs it at `/usr/local/bin/evdb`.
+
+## Initialize the host
+
+Start guided initialization:
+
+```sh
+sudo evdb init
+```
+
+Enter the host ID, base domain, ACME email, Traefik DNS provider name, Restic repository, DNS
+credential file, and absolute rclone configuration path prepared above. Leave the initial Restic
+password blank to generate one.
+
+Initialization stores configuration under `/etc/evdb`, managed data under `/var/lib/evdb`, starts the
+TLS router, initializes the Restic repository, and enables automatic daily backups.
+
+## Create your first database
+
+Project names must end in `-dev-N`, `-test-N`, or `-prod-N`. Create Postgres and retrieve its
+TLS-secured connection URL:
 
 ```sh
 sudo evdb database add notes-prod-01 postgres
@@ -19,114 +93,44 @@ sudo evdb database info notes-prod-01/postgres
 postgresql://default:<password>@notes-prod-01.example-01.storage.example.com:5432/postgres?sslmode=require
 ```
 
-## Installation
+Use the URL with any standard Postgres client. `database info` prints complete credentials and
+therefore requires a terminal.
 
-evdb supports Ubuntu 22.04 or newer on ARM64 and x86_64. The host requires Docker with Compose,
-Restic 0.17 or newer, rclone, systemd, DNS provider credentials for TLS certificates, and free native
-ports `5432` and `6379`.
+## CLI usage
 
-Install the latest standalone release, then initialize the host:
-
-```sh
-curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install.sh | sudo sh
-sudo evdb init
-```
-
-Initialization creates or validates root-owned `/etc/evdb/config.yml` and
-`/etc/evdb/secrets.yml`, uses a supplied private non-root user's native rclone file in place, and stores
-generated runtime and database data under `/var/lib/evdb`. It initializes the host's one Restic
-repository, including a missing rclone-backed path, then enables one persistent randomized daily
-systemd timer. The service runs backup creation as root and drops only Restic and rclone to the rclone
-file owner.
-
-On first init, the guided masked Restic password prompt generates a password when left blank. Direct
-init can read one from a private file with `--restic-password-file PATH`; the credential is never
-accepted inline or through the environment and is not printed.
-
-See [Host setup and updates](docs/setup.md) for pinned installations and configured-host updates.
-
-## Quick start
-
-Create Postgres and the default Dragonfly-backed KV role, or select Redis explicitly:
+Run `sudo evdb` for the guided terminal interface. Direct commands execute immediately and are useful
+for scripts and SSH. Use `--help` at any command level, such as
+`sudo evdb database configure --help`, for all available options.
 
 ```sh
-sudo evdb database add notes-prod-01 postgres
-sudo evdb database add notes-prod-01 kv
-sudo evdb database add cache-prod-01 kv --engine redis
-```
-
-Retrieve connection details:
-
-```sh
-sudo evdb database info notes-prod-01/postgres
-sudo evdb database info notes-prod-01/kv
-```
-
-Postgres, Redis-compatible native access, and Redis over HTTPS use standard clients. Native Postgres
-and KV connections use TLS and share a project hostname; the scheme and port select the protocol.
-`database info` deliberately shows usable credentials in a terminal. Status and machine-readable
-output remain credential-free.
-
-## Backups
-
-Backup creation runs engine-native checks, records file sizes and SHA-256 hashes, and reports success
-only after Restic confirms the snapshot. Create or inspect one database backup directly:
-
-```sh
-sudo evdb backup create notes-prod-01/postgres
-sudo evdb backup list notes-prod-01/postgres
-sudo evdb backup create --all
-```
-
-The automatic timer runs the same all-database command sequentially. Remote snapshots grow
-indefinitely because evdb v1 does not delete them. Recovery uses Restic plus manual engine tools; evdb
-does not provide a recovery command in v1.
-
-## Commands
-
-Run `evdb` without arguments for the guided terminal interface. Direct commands are available for
-scripts, SSH, and systemd:
-
-```sh
-sudo evdb init
 sudo evdb status
+sudo evdb status --json
 
 sudo evdb database list
-sudo evdb database add notes-prod-01 postgres
-sudo evdb database info notes-prod-01/postgres
-sudo evdb database configure notes-prod-01/postgres
+sudo evdb database add cache-prod-01 kv
+sudo evdb database add cache-prod-02 kv --engine redis
+sudo evdb database info cache-prod-01/kv
+sudo evdb database configure notes-prod-01/postgres --max-clients 200
 sudo evdb database start notes-prod-01/postgres
 sudo evdb database stop notes-prod-01/postgres
 sudo evdb database restart notes-prod-01/postgres
-sudo evdb database logs notes-prod-01/postgres
+sudo evdb database logs notes-prod-01/postgres --lines 200
 
 sudo evdb backup create notes-prod-01/postgres
 sudo evdb backup create --all
 sudo evdb backup list notes-prod-01/postgres
 ```
 
-Explicit direct commands execute immediately. Guided creation and settings changes use one final
-confirmation.
+Rerun the installer to update evdb. On a configured host it also refreshes the managed router and
+backup timer without restarting healthy databases.
 
-Operational identifiers stay visible in output and errors, including repository URLs, rclone remote
-names, paths, image references, snapshot IDs, and unrelated subprocess output. evdb redacts only exact
-managed password and token values and their required encoded forms.
+## Backups and recovery
 
-## V1 limitations
+The automatic timer backs up every durable database sequentially. A backup succeeds only after the
+database files are checked and Restic confirms the remote snapshot.
 
-evdb v1 targets Ubuntu hosts with systemd. A failed creation or settings change leaves readable source
-and generated files in place for correction and retry with `database start`. Existing pre-v1 host
-files are not migrated automatically. Production migration is a separate approved change.
-
-## Documentation
-
-- [Command reference](docs/commands.md)
-- [Host setup and updates](docs/setup.md)
-- [Configuration](docs/configuration.md)
-- [Database operations](docs/deploy.md)
-- [Routing](docs/routing.md)
-- [Backups](docs/backup.md)
-- [Credentials](docs/secrets.md)
+evdb does not delete remote snapshots, so configure retention separately. Recovery is manual with
+Restic and the matching database tools; evdb does not provide a restore command.
 
 ## Development
 
@@ -137,10 +141,6 @@ uv sync --locked
 make check
 make binary
 ```
-
-For an uncommitted revision on a disposable VPS, use the guarded source workflow in
-[Host setup and updates](docs/setup.md#disposable-vps-development). It keeps the installed release
-tree intact and rejects `montreal-01`.
 
 ## License
 

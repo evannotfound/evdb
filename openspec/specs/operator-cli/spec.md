@@ -7,51 +7,77 @@ Define the guided and explicit host-local operator command interface.
 ## Requirements
 
 ### Requirement: Guided root menu
-Running `evdb` with an interactive terminal and no subcommand SHALL display current host health and a numbered menu for databases, backups, restore, host checks, and exit. The menu SHALL use an SSH-safe terminal presentation and SHALL NOT require arrow-key terminal support, cursor-addressed navigation, or an additional full-screen TUI framework.
+Running `evdb` in an interactive terminal SHALL show a compact host summary and one numbered database
+overview. Database rows SHALL be directly selectable, followed by Add database, Host, and Exit. The
+root SHALL NOT expose separate top-level backup, restore, or host-maintenance categories.
 
-#### Scenario: Operator runs evdb over an interactive SSH session
+#### Scenario: Operator runs evdb over SSH
 - **WHEN** stdin and stdout are terminals and the operator runs `evdb`
-- **THEN** the command shows host and database summary state followed by numbered actions
+- **THEN** the command shows `#`, database identity, engine, runtime status, and latest backup before the numbered choices
 
 ### Requirement: Terminal presentation
-When stdout is an interactive terminal, evdb SHALL render human output with an adaptive terminal presenter that may use color, table layout, emphasis, and progress/status indicators. The presenter SHALL preserve numbered menu choices, text-entry prompts, ordinary SSH compatibility, and plain behavior when stdout is not an interactive terminal or output is injected by tests.
+Interactive output SHALL use an SSH-safe terminal presenter with readable emphasis and compact layout.
+It SHALL separate screens, results, errors, and prompts with blank lines, preserve numbered input, and
+avoid cursor-addressed navigation. Plain or injected output SHALL contain no terminal control sequences
+or Rich markup.
 
-#### Scenario: Operator uses guided CLI in a terminal
-- **WHEN** stdin and stdout are terminals and the operator runs `evdb`
-- **THEN** evdb renders status, menus, prompts, and operation feedback in a readable terminal layout while choices remain entered as numbers or text
+#### Scenario: Guided flow advances between screens
+- **WHEN** the operator selects a database and then a backup action
+- **THEN** headings, content, result, and next prompt are visually separated without clearing prior terminal history
 
 #### Scenario: Output is captured by automation
-- **WHEN** stdout is not a terminal or the caller injects an output function
-- **THEN** evdb does not emit terminal control sequences or Rich markup as part of the command output
+- **WHEN** stdout is not a terminal or output is injected by a test
+- **THEN** evdb emits stable plain text without style control sequences
 
 #### Scenario: Terminal cannot display color
-- **WHEN** terminal settings disable color or indicate a plain terminal
-- **THEN** evdb preserves readable text layout without requiring color to understand state or available actions
+- **WHEN** terminal settings disable color
+- **THEN** labels and wording preserve every state distinction
 
 ### Requirement: Context-aware database menu
-The guided database flow SHALL list databases by `<project>/<role>`, show engine and current health, and expose only actions and settings valid for the selected role and concrete engine. Current values SHALL identify whether they are defaults or custom values. Interactive terminal output SHALL present this information in a readable layout without changing the numbered selection model.
+The guided root SHALL use a table only for the database overview. Selecting a role SHALL open a
+key/value summary and numbered actions for Details, Connection, Settings, Start or Stop, Restart,
+Backups, Logs, and Back. Full image references, credentials, generated paths, backup records, and error
+details SHALL appear only in their relevant submenu.
 
-#### Scenario: Operator configures Dragonfly
-- **WHEN** the operator selects a Dragonfly-backed KV database and opens its settings
-- **THEN** the menu shows mode, memory, threads, HTTP, and image settings without showing PostgreSQL pool settings
+#### Scenario: Operator opens Postgres details
+- **WHEN** the operator selects a Postgres role and opens Details
+- **THEN** the view shows its full configured images and PgBouncer settings without widening the root table
 
 #### Scenario: Operator configures Redis
-- **WHEN** the operator selects a Redis-backed KV database
-- **THEN** the menu does not offer Dragonfly-only memory or thread settings
+- **WHEN** the operator opens Settings for Redis-backed KV
+- **THEN** the menu omits Dragonfly-only memory and thread settings
+
+#### Scenario: Narrow terminal displays the root
+- **WHEN** terminal width is 60 columns
+- **THEN** the root does not print image digests and the database identity remains readable without being replaced by an ellipsis-only value
 
 ### Requirement: Guided settings session
-The settings editor SHALL allow the operator to change multiple values, keep a value unchanged, reset an override to its default, discard the session, or save once. Saving SHALL show old and new values, identify services that restart, describe expected interruption and safety backup behavior, and require one confirmation before mutation.
+The guided settings editor SHALL expose only settings valid for the selected engine, let the operator
+keep or change several values, and require one final Save confirmation. Saving SHALL write once,
+rerender once, start Compose once, and report health. It SHALL NOT describe safety backups, rollback,
+deployment transactions, or service contract hashes.
 
 #### Scenario: Several settings change
-- **WHEN** the operator changes Dragonfly memory and threads in one guided session
-- **THEN** evdb previews both changes and performs at most one settings transaction and one service restart
+- **WHEN** the operator changes Dragonfly memory and threads and confirms Save
+- **THEN** evdb performs one source update and one Compose invocation
+
+#### Scenario: Settings are discarded
+- **WHEN** the operator leaves without confirming Save
+- **THEN** source, generated files, and containers remain unchanged
 
 ### Requirement: Grouped command interface
-The canonical non-menu interface SHALL group commands under `database`, `backup`, and `host`, with top-level `status` and `restore`. It SHALL use the same domain operations as guided flows and SHALL NOT expose `plan`, `apply`, `releases`, `rollback`, `promote`, or a second internal CLI.
+The non-menu interface SHALL provide top-level `init` and `status`, group retained operations under
+`database` and `backup`, and expose `--version`. It SHALL NOT expose restore, backup test, retention,
+prune, repository check, host setup, host check, host update, host uninstall, plan, apply, releases,
+rollback, promote, or a second internal CLI.
 
-#### Scenario: Script creates a backup
+#### Scenario: Script creates one backup
 - **WHEN** automation runs `evdb backup create PROJECT/ROLE`
-- **THEN** it invokes the same checked backup operation available from the guided menu
+- **THEN** it invokes the same checked create-and-upload operation available under the database Backups submenu
+
+#### Scenario: Systemd backs up the host
+- **WHEN** the packaged service runs `evdb backup create --all`
+- **THEN** every configured durable database is attempted and the command exits nonzero if any attempt fails
 
 ### Requirement: TTY-aware prompting
 Missing human inputs MAY prompt only when stdin and stdout are terminals. In non-interactive execution, missing values SHALL produce a concise error that names the required argument and shows a valid example; the command SHALL NOT wait for input.
@@ -61,61 +87,79 @@ Missing human inputs MAY prompt only when stdin and stdout are terminals. In non
 - **THEN** evdb exits nonzero immediately with a secret-free usage error
 
 ### Requirement: Secure initial Postgres password input
-Direct Postgres creation SHALL accept an optional `--password-file PATH` whose content becomes the
-initial password for the fixed `default` login. Guided Postgres creation SHALL offer a masked password
-prompt where blank input selects generation. evdb SHALL NOT accept a password value as a command
-argument, environment variable, ordinary echoed prompt, preview field, log field, or machine-readable
-output. A supplied password SHALL be non-empty and contain no NUL, carriage return, or embedded line
-feed after one trailing line ending is removed.
+Direct Postgres creation SHALL accept optional `--password-file PATH`; guided creation SHALL use a
+masked prompt where blank selects generation. The validated value SHALL be stored only in
+`secrets.yml` and derived private role files. No inline password argument, environment input, echoed
+prompt, preview, status, or machine output SHALL be accepted.
 
 #### Scenario: Script supplies a password file
-- **WHEN** automation runs `evdb database add app-prod-01 postgres --password-file PATH` with a valid private file
-- **THEN** evdb reads the password from the file, protects it from subprocess output, and does not place it in the process arguments or operation preview
-
-#### Scenario: Guided creation keeps the entered password hidden
-- **WHEN** an operator enters a password in the guided Postgres add flow
-- **THEN** the terminal does not echo or redisplay the value and the confirmed operation uses it as the initial managed password
+- **WHEN** automation adds Postgres with a valid private password file
+- **THEN** evdb stores the value under the matching `secrets.yml` role without placing it in process arguments or output
 
 #### Scenario: Guided creation requests generation
-- **WHEN** an operator leaves the guided Postgres password prompt blank
-- **THEN** evdb generates the initial managed password without requiring another credential input
+- **WHEN** the masked prompt is left blank
+- **THEN** evdb generates and stores a valid initial password
 
-#### Scenario: Password file has invalid content
-- **WHEN** the selected password file is empty or contains a NUL or embedded line break
-- **THEN** evdb rejects creation before changing source, state, secrets, Compose, containers, routes, or data
+#### Scenario: Password file is invalid
+- **WHEN** the file is empty, non-private, symlinked, non-regular, or contains NUL or embedded line breaks
+- **THEN** creation fails before source or services change
 
 ### Requirement: Deliberate confirmations
-Every operation that starts, stops, restarts, reconfigures, restores, installs, or updates production services SHALL identify the host and affected database or host infrastructure and require confirmation unless `--yes` is supplied. `--yes` SHALL confirm a complete operation but SHALL NOT invent missing inputs. In an interactive terminal, confirmations SHALL be shown outside long-running progress indicators and SHALL present preview details in a readable human layout.
+Guided database creation and settings editing SHALL present one concise summary and require one final
+Create or Save confirmation. Explicit direct database lifecycle, backup, and initialization commands
+SHALL execute without a generic confirmation or `--yes`, except the installer MAY use `init --yes` to
+assert that required existing source is complete without prompting.
 
-#### Scenario: Operator declines a settings change
-- **WHEN** the operator rejects the displayed settings transaction
-- **THEN** source configuration, generated files, secrets, containers, data, and audit state remain unchanged
+#### Scenario: Operator declines guided creation
+- **WHEN** the operator rejects the final Create prompt
+- **THEN** source, generated files, credentials, containers, routes, and data remain unchanged
+
+#### Scenario: Operator runs an explicit backup
+- **WHEN** the operator invokes `evdb backup create PROJECT/ROLE`
+- **THEN** backup starts without repeating a confirmation of the already explicit command
 
 ### Requirement: Human operation summaries
-Interactive terminal mutations SHALL finish with concise human summaries rather than raw developer-shaped result dictionaries. The summary SHALL name the affected host, database or host component, result state, changed settings or selected operation when relevant, and important backup or snapshot identifiers when relevant. Non-terminal mutation output MAY retain existing machine-oriented formatting unless a command explicitly defines a JSON mode.
+Interactive and direct human commands SHALL finish with concise text naming the affected database or
+host operation and result. Backup completion SHALL include time, backup identity, and snapshot ID.
+Commands SHALL NOT print raw Python dictionaries or developer-shaped JSON unless a documented JSON
+flag was explicitly requested.
 
-#### Scenario: Database creation succeeds in guided mode
-- **WHEN** an operator creates a database from the guided terminal menu and the operation succeeds
-- **THEN** evdb reports that the selected `<project>/<role>` is healthy and includes relevant changed settings or safety backup information without printing a raw JSON dictionary
+#### Scenario: Database creation succeeds
+- **WHEN** a database reaches native health
+- **THEN** evdb reports that `<project>/<role>` is healthy and offers its selected next view without raw result data
 
-#### Scenario: Mutation runs outside a terminal
-- **WHEN** automation runs a mutation command without interactive stdout
-- **THEN** evdb preserves parseable or existing machine-oriented result text and does not require Rich terminal rendering
+#### Scenario: Backup upload fails
+- **WHEN** checked local files exist but Restic fails
+- **THEN** evdb names the database, repository URL, retained local backup, and original Restic failure
 
 ### Requirement: Database information view
-`evdb database info PROJECT/ROLE` SHALL show configured settings, engine and image versions, live health, data and Compose paths, backup summary, native connection details, and HTTP details when enabled. It SHALL intentionally include current credentials in terminal output and SHALL NOT offer JSON output.
+The selected database Details view and `database info` SHALL show configured settings, full images,
+live health, data and Compose paths, backup summary, and native or HTTP connection details. Credentials
+SHALL appear only in the deliberate Connection view or terminal `database info`; neither SHALL offer
+JSON output.
 
 #### Scenario: KV information is displayed
-- **WHEN** the operator requests information for an HTTP-enabled KV database
-- **THEN** the terminal shows the concrete Redis or Dragonfly engine, native TLS URL, HTTP endpoint, and usable credentials without persisting them to logs or state
+- **WHEN** the operator opens an HTTP-enabled KV Connection view
+- **THEN** evdb shows its native TLS URL, HTTP endpoint, and usable credentials
+
+#### Scenario: Root overview is displayed
+- **WHEN** the operator has not selected a database
+- **THEN** no password, token, full connection URL, full image reference, or image digest is printed
 
 ### Requirement: Secret-free machine output
-`evdb status --json` and every other machine-readable output SHALL be versioned and contain no password, token, credential-bearing URL, secret-file content, or DNS-provider credential. Terminal presentation SHALL NOT change the stdout contract of `evdb status --json`, which SHALL emit exactly one parseable JSON document and no menu, table, progress indicator, or styled terminal text.
+`evdb status --json` and non-interactive structured output SHALL contain no database, HTTP, DNS,
+Restic, or rclone credential value. Exact credentials and required encoded forms SHALL be replaced,
+while repository URLs, remote names, ordinary paths, image references, snapshot IDs, and unrelated
+subprocess stderr SHALL remain visible.
 
 #### Scenario: Monitoring polls status
-- **WHEN** a future monitor invokes `evdb status --json`
-- **THEN** it receives parseable host and database status without any secret-bearing field
+- **WHEN** monitoring invokes `evdb status --json`
+- **THEN** it receives one parseable status document without credentials
 
-#### Scenario: Operator requests JSON status from a terminal
-- **WHEN** an operator invokes `evdb status --json` while stdout is a terminal
-- **THEN** stdout contains one parseable JSON document rather than Rich-rendered status output
+#### Scenario: Restic reports a missing repository
+- **WHEN** Restic stderr includes the configured repository URL
+- **THEN** evdb prints that URL unchanged rather than replacing it with a redaction marker
+
+#### Scenario: Subprocess prints an exact credential
+- **WHEN** command output includes a value loaded from `secrets.yml` or credential fields in `rclone.conf`
+- **THEN** evdb replaces that exact value before display or journald capture

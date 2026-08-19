@@ -2,44 +2,24 @@
 
 ## Purpose
 
-Define safe remote management, immutable deployment releases, health-gated activation, and release rollback.
+Define direct host-local database creation, configuration, lifecycle, routing, and health checks.
 
 ## Requirements
 
 ### Requirement: Direct settings transaction
-`evdb database configure PROJECT/ROLE` SHALL collect and validate typed settings, render private candidate files, resolve immutable image digests, validate candidate Compose, preview exact changes and restart effects, and require confirmation before changing installed files or services. It SHALL perform at most one restart for all changes in one session.
+`evdb database configure PROJECT/ROLE` SHALL collect and validate role-specific values, atomically
+update `config.yml`, rerender that role's generated files, run Compose once, and wait for native health.
+It SHALL NOT stage a deployment transaction, create a safety backup, snapshot prior files, or recover
+the prior service automatically. Guided settings SHALL show changed values and require one save
+confirmation; an explicit direct command SHALL execute immediately.
 
 #### Scenario: Operator changes two Dragonfly settings
-- **WHEN** memory and threads change in one confirmed session
-- **THEN** evdb installs one generated definition and restarts the KV project once
+- **WHEN** memory and threads are saved in one guided session
+- **THEN** evdb writes both values, renders once, invokes Compose once, and reports the final health result
 
-### Requirement: Safety backup before durable service recreation
-A confirmed settings transaction that recreates the primary container of a durable database SHALL create, validate, and upload a current backup before stopping or replacing that service. Cache-mode KV and sidecar-only changes SHALL not claim to have created a database recovery point when no backup ran.
-
-#### Scenario: Durable Postgres image is updated
-- **WHEN** a compatible same-major image change requires container recreation
-- **THEN** a confirmed Restic snapshot of current data exists before Compose replaces the container
-
-### Requirement: Failed settings recovery
-Before installing a settings transaction, evdb SHALL retain exact prior source, generated files, secret-file metadata, and resolved state. If candidate validation, startup, or health fails after mutation starts, it SHALL restore the previous files and same-engine Compose definition, restart affected prior services, and verify their health without prompting.
-
-#### Scenario: New image is unhealthy
-- **WHEN** a configured same-major image cannot pass container and engine health
-- **THEN** evdb restores the prior image definition and settings and reports whether prior health recovered
-
-### Requirement: Settings activity record
-Every confirmed settings transaction SHALL append a bounded secret-free activity record containing host, project/role, command, changed setting names, start and finish times, result, and recovery result. It SHALL NOT retain a selectable deployment release.
-
-#### Scenario: Settings recovery succeeds
-- **WHEN** candidate health fails and previous settings recover
-- **THEN** activity reports the failed change and successful recovery without storing prior secret values
-
-### Requirement: Unsupported role removal is non-destructive
-Omitting an installed project role from source configuration SHALL NOT stop or remove its containers, route, Compose, secrets, machine state, backups, or data. Host check and status SHALL report an unsupported removal or orphan condition, and every mutating command SHALL fail closed until source is restored or a future retirement workflow handles the role.
-
-#### Scenario: Installed role is removed from YAML
-- **WHEN** host source no longer contains a project/role that still has installed generated state
-- **THEN** evdb leaves all service and persistent assets unchanged and reports that database removal is unsupported
+#### Scenario: New settings fail health
+- **WHEN** the rendered service cannot become healthy
+- **THEN** evdb preserves the readable configured values and generated files, reports the failing operation, and permits correction followed by `database start`
 
 ### Requirement: Dedicated native routing proxy
 evdb SHALL manage one dedicated Traefik Compose project that owns host ports 5432 and 6379, uses the Docker provider on a dedicated external network, carries a concrete healthcheck, and routes every database through a TLS `HostSNI` router and unique role-qualified backend. Postgres and KV roles in the same project MAY share the same SNI hostname because they use separate native entrypoints.
@@ -56,59 +36,63 @@ Dedicated Traefik SHALL use a configured ACME DNS-01 resolver for native databas
 - **THEN** certificate state persists across proxy restarts without exposing the provider token in Compose, status, or logs
 
 ### Requirement: Private PgBouncer runtime access
-Generated PgBouncer services SHALL run without root privileges under an identity that can read the
-evdb-owned configuration and authentication files mounted into that service. PgBouncer configuration
-and authentication files SHALL retain private host permissions, and their contents SHALL NOT appear
-in generated Compose environment, labels, commands, status, activity, or logs.
+Generated PgBouncer services SHALL run without root under an identity that can read the private
+PgBouncer configuration and authentication files generated for that Postgres role. The source password
+SHALL live only in `secrets.yml`; generated files SHALL remain private and credential content SHALL
+not appear in Compose, status, errors, or logs.
 
 #### Scenario: Default PgBouncer starts from private files
-- **WHEN** evdb starts a newly added Postgres role with PgBouncer enabled and managed files owned by the evdb service account
-- **THEN** PgBouncer reads only its mounted configuration and authentication files, becomes healthy as a non-root process, and accepts the managed Postgres login
+- **WHEN** evdb starts a Postgres role with PgBouncer enabled
+- **THEN** PgBouncer reads its role-local generated files, becomes healthy as a non-root process, and accepts the managed Postgres login
 
 #### Scenario: Generated Compose remains secret-free
-- **WHEN** evdb renders or validates the Postgres Compose project
-- **THEN** the Compose document contains the private file paths and runtime identity but no password or authentication-file content
+- **WHEN** evdb renders the Postgres Compose project
+- **THEN** the document contains private file paths and runtime identity but no password or authentication-file content
 
 ### Requirement: Idempotent database creation
 `evdb database add PROJECT postgres` and `evdb database add PROJECT kv [--engine ENGINE]` SHALL
-validate identity, select and persist explicit defaults, generate required private host credentials or
-accept a securely supplied initial Postgres password, render and validate an independent Compose
-project, preview the operation without the credential value, require confirmation, start services, and
-require full health before committing successful installation state. Rerunning an interrupted or
-matching add SHALL not duplicate a role, data directory, secret, project, or route. A matching
-Postgres add with the same supplied password SHALL be unchanged, while a different supplied password
-SHALL be rejected as an unsupported rotation.
+validate identity, persist explicit role settings, generate or securely accept required credentials in
+`secrets.yml`, render role-local files, start Compose, and wait for full native health. Existing matching
+roles SHALL not be duplicated. Creation failure SHALL leave readable source and generated files for
+inspection and retry rather than running candidate rollback.
 
 #### Scenario: Default KV is added
-- **WHEN** the operator confirms a valid absent KV role without selecting an engine
-- **THEN** one Dragonfly-backed KV role with HTTP and backups becomes healthy and source records the engine explicitly
+- **WHEN** the operator adds an absent KV role without selecting an engine
+- **THEN** one Dragonfly-backed KV role with HTTP and backups is recorded and started
 
 #### Scenario: Postgres receives a supplied initial password
-- **WHEN** the operator confirms a valid absent Postgres role with a securely supplied initial password
-- **THEN** Postgres and PgBouncer become healthy using that exact password for the fixed `default` login without persisting the value outside private managed secret files
+- **WHEN** an absent Postgres role is added with a valid securely supplied password
+- **THEN** `secrets.yml`, Postgres, and PgBouncer use that exact password for the fixed `default` login
 
 #### Scenario: Postgres password is omitted
-- **WHEN** the operator confirms a valid absent Postgres role without supplying a password
-- **THEN** evdb generates the private initial password and creates the same healthy default Postgres service
+- **WHEN** an absent Postgres role is added without a password
+- **THEN** evdb generates the password, stores it in `secrets.yml`, and starts the same default service
 
 #### Scenario: Existing Postgres receives a different password
-- **WHEN** an operator reruns add for a matching Postgres role with a supplied password different from the installed credential
-- **THEN** evdb performs no mutation and reports that password rotation requires a separate operation
+- **WHEN** add is rerun for an existing Postgres role with another supplied password
+- **THEN** evdb performs no mutation and reports that password rotation is outside v1
 
 #### Scenario: New creation fails health
-- **WHEN** candidate services cannot become healthy
-- **THEN** evdb stops candidate services, does not claim installation success, and removes only empty files and data proven to belong to that transaction
+- **WHEN** new services cannot become healthy
+- **THEN** evdb reports the concrete failure without deleting the configured role, generated files, or data
 
 ### Requirement: Routine lifecycle commands
-The host CLI SHALL provide `database start`, `stop`, `restart`, and `logs` for one project/role. Start SHALL use installed generated Compose and reconcile stopped services; stop and restart SHALL preserve source, generated definitions, secrets, data, backup history, and tool history. Start and restart SHALL require container, sidecar, contract, and engine health.
+The CLI SHALL provide `database start`, `stop`, `restart`, and `logs` for one project/role. Start and
+restart SHALL rerender role files from current source before invoking Compose and SHALL wait for
+container and engine health. Stop SHALL preserve source, generated files, credentials, data, and backup
+history. Logs SHALL be bounded and redact exact credential values while preserving other output.
 
 #### Scenario: Database is stopped
-- **WHEN** the operator confirms `evdb database stop PROJECT/ROLE`
-- **THEN** only that role's Compose services stop while its project sibling role and all persistent files remain unchanged
+- **WHEN** the operator runs `evdb database stop PROJECT/ROLE`
+- **THEN** only that role's Compose services stop and its persistent files remain unchanged
+
+#### Scenario: Configured role is retried
+- **WHEN** an operator corrects source after a failed start and runs `database start`
+- **THEN** evdb rerenders the corrected role and starts it without requiring a creation transaction
 
 #### Scenario: Logs are requested
 - **WHEN** the operator requests bounded logs
-- **THEN** evdb reads that Compose project's logs and redacts credentials, URLs, references, and secret-bearing fields
+- **THEN** evdb prints the selected Compose project's original log text except for exact managed credential values
 
 ### Requirement: Unambiguous selectors
 Database commands SHALL use `<project>/postgres` or `<project>/kv`. Guided flows MAY select the same identity from a numbered project list. A project name alone SHALL be accepted only when exactly one role exists and no credential-bearing output can be disclosed ambiguously.
@@ -118,62 +102,61 @@ Database commands SHALL use `<project>/postgres` or `<project>/kv`. Guided flows
 - **THEN** evdb performs no mutation and lists the valid project/role identities
 
 ### Requirement: Production guardrails
-Write operations SHALL run on the authoritative host, display its configured host ID and affected project/role or host infrastructure, acquire compatible host/database/repository locks, and require explicit confirmation or `--yes`. They SHALL fail closed on invalid config, unsafe ownership, incompatible schemas, missing prerequisites, or changed operation state.
+Write operations SHALL run on the authoritative host, validate complete canonical source, use
+subprocess argument arrays and relevant host, database, or repository locks, and name the affected host
+and project/role. Guided source edits SHALL require one final save or create confirmation. Explicit
+direct lifecycle and backup commands SHALL execute without a generic `--yes` confirmation layer.
 
-#### Scenario: Host state changes during confirmation
-- **WHEN** installed source or generated files differ from the previewed candidate before mutation
-- **THEN** evdb aborts and asks the operator to run the command again
+#### Scenario: Source is invalid
+- **WHEN** a write command loads invalid `config.yml` or `secrets.yml`
+- **THEN** it fails before writing generated files or invoking Docker, Restic, or systemd
 
 ### Requirement: Production paths
-Host source and generated service files SHALL live under `/etc/evdb`, mutable state under `/var/lib/evdb`, managed tool versions under `/opt/evdb`, and database data under the configured project-first data root. Secrets and mutable state SHALL remain outside tool versions and generated Compose.
+Canonical evdb source SHALL live under `/etc/evdb`; generated services, Traefik assets, local backups,
+locks, and fixed database data SHALL live under `/var/lib/evdb`; and the verified tool SHALL be the
+regular executable `/usr/local/bin/evdb`. No copied rclone file, deployment machine state, activity
+record, restore staging, transaction tree, or configurable data root SHALL be created.
 
-#### Scenario: Tool updates
-- **WHEN** `/opt/evdb/current` changes versions
-- **THEN** every database continues using stable Compose, secret, state, and data paths
+#### Scenario: Tool version changes
+- **WHEN** the verified installer atomically replaces `/usr/local/bin/evdb`
+- **THEN** every database continues using stable source, generated, credential, backup, and data paths
 
 ### Requirement: Mutable rclone configuration
-Host setup SHALL seed live rclone configuration only when absent. Once created, the service account-owned file under `/var/lib/evdb/rclone` SHALL remain mutable and SHALL NOT be overwritten by setup, settings changes, tool updates, or generated Compose because rclone may refresh OAuth data.
+Initialization SHALL validate and persist the absolute path of a provided private native rclone file.
+evdb SHALL use that file in place and SHALL NOT copy, replace, chown, or regenerate it from
+`secrets.yml` during initialization, database changes, or installer updates. The file SHALL remain
+owned and atomically writable by its non-root operator; evdb repository subprocesses SHALL use that
+identity so token refreshes preserve normal manual rclone use.
 
 #### Scenario: Live OAuth token changed
-- **WHEN** setup or tool update runs after rclone refreshes its token
-- **THEN** the existing live rclone file remains byte-for-byte unchanged
-
-### Requirement: Service account
-Database jobs and routine operations SHALL run under the dedicated non-login evdb service account where privilege permits. Setup SHALL grant only required file access and Docker group membership; documentation SHALL identify Docker access as root-equivalent. Privileged setup and tool activation SHALL require root.
-
-#### Scenario: Restore verification starts
-- **WHEN** systemd or an operator starts a backup test
-- **THEN** temporary Docker work and private files use the evdb service identity rather than an interactive user's home
+- **WHEN** initialization runs after rclone refreshes its token
+- **THEN** evdb continues using the configured host file without creating another rclone configuration
 
 ### Requirement: Generated Compose and shared routing
-The system SHALL generate independent YAML Compose definitions for every Postgres and KV role plus dedicated Traefik. Generated images SHALL resolve to immutable digests; no secret value SHALL appear in YAML. Only dedicated Traefik SHALL publish native database ports. Postgres, PgBouncer, Redis, Dragonfly, and HTTP sidecars SHALL use type-qualified projects and unique network identities. Native route uniqueness SHALL be scoped to the Traefik entrypoint so one project can use the same hostname for Postgres and KV.
+The system SHALL generate independent Compose YAML for every Postgres and KV role plus dedicated
+Traefik. Generated services SHALL use configured non-`latest` images directly and SHALL reference
+private role-local files without embedding credentials. Only dedicated Traefik SHALL publish native
+database ports. Services SHALL use role-qualified projects and unique network identities without
+service contract hash labels.
 
 #### Scenario: Generated Compose validates
-- **WHEN** a candidate database or Traefik definition is rendered
-- **THEN** `docker compose config --quiet` succeeds before the file is installed
+- **WHEN** a database or Traefik definition is rendered
+- **THEN** `docker compose config --quiet` succeeds before Compose is started
 
-#### Scenario: Two databases share native port
+#### Scenario: Two databases share a native port
 - **WHEN** several Postgres or KV roles run on one host
-- **THEN** Traefik SNI routes each hostname on that role's native port to its unique database-specific backend
+- **THEN** Traefik SNI routes each hostname on the role's native port to its unique backend
 
 #### Scenario: One project shares one hostname across roles
-- **WHEN** one project has both Postgres and KV roles
-- **THEN** generated native routers use the same `HostSNI` hostname on separate `postgres` and `kv` entrypoints with separate role-qualified backend services
-
-### Requirement: Data-format compatibility guard
-Settings operations SHALL compare the installed role, concrete engine, source image major, backup compatibility, and live data contract. They SHALL reject engine replacement and engine-major changes before stopping a service. Compatible same-engine image updates MAY proceed through the safety-backup transaction.
-
-#### Scenario: Postgres major changes
-- **WHEN** an operator selects a Postgres image with another major version
-- **THEN** evdb rejects the settings change and identifies major migration as a future explicit workflow
-
-#### Scenario: KV implementation changes
-- **WHEN** an operator attempts to change an installed KV role from Redis to Dragonfly
-- **THEN** evdb refuses to treat the conversion as a settings update
+- **WHEN** one project contains Postgres and KV
+- **THEN** separate entrypoints route the shared hostname to distinct role-qualified services
 
 ### Requirement: Local deployment test
-Generated YAML, direct settings transactions, failed-settings recovery, dedicated Traefik, host setup, and tool updates SHALL be tested on disposable local infrastructure. Tests SHALL NOT invoke production hosts, repositories, credentials, Docker changes, cron changes, or systemd changes on `montreal-01`.
+Generated files, direct settings changes, each concrete engine, PgBouncer, HTTP, Traefik, host
+initialization, and installer updates SHALL be tested on disposable infrastructure. Tests SHALL NOT
+invoke production hosts, repositories, credentials, Docker changes, or systemd changes on
+`montreal-01`.
 
 #### Scenario: Full disposable operation completes
-- **WHEN** the integration suite adds and configures test databases
-- **THEN** it proves independent projects, native routing, health gates, safety files, and failure recovery without production resources
+- **WHEN** the integration suite creates and reconfigures test databases
+- **THEN** it proves independent projects, routing, native health, direct retry behavior, and checked backups without production resources

@@ -2,38 +2,56 @@
 
 ## Purpose
 
-Define operational status, safe execution, structured records, and scheduled maintenance behavior.
+Define operational status, safe execution, and the scheduled all-database backup job.
 
 ## Requirements
 
 ### Requirement: Safe command execution
-External commands SHALL use argument arrays without `shell=True`, enforce timeouts, check return codes, and redact secret values from logs and errors.
+External commands SHALL use argument arrays without `shell=True`, enforce finite timeouts, and check
+return codes. evdb SHALL redact exact credential values loaded from `secrets.yml` and credential fields
+in the configured external rclone file, including required encoded forms, while preserving repository URLs, remote names,
+paths, images, snapshot IDs, and unrelated stdout or stderr. Repository subprocesses SHALL use numeric
+user and group identities, exact environment replacement, and explicit inherited file descriptors.
 
-#### Scenario: Tool prints a secret in an error
-- **WHEN** stderr contains a configured secret value
-- **THEN** the stored and displayed error replaces that value with a redaction marker
+#### Scenario: Tool prints a managed credential in an error
+- **WHEN** stderr contains an exact managed password or token
+- **THEN** displayed and journal-captured output replaces that value with a redaction marker
+
+#### Scenario: Tool prints the repository location
+- **WHEN** stderr names the configured Restic repository
+- **THEN** the operator sees the complete repository URL
 
 ### Requirement: Unified database status
-`evdb status` SHALL report every configured project/role's running state, concrete engine health, installed-configuration match, current image, latest completed local backup, latest confirmed Restic snapshot and upload result, latest successful backup test, and current operation failure in one concise table.
+`evdb status` SHALL report each configured project/role's concrete engine, running and native health,
+latest valid backup time and availability, and current assessment error. Human output SHALL use one
+compact overview with Database, Engine, Status, and Backup and SHALL omit images, hashes, generated
+configuration comparison, and full errors until a database is selected or explicitly requested.
 
 #### Scenario: All databases are healthy
-- **WHEN** every configured role is running, matches installed Compose, is backed up, and has recent recovery verification
+- **WHEN** every configured role is running, passes native health, and has a recent remote backup
 - **THEN** status prints one compact healthy row per project/role and exits zero
 
 #### Scenario: One database is unhealthy
-- **WHEN** one role fails an engine health check
-- **THEN** its row identifies the failure, remaining rows are reported, and status exits nonzero
+- **WHEN** one role fails a native health check
+- **THEN** its compact row identifies the unhealthy state, other roles remain visible, and status exits nonzero
+
+#### Scenario: Operator opens one database
+- **WHEN** the operator selects a role from the guided overview
+- **THEN** its full image, paths, settings, backup records, and current error are shown outside the root table
 
 ### Requirement: Host status
-Status SHALL include host identity, installed evdb version, configuration and machine-state consistency, dedicated Traefik and network health, native listener state, free data and backup disk space, required timer state, and any incomplete settings, restore, setup, or update transaction. It SHALL not depend on SSH reachability or an active deployment release.
+Status SHALL include host identity, running evdb version, Traefik and network health, native listeners,
+free `/var/lib/evdb` storage, one backup timer state, repository availability, and source validation.
+It SHALL NOT assess machine-state compatibility, tool-version match, generated contract hashes,
+transaction directories, restore state, or maintenance timers.
 
 #### Scenario: Disk space is below policy
 - **WHEN** free space is below the configured minimum
-- **THEN** status marks the host unhealthy and names the affected evdb filesystem without exposing unrelated host data
+- **THEN** host status identifies the affected filesystem and marks the host unhealthy
 
-#### Scenario: Settings transaction was interrupted
-- **WHEN** private transaction state remains after an interrupted mutation
-- **THEN** host status identifies the affected project/role and directs the operator to a safe host check
+#### Scenario: Backup timer is inactive
+- **WHEN** the one packaged backup timer is not loaded, enabled, and active
+- **THEN** host details report the inactive timer without listing per-database unit names
 
 ### Requirement: Live engine checks
 The host-local runtime SHALL inspect Compose service state and perform an engine-native ping or simple query for each running database. A running container alone SHALL NOT be considered healthy.
@@ -42,50 +60,34 @@ The host-local runtime SHALL inspect Compose service state and perform an engine
 - **WHEN** Docker reports a running primary but the native check fails
 - **THEN** status marks the project/role unhealthy and records the engine check failure
 
-### Requirement: Drift reporting
-Status SHALL compare authoritative host source, installed generated Compose hashes, resolved image state, dedicated network and Traefik, and every expected primary and sidecar's image, health, and service-contract label. Human output SHALL say that configuration or a running service differs rather than exposing desired/deployed/release terminology.
-
-#### Scenario: Live image changed manually
-- **WHEN** a running image digest differs from installed generated Compose and machine state
-- **THEN** status reports that the selected project/role differs from its installed configuration
-
-#### Scenario: Generated Compose was edited
-- **WHEN** an installed Compose file differs from the canonical source-derived structure
-- **THEN** status marks the role unhealthy and directs the operator to run its settings workflow
-
-#### Scenario: Sidecar is unhealthy
-- **WHEN** expected PgBouncer or HTTP service is absent, stopped, unhealthy, or has the wrong contract label
-- **THEN** status marks only that database unhealthy and continues assessing others
-
-#### Scenario: Traefik has no health status
-- **WHEN** dedicated Traefik is running without concrete healthy Docker status
-- **THEN** host status marks native routing unhealthy
-
 ### Requirement: Backup and recovery freshness
-Status SHALL evaluate project/role backup uploads and full backup-test timestamps against host policy and distinguish stale state from the latest operation failure.
+Status SHALL compare the newest matching confirmed Restic snapshot for each durable project/role with
+the configured maximum backup age. It SHALL distinguish missing or stale backup state from runtime
+database health and SHALL NOT evaluate restore-test freshness.
 
 #### Scenario: Backup is stale
-- **WHEN** no confirmed remote snapshot exists within configured maximum age
-- **THEN** status marks the project/role backup stale and exits nonzero
+- **WHEN** no confirmed matching snapshot exists within maximum age
+- **THEN** the role's Backup column reports stale or missing and status exits nonzero
 
-#### Scenario: Backup test is stale
-- **WHEN** no successful isolated backup test exists within configured maximum age
-- **THEN** status marks recovery verification stale
-
-#### Scenario: Last backup attempt failed
-- **WHEN** an operation recorded an error after the latest successful snapshot
-- **THEN** status reports the failure separately from the age of the last success
+#### Scenario: Cache role is displayed
+- **WHEN** a KV role uses cache mode
+- **THEN** its Backup column reports disabled rather than stale
 
 ### Requirement: Structured status output
-`evdb status --json` SHALL emit one secret-free JSON object containing integer `version`, boolean `healthy`, object `host`, object `databases`, and array `errors`. `host` SHALL include host identity, installed tool version, infrastructure health, disk status, timer status, and active transaction summary. `databases` SHALL be keyed by exact `<project>/<role>` identity and each value SHALL include project, role, concrete engine, running and health state, installed image, configuration match, latest backup/upload/test summaries, and a bounded current error when present. Errors SHALL use stable codes and bounded human messages without subprocess dumps or secrets. Additive fields MAY be introduced within one version; removing fields or changing their type or meaning SHALL increment `version`. The command SHALL use the same health exit status as human output and remain suitable for SSH polling and a future read-only central monitor.
+`evdb status --json` SHALL emit one credential-free JSON object containing integer `version`, boolean
+`healthy`, a host object, a databases object keyed by exact project/role, and an errors array. Host
+fields SHALL cover identity, tool version, infrastructure, storage, repository, and the one timer.
+Database fields SHALL cover project, role, engine, running, health, configured image, latest backup,
+and bounded error. Output SHALL omit machine state, contract comparison, operation history, restore,
+backup tests, and maintenance units.
 
 #### Scenario: Automation requests JSON
-- **WHEN** status runs non-interactively with `--json`
-- **THEN** it emits one parseable JSON document, no menu or table text, and no credential-bearing field
+- **WHEN** status runs with `--json`
+- **THEN** stdout contains exactly one parseable document and no terminal presentation or credentials
 
-#### Scenario: Status contract changes incompatibly
-- **WHEN** a release removes a required field or changes its type or meaning
-- **THEN** the top-level status version is incremented and the prior tool is not treated as producing the new contract
+#### Scenario: Human contract changes incompatibly
+- **WHEN** a future release removes or changes a required structured field
+- **THEN** the top-level status version changes
 
 ### Requirement: Partial assessment
 Failure to assess one project/role SHALL NOT prevent status from assessing and reporting other databases or host infrastructure when local execution remains possible.
@@ -94,32 +96,21 @@ Failure to assess one project/role SHALL NOT prevent status from assessing and r
 - **WHEN** one native health command exceeds its timeout
 - **THEN** status records that timeout and continues with remaining roles
 
-### Requirement: Structured logs
-Commands SHALL write concise structured logs with host, project, role, concrete engine when relevant, command, step, result, duration, and redacted error fields. Logs SHALL be useful through journald and readable during local tests. Routine structured log records SHALL be emitted as JSONL when stderr is not an interactive terminal and SHALL NOT appear as raw JSON in ordinary interactive terminal stderr.
-
-#### Scenario: Backup fails
-- **WHEN** an engine backup command fails in a non-interactive job or with stderr redirected
-- **THEN** one error record identifies project/role and failed step without exposing credentials
-
-#### Scenario: Systemd captures command logs
-- **WHEN** a systemd timer or service runs an evdb command with non-terminal stderr
-- **THEN** stderr receives parseable structured JSONL records suitable for journald ingestion
-
-#### Scenario: Operator uses guided CLI in a terminal
-- **WHEN** stdin, stdout, and stderr are interactive terminals and routine status or mutation events are recorded
-- **THEN** evdb does not print raw structured JSON records into the human menu session
-
-#### Scenario: Operator redirects terminal stderr for debugging
-- **WHEN** an operator runs an interactive command with stderr redirected to a file or pipe
-- **THEN** evdb writes the same redacted structured JSONL records to that redirected stream
-
 ### Requirement: Systemd jobs and timer preservation
-The installed package SHALL include canonical systemd units for per-database backups, daily status, due backup testing, weekly Restic checks and retention, and monthly prune. Timers SHALL use persistent scheduling, randomized delays, execution timeouts, and low CPU and I/O priority. Host setup and tool updates SHALL preserve each timer's enabled and running state unless the operator explicitly changes scheduling.
+The package SHALL include exactly one `evdb-backup.service` and one `evdb-backup.timer`. The service
+SHALL run `evdb backup create --all` as root with finite timeout and low CPU and I/O
+priority, while only its Restic and rclone subprocesses drop to the configured rclone owner. The timer
+SHALL be daily, persistent, randomized, and automatically enabled by `evdb init`.
+Initialization and installer refresh SHALL converge it to loaded, enabled, and active.
 
 #### Scenario: Host was offline at backup time
-- **WHEN** a persistent timer becomes active after the host returns
-- **THEN** systemd schedules missed work instead of waiting a full day
+- **WHEN** the persistent timer becomes active after the host returns
+- **THEN** systemd schedules the missed all-database backup
 
-#### Scenario: Tool update refreshes units
-- **WHEN** a candidate package installs compatible canonical units
-- **THEN** enabled and running timers retain state and disabled timers remain disabled
+#### Scenario: Database is added after initialization
+- **WHEN** a new durable role is added
+- **THEN** the unchanged all-database service includes it on the next run without a timer instance or daemon reload
+
+#### Scenario: Installer refreshes units
+- **WHEN** a configured host installs a new evdb release
+- **THEN** rerunnable initialization installs the two packaged units and leaves the timer active

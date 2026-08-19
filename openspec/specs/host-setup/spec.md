@@ -2,87 +2,98 @@
 
 ## Purpose
 
-Define exact-version evdb installation, idempotent host setup, recoverable host tool updates, and
-safe host uninstall.
+Define exact-version evdb installation, idempotent host initialization, and direct tool activation.
 
 ## Requirements
 
 ### Requirement: Published exact-version package
-evdb SHALL be distributed as a checksummed, architecture-specific standalone release archive. Initial
-installation SHALL select and verify the exact version embedded in the downloaded archive, and host
-updates SHALL select an exact semantic version rather than an unbounded latest release. Each archive
-SHALL expose one `evdb` executable with canonical setup and systemd assets.
+evdb SHALL be distributed as checksummed architecture-specific standalone executables with the two
+canonical backup systemd units embedded. Initial install and configured-host updates SHALL verify the
+exact version reported by the downloaded executable before activation.
 
 #### Scenario: Operator installs the first host version
 - **WHEN** the public installer downloads and verifies release `1.0.0` for the host architecture
-- **THEN** the resulting version directory exposes one standalone `evdb` executable with canonical
-  setup and systemd assets
+- **THEN** `/usr/local/bin/evdb` is one standalone command that can install the embedded service and timer
 
 ### Requirement: Idempotent host setup
-`sudo evdb host setup` SHALL check required prerequisites, create the service account and group, establish canonical directories and ownership, initialize host configuration through guided or explicit inputs, create the dedicated Docker network, generate dedicated Traefik files, install canonical systemd units, and finish with a host check. Rerunning setup SHALL converge without changing database data, credentials, timer enablement, or healthy service definitions unnecessarily.
+Top-level `sudo evdb init` SHALL validate prerequisites and canonical source, create root-owned
+directories, initialize routing and Traefik, initialize or verify the one Restic repository,
+install the two systemd units, enable the backup timer, and finish with status. On an existing host it
+SHALL rerun those direct convergence steps without replacing `secrets.yml` values, the configured
+external rclone file, database data, or healthy database Compose projects.
 
-#### Scenario: Setup runs twice
-- **WHEN** an already configured host runs `evdb host setup` again with unchanged inputs
-- **THEN** the second run reports the host ready without restarting databases or replacing secrets
+#### Scenario: Initialization runs twice
+- **WHEN** an already initialized host runs `evdb init` with unchanged source
+- **THEN** the second run verifies the repository and host assets without replacing credentials or restarting databases
+
+#### Scenario: Repository path is absent
+- **WHEN** initialization reaches a configured missing rclone repository path
+- **THEN** it initializes that path before enabling the backup timer
+
+#### Scenario: Initialization fails midway
+- **WHEN** one direct initialization command fails
+- **THEN** evdb reports that command and preserves completed canonical files so the operator can correct the cause and rerun init
 
 ### Requirement: Prerequisite boundary
-Setup SHALL validate Docker with Compose, Restic, rclone, systemd, writable canonical filesystems, DNS
-routing inputs, and availability of native ports 5432 and 6379. It SHALL NOT require a host Python
-runtime, Python package manager, or `uv`. It SHALL provide installation guidance for missing database
-tooling but SHALL NOT install or upgrade unrelated host prerequisites.
+Initialization SHALL validate Docker with Compose, Restic 0.17 or newer, rclone, systemd, writable
+canonical roots, DNS routing input, one backup repository, and free native ports 5432 and 6379. It
+SHALL NOT require host Python, a Python package manager, or `uv`, and SHALL NOT install or upgrade
+unrelated host packages.
 
 #### Scenario: Port 5432 belongs to another proxy
-- **WHEN** setup detects an existing process bound to the dedicated Postgres listener
-- **THEN** setup fails before starting Traefik and directs the operator to perform an explicit routing
-  migration
+- **WHEN** initialization detects an unrelated listener on the dedicated Postgres port
+- **THEN** it fails before starting Traefik and names the occupied port
+
+#### Scenario: Restic is too old
+- **WHEN** the installed Restic version predates deterministic missing-repository exit codes
+- **THEN** initialization names version 0.17 as the minimum and does not inspect or initialize the repository
 
 #### Scenario: Python is absent
-- **WHEN** a standalone evdb release runs setup on a host without Python or `uv`
-- **THEN** setup does not report either development tool as a missing prerequisite
+- **WHEN** the standalone release initializes a host without Python or `uv`
+- **THEN** neither development tool is reported as a missing prerequisite
 
-### Requirement: Least file privilege
-Setup SHALL create a non-login service account, private state and secret directories, root-controlled source configuration, and systemd jobs that run under the service account. Docker access SHALL be documented as root-equivalent.
+### Requirement: Consistent root ownership
+Canonical host commands and the backup job SHALL run as root. Initialization SHALL create root-owned
+private source, generated, database, lock, and partial-backup paths and SHALL NOT create an evdb account
+or grant Docker-group access to another user. Backup ancestors SHALL be root-owned and traverse-only;
+completed backups SHALL be handed to the configured rclone owner read-only. Database containers retain
+their image-specific runtime identities, and only Restic and its rclone child SHALL drop to the rclone
+owner.
 
 #### Scenario: Backup timer starts
-- **WHEN** systemd launches a scheduled backup
-- **THEN** the job runs as the evdb service account with access only to Docker and required evdb files
+- **WHEN** systemd launches the scheduled backup
+- **THEN** the service runs as root while each Restic and rclone repository subprocess runs as the configured non-root rclone owner
 
-### Requirement: Versioned tool installation
-Managed tool versions SHALL live under `/opt/evdb/versions/<version>`, `/opt/evdb/current` SHALL select the active tool, `/opt/evdb/previous` SHALL identify one prior tool, and `/usr/local/bin/evdb` SHALL resolve through the active tool. Database configuration, Compose, secrets, state, and data SHALL NOT be stored in a tool version directory.
+### Requirement: Direct tool installation
+The verified release SHALL be one root-owned regular executable at `/usr/local/bin/evdb`. No
+`/opt/evdb`, current or previous link, version directory, or installed application machine state SHALL
+be created. Source, generated files, credentials, backups, and data SHALL remain outside the command.
 
 #### Scenario: Tool version changes
-- **WHEN** evdb updates from 1.0.0 to 1.1.0
-- **THEN** database files remain at their stable paths while new command invocations use 1.1.0
+- **WHEN** the installer changes from 1.0.0 to 1.1.0
+- **THEN** stable database files remain unchanged and new command invocations use 1.1.0
 
-### Requirement: Exact-version host update
-`evdb host update VERSION` SHALL acquire the host lock, download the exact architecture-specific
-GitHub Release archive and checksum, verify its digest, members, executable version, and systemd
-assets, and stage it as a candidate. It SHALL then run the candidate read-only against current config,
-state, Compose, backup records, and units, preview compatible migrations, and require confirmation
-before switching. It SHALL NOT resolve or install an unbounded latest release.
+### Requirement: Atomic tool activation
+The public installer SHALL fully download and verify a candidate before atomically replacing
+`/usr/local/bin/evdb`. After selection it SHALL run `evdb init --yes` on configured hosts.
+Initialization failure SHALL be reported directly and SHALL NOT trigger an automatic tool rollback.
 
-#### Scenario: Candidate cannot read current state
-- **WHEN** the selected standalone release does not support the installed state schema
-- **THEN** update refuses before changing the active tool, config, units, or services
+#### Scenario: Archive validation fails
+- **WHEN** the candidate checksum or reported version is invalid
+- **THEN** the installer leaves the installed executable unchanged
 
-#### Scenario: Candidate archive is unsafe
-- **WHEN** the selected archive has a mismatched checksum, traversal path, link, duplicate, unexpected
-  member, incomplete units, or executable version other than the selected version
-- **THEN** update removes its staging files and leaves the active and previous versions unchanged
-
-### Requirement: Atomic tool activation and recovery
-Host update SHALL snapshot affected config and unit files, atomically switch the active tool, refresh canonical units without changing timer enablement, and run `evdb host check`. If activation or checking fails, it SHALL restore the previous tool, files, units, and loaded systemd definitions.
-
-#### Scenario: Updated unit fails host check
-- **WHEN** the candidate tool activates but its installed unit contract is invalid
-- **THEN** evdb restores the prior tool and unit files and reports the failed update without touching database data
+#### Scenario: Post-selection initialization fails
+- **WHEN** the new command cannot refresh configured host assets
+- **THEN** the installer exits nonzero with the initialization error while the verified new executable remains installed
 
 ### Requirement: Tool updates do not deploy databases
-A tool update SHALL NOT regenerate database Compose, change image digests, restart database projects, restore data, or perform an engine migration. A candidate that cannot operate existing definitions SHALL be rejected before activation.
+Installer-driven updates and their `evdb init --yes` refresh SHALL NOT rewrite project source,
+credentials, database Compose, data, or images and SHALL NOT restart database roles. They MAY refresh
+Traefik and the two canonical backup units from unchanged host source.
 
-#### Scenario: New renderer would change Compose
-- **WHEN** a package update contains different defaults for newly created databases
-- **THEN** existing installed database Compose remains unchanged solely because the tool updated
+#### Scenario: New release has different engine defaults
+- **WHEN** a configured host installs it
+- **THEN** existing explicit database settings and generated Compose remain unchanged solely because the tool changed
 
 ### Requirement: No Ansible runtime dependency
 Host setup and updates SHALL NOT invoke Ansible, generate inventory, depend on a controller checkout, copy source modules from a workstation, or maintain a separate bootstrap runtime.
@@ -90,14 +101,3 @@ Host setup and updates SHALL NOT invoke Ansible, generate inventory, depend on a
 #### Scenario: Fresh host setup succeeds
 - **WHEN** the exact package and documented prerequisites are present on a VPS
 - **THEN** `evdb host setup` can prepare the host without `ansible-playbook`
-
-### Requirement: Safe host uninstall
-`sudo evdb host uninstall` SHALL stop evdb timers, configured database Compose projects, orphaned evdb containers, Traefik, and the managed Docker network, then remove evdb systemd units and the installed evdb tool. By default it SHALL preserve local configuration, secrets, state, local backups, restore staging, and database data. `sudo evdb host uninstall --purge` SHALL explicitly delete those local managed files after the runtime is stopped. Uninstall SHALL NOT delete remote Restic repositories, DNS records, Docker images, or original external credential files.
-
-#### Scenario: Uninstall preserves local data by default
-- **WHEN** an operator runs `sudo evdb host uninstall`
-- **THEN** services and the installed tool are removed while `/etc/evdb`, `/var/lib/evdb`, and database data remain for reinstall
-
-#### Scenario: Purge deletes local managed data
-- **WHEN** an operator runs `sudo evdb host uninstall --purge`
-- **THEN** local managed config, secrets, state, backups, restore staging, and database data are deleted after services stop

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define verified Restic uploads, stable snapshot identity, serialized repository maintenance, retention, and local testing.
+Define verified Restic uploads, stable snapshot identity, serialized repository access, initialization, and local testing.
 
 ## Requirements
 
@@ -20,44 +20,77 @@ Restic backup SHALL run with JSON output, parse JSON Lines by `message_type`, re
 - **WHEN** Restic returns a nonzero exit code and prints a snapshot id
 - **THEN** upload is marked failed and the local backup is kept
 
-### Requirement: Snapshot identity
-Every snapshot SHALL use stable host, project, and role tags. It SHALL additionally record concrete engine and backup identity metadata without using mutable image details as retention grouping keys. Changing backup format details SHALL be recorded in `backup.json` rather than by changing stable grouping tags.
+### Requirement: User-run repository subprocesses
+Every Restic repository operation SHALL run as the non-root owner of
+`host.backup.rclone_config`, using that account's primary and supplementary groups. evdb SHALL replace
+the inherited root environment with explicit `HOME`, `USER`, `LOGNAME`, `RCLONE_CONFIG`, and a
+user-writable Restic cache location. It SHALL invoke trusted absolute Restic and rclone executables and
+configure Restic to launch that rclone path. The Restic password SHALL be supplied through an inherited
+Linux memory-file descriptor, not arguments, environment variables, or a persistent file.
 
-#### Scenario: Latest snapshot is queried
-- **WHEN** status checks `example-prod-01/kv`
-- **THEN** it finds that role's latest snapshot without matching Postgres from the same project or KV from another project
+#### Scenario: Scheduled repository inspection runs
+- **WHEN** the root backup service checks the configured repository
+- **THEN** Restic and its rclone child run with the rclone file owner's identity and canonical mutable configuration
+
+#### Scenario: Restic reads its password
+- **WHEN** evdb starts any Restic operation
+- **THEN** Restic reads the password from an inherited memory descriptor that is closed when the operation ends
+
+### Requirement: Automatic host repository initialization
+`evdb init` SHALL initialize the one configured host Restic repository before enabling scheduled
+backups. It SHALL run `restic cat config`; success SHALL reuse the repository, the documented
+missing-repository exit SHALL run `restic init --repository-version 1`, and every other result SHALL
+fail with the repository URL and original credential-redacted error. Restic through rclone SHALL create
+the missing remote path without a separate rclone directory operation.
+
+#### Scenario: Configured remote path does not exist
+- **WHEN** Restic 0.17 or newer reports that the configured rclone repository is missing
+- **THEN** initialization creates a format-v1 repository at that exact path and verifies it before enabling the timer
+
+#### Scenario: Repository already exists
+- **WHEN** `restic cat config` succeeds
+- **THEN** initialization preserves the existing repository and does not run `restic init`
+
+#### Scenario: Repository access is denied
+- **WHEN** repository inspection fails for a reason other than the documented missing-repository exit
+- **THEN** initialization fails without attempting another command or hiding the repository and error
+
+### Requirement: Snapshot identity
+Every snapshot in the host repository SHALL use stable host, project, role, concrete engine, backup,
+and purpose tags. History SHALL filter all required identity tags so Postgres, Redis, and Dragonfly
+backups from different projects remain distinct inside one repository.
+
+#### Scenario: Latest snapshots are queried
+- **WHEN** history reads `example-prod-01/kv`
+- **THEN** it returns only matching host, project, role, and concrete-engine snapshots from the shared repository
 
 ### Requirement: Repository locking
-All Restic work for one repository SHALL use one host lock. Backup, status, retention, prune, and check commands SHALL NOT race each other.
+All Restic work SHALL use one lock derived from the configured host repository. Repository
+initialization, backup upload, and snapshot listing SHALL NOT race or use `--no-lock`.
 
-#### Scenario: Repository check is running
-- **WHEN** a backup reaches the same repository
-- **THEN** it waits for the configured lock time or fails clearly without using `--no-lock`
+#### Scenario: Upload is running
+- **WHEN** another role reaches the same host repository
+- **THEN** it waits for the shared repository lock or fails clearly at the configured timeout
 
 ### Requirement: Repository format
-The system SHALL keep existing repositories at format v1 and SHALL work with a pinned current Restic release. Repository format upgrades are outside this capability.
+V1 SHALL require Restic 0.17 or newer, initialize new repositories as format v1, and reject an existing
+repository whose configuration cannot be read with the configured password. Repository upgrades are
+outside v1.
+
+#### Scenario: Restic is too old
+- **WHEN** host initialization detects Restic older than 0.17
+- **THEN** it fails before repository inspection and names the required minimum version
 
 #### Scenario: Repository reports format v2
-- **WHEN** repository validation sees format v2 for an existing production repository
-- **THEN** it reports the mismatch and does not continue with maintenance
-
-### Requirement: Retention and prune
-The system SHALL support the policy of 7 daily, 4 weekly, and 12 monthly snapshots per durable project/role. Forget SHALL run weekly and prune SHALL run monthly. A dry run SHALL be reviewed before deletion is enabled for a repository.
-
-#### Scenario: Weekly retention runs
-- **WHEN** the weekly job applies retention
-- **THEN** snapshots are grouped by stable host/project/role identity and prune does not run
-
-### Requirement: Repository checks
-The system SHALL support weekly structure checks and deterministic rotating data checks using `n/t` subsets so all repository data is covered over time.
-
-#### Scenario: Data check rotation completes
-- **WHEN** all subset numbers from 1 through the configured total have succeeded
-- **THEN** the full set of repository packs has been scheduled for reading once
+- **WHEN** initialization reads an existing format-v2 repository
+- **THEN** it reports that v1 requires repository format v1 and does not upload
 
 ### Requirement: Local test repository
-Integration tests SHALL use a new local Restic repository and test password. They SHALL NOT use production OneDrive remotes, the production Restic password, or production rclone configuration.
+Restic integration tests SHALL create a new disposable repository and password inside temporary test
+storage. At least one integration SHALL use an rclone local remote whose target path is initially
+absent and prove automatic initialization. Tests SHALL NOT use production OneDrive remotes,
+credentials, passwords, or rclone configuration.
 
-#### Scenario: Integration tests run
-- **WHEN** the Restic integration suite starts
-- **THEN** its repository path is inside the temporary test directory
+#### Scenario: Restic integration runs
+- **WHEN** the test initializes its missing rclone-backed repository path
+- **THEN** the resulting repository and all snapshots remain inside the disposable temporary directory
