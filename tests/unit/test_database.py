@@ -20,6 +20,18 @@ def _runtime(monkeypatch):
     return calls
 
 
+def _place(config, identity, root):
+    target = config.select(identity)
+    projects = tuple(
+        replace(project, **{target.role: replace(target.settings, data_root=root)})
+        if project.id == target.project
+        else project
+        for project in config.projects
+    )
+    roots = tuple(dict.fromkeys((*config.host.data_roots, root)))
+    return replace(config, host=replace(config.host, data_roots=roots), projects=projects)
+
+
 def test_add_persists_source_credentials_and_generated_files_before_start(config, monkeypatch):
     calls = _runtime(monkeypatch)
     monkeypatch.setattr(database.random, "token_urlsafe", lambda size: "generated-value")
@@ -55,6 +67,44 @@ def test_add_persists_custom_postgres_identity_and_encodes_connection(config, mo
     assert connection["database"] == "app/data"
     assert "app%20user" in connection["url"]
     assert "/app%2Fdata?" in connection["url"]
+
+
+def test_add_requires_and_persists_selection_when_multiple_roots(config, tmp_path, monkeypatch):
+    parent = tmp_path / "database-volume"
+    parent.mkdir()
+    root = parent / "evdb"
+    selected = replace(
+        config,
+        host=replace(config.host, data_roots=(config.paths.databases, root)),
+    )
+    write(selected)
+
+    with pytest.raises(DatabaseError, match="data root is required"):
+        database.add(selected, "ambiguous-prod-01", "kv")
+
+    _runtime(monkeypatch)
+    updated = database.add(selected, "placed-prod-01", "kv", data_root=root)
+    target = updated.select("placed-prod-01/kv")
+    assert target.settings.data_root == root
+    assert target.data == root / "placed-prod-01/kv/data"
+
+
+def test_add_rejects_unconfigured_or_changed_data_root(config, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    with pytest.raises(DatabaseError, match="not configured"):
+        database.add(config, "outside-prod-01", "kv", data_root=outside)
+
+    monkeypatch.setattr(database, "health", lambda *args: pytest.fail("health after mismatch"))
+    parent = tmp_path / "database-volume"
+    parent.mkdir()
+    root = parent / "evdb"
+    selected = replace(
+        config,
+        host=replace(config.host, data_roots=(config.paths.databases, root)),
+    )
+    write(selected)
+    with pytest.raises(DatabaseError, match="changing database data root"):
+        database.add(selected, "app-test-01", "kv", data_root=root)
 
 
 def test_existing_postgres_rejects_different_creation_identity(config, monkeypatch):
@@ -329,7 +379,7 @@ def test_render_preserves_existing_mode_restricted_data_directory(config, monkey
 def test_render_uses_custom_host_data_root(config, tmp_path, monkeypatch):
     parent = tmp_path / "database-volume"
     parent.mkdir()
-    selected = replace(config, host=replace(config.host, data_root=parent / "evdb"))
+    selected = _place(config, "app-test-01/kv", parent / "evdb")
     target = selected.select("app-test-01/kv")
     monkeypatch.setattr(database.docker, "validate_compose", lambda *args, **kwargs: None)
 
@@ -346,7 +396,7 @@ def test_render_rejects_changed_data_root_before_mutation(config, tmp_path, monk
     before = target.compose.read_text()
     parent = tmp_path / "database-volume"
     parent.mkdir()
-    selected = replace(config, host=replace(config.host, data_root=parent / "evdb"))
+    selected = _place(config, target.identity, parent / "evdb")
     changed = selected.select(target.identity)
 
     with pytest.raises(DatabaseError, match="data root cannot change"):

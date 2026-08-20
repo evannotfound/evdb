@@ -1,7 +1,8 @@
 host:
   id: test-01
   domain: storage.example.com
-  data_root: /tmp/evdb-data-root
+  data_roots:
+  - /tmp/evdb-data-root
   backup:
     repository: rclone:remote:evdb/test-01
     rclone_config: /tmp/evdb-rclone.conf
@@ -15,6 +16,7 @@ projects:
   app-test-01:
     postgres:
       image: postgres:16
+      data_root: /tmp/evdb-data-root
       username: default
       database: postgres
       pgbouncer:
@@ -26,6 +28,7 @@ projects:
     kv:
       engine: redis
       image: redis:7.2.5
+      data_root: /tmp/evdb-data-root
       mode: durable
       http:
         enabled: true

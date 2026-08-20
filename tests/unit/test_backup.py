@@ -110,12 +110,7 @@ def test_cache_backup_never_calls_engine(config, monkeypatch):
     target = target.__class__(
         target.project,
         target.role,
-        target.settings.__class__(
-            target.settings.engine,
-            target.settings.image,
-            "cache",
-            target.settings.http,
-        ),
+        replace(target.settings, mode="cache"),
         target.host,
         target.paths,
         target.credentials,

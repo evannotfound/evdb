@@ -18,7 +18,7 @@ from .config import (
     protected,
     reject_unsupported,
     repository_parts,
-    validate_data_root,
+    validate_data_roots,
     write,
 )
 from .errors import CommandError, ConfigError, Error, HostError
@@ -51,15 +51,17 @@ def initialize(
         else:
             _guard_preload(source_path, managed)
     config = load(source_path, paths=managed) if existing else _initial(values or {}, managed)
-    if existing and values and values.get("data_root") is not None:
+    if existing and values and values.get("data_roots") is not None:
         try:
-            requested = validate_data_root(
-                values["data_root"], managed, config.host.backup.repository
+            requested = validate_data_roots(
+                tuple(Path(value) for value in values["data_roots"]),
+                managed,
+                config.host.backup.repository,
             )
         except ConfigError as exc:
             raise HostError(str(exc)) from exc
-        if requested != config.host.data_root:
-            raise HostError("host.data_root cannot be changed after initialization")
+        if requested != config.host.data_roots:
+            raise HostError("host.data_roots cannot be changed through initialization arguments")
     _require_root(config)
     missing = prerequisites(config)
     if missing:
@@ -143,7 +145,7 @@ def _initial(values: dict[str, Any], paths: Paths) -> Config:
         Host(
             values["host_id"],
             values["domain"],
-            Path(values.get("data_root", paths.databases)),
+            tuple(Path(value) for value in values.get("data_roots", (paths.databases,))),
             BackupSettings(values["repository"], Path(rclone) if rclone else None, 5, 26),
             Routing(values["acme_email"], provider, DEFAULT_IMAGES["traefik"]),
         ),
@@ -160,7 +162,7 @@ def _initial(values: dict[str, Any], paths: Paths) -> Config:
 def _directories(config: Config) -> None:
     try:
         config_mode = 0o700 if config.paths.config == CONFIG_DIR else 0o750
-        for path, mode in (
+        items = (
             (config.paths.config, config_mode),
             (config.paths.projects, 0o700),
             (config.paths.traefik, 0o700),
@@ -168,8 +170,9 @@ def _directories(config: Config) -> None:
             (config.paths.state, 0o711),
             (config.paths.backups, 0o711),
             (config.paths.locks, 0o700),
-            (config.host.data_root, 0o700),
-        ):
+            *((path, 0o700) for path in config.host.data_roots),
+        )
+        for path, mode in items:
             managed_dir(path, mode)
     except OSError as exc:
         raise HostError(str(exc)) from exc
@@ -520,7 +523,7 @@ def _env_file(path: Path) -> dict[str, str]:
 
 
 def _writable(config: Config, unit_dir: Path) -> None:
-    roots = (config.paths.config, config.paths.state, config.host.data_root, unit_dir)
+    roots = (config.paths.config, config.paths.state, *config.host.data_roots, unit_dir)
     for path in roots:
         current = path
         while True:

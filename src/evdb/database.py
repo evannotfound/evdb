@@ -90,6 +90,23 @@ def _bind_source(service: dict[str, Any], target: str) -> Path:
     return matches[0]
 
 
+def _data_root(config: Config, value: str | Path | None) -> Path:
+    if value is None:
+        if len(config.host.data_roots) != 1:
+            raise DatabaseError(
+                "database data root is required when the host configures multiple roots"
+            )
+        return config.host.data_roots[0]
+    path = Path(value)
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise DatabaseError("database data root must be configured on the host") from exc
+    if not path.is_absolute() or path != resolved or path not in config.host.data_roots:
+        raise DatabaseError(f"database data root is not configured on the host: {path}")
+    return path
+
+
 def add(
     config: Config,
     project: str,
@@ -99,6 +116,7 @@ def add(
     password: str | None = None,
     username: str | None = None,
     database_name: str | None = None,
+    data_root: str | Path | None = None,
 ) -> Config:
     identity = f"{project}/{role}"
     if role == "postgres" and engine is not None:
@@ -127,10 +145,15 @@ def add(
                 raise DatabaseError(
                     "changing initialized Postgres identity is outside this operation"
                 )
+            if data_root is not None and existing.settings.data_root != _data_root(
+                current, data_root
+            ):
+                raise DatabaseError("changing database data root is outside this operation")
             with lock(current.paths.role_lock(project, role), timeout=timeout):
                 health(current, existing)
             return current
-        settings = defaults(role, engine or "dragonfly")
+        selected_root = _data_root(current, data_root)
+        settings = defaults(role, selected_root, engine or "dragonfly")
         if role == "postgres":
             from .config import validate_postgres_name
 
@@ -373,7 +396,7 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
         raise DatabaseError(f"setting is not valid for {database.engine}: {unknown[0]}")
     if database.engine == "redis" and ({"memory", "threads"} & (set(values) | set(reset))):
         raise DatabaseError("memory and threads are only valid for Dragonfly")
-    base = defaults(database.role, database.engine)
+    base = defaults(database.role, database.settings.data_root, database.engine)
     updates = dict(values)
     for name in reset:
         updates[name] = _current(base, name)

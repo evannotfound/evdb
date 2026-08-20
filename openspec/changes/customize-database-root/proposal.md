@@ -1,20 +1,21 @@
 ## Why
 
-Database files are fixed under `/var/lib/evdb/databases`, which prevents an operator from placing them
-on a dedicated mounted disk during host setup. The host needs one explicit storage root while preserving
-the existing project and role layout.
+Database files are fixed under `/var/lib/evdb/databases`, which prevents an operator from distributing
+roles across dedicated storage paths. The host needs an allowlisted root catalog and an explicit
+creation-time placement for each database role.
 
 ## What Changes
 
-- **BREAKING**: require `host.data_root` in `config.yml`; fresh setup writes
-  `/var/lib/evdb/databases` by default.
-- Add guided and direct initialization input for one host-wide database data root.
-- Derive every database bind source as `<data_root>/<project>/<role>/data`.
-- Validate the selected root as a safe normalized absolute path and reject overlap with other managed or
-  local repository paths.
-- Reject a changed data bind source when an existing generated Compose file records another root. evdb
-  does not move database data.
-- Keep mount configuration and startup ordering under operator control.
+- **BREAKING**: require a non-empty ordered `host.data_roots` list and an exact `data_root` selection on
+  every Postgres and KV role; no compatibility values are synthesized.
+- Let fresh guided setup collect one or more roots, beginning with `/var/lib/evdb/databases`.
+- Let guided database creation choose an allowlisted root. Direct creation uses the sole root
+  automatically or requires an explicit selection when multiple roots exist.
+- Derive every database bind source as `<selected-root>/<project>/<role>/data`.
+- Validate each root, reject duplicates and overlaps, and reject role selections outside the catalog.
+- Allow operators to edit the catalog in `config.yml` and rerun initialization; referenced roots cannot
+  be removed.
+- Reject changed role data binds when generated Compose records another root. evdb does not move data.
 
 ## Capabilities
 
@@ -24,12 +25,12 @@ None.
 
 ### Modified Capabilities
 
-- `config`: Make the host database data root explicit, safe, and immutable after database generation.
-- `host-setup`: Collect and prepare the host-wide database data root during initialization.
-- `deploy`: Allow database data outside `/var/lib/evdb` while keeping all other production paths fixed.
+- `config`: Define an allowlisted root catalog and explicit immutable placement for every database role.
+- `host-setup`: Collect, validate, and prepare all configured roots and select placement during creation.
+- `deploy`: Allow role data outside `/var/lib/evdb` while keeping all other production paths fixed.
 
 ## Impact
 
-This changes the host source schema, initialization CLI and review, database path derivation, generated
-Compose safety checks, documentation, and focused configuration and database tests. It adds no runtime
-dependency and does not change backup staging or repositories.
+This changes the host and role source schema, initialization and database-creation CLI, path derivation,
+generated Compose safety checks, and focused tests. It adds no runtime dependency and does not change
+backup staging or repositories.

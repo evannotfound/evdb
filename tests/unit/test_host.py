@@ -316,7 +316,7 @@ def test_initial_restic_password_file_is_private_and_existing_config_ignores_rep
     config = host._initial(values, paths)
 
     assert config.secrets.restic_password == "existing repository password"
-    assert config.host.data_root == paths.databases
+    assert config.host.data_roots == (paths.databases,)
     password.chmod(0o644)
     with pytest.raises(host.HostError, match="private regular"):
         host._initial(values, paths)
@@ -370,7 +370,7 @@ def test_host_directories_expose_only_backup_traversal(config):
     for path in (
         config.paths.projects,
         config.paths.traefik,
-        config.host.data_root,
+        *config.host.data_roots,
         config.paths.locks,
     ):
         assert path.stat().st_mode & 0o777 == 0o700
@@ -380,7 +380,10 @@ def test_host_directories_prepare_custom_data_root(config, tmp_path):
     parent = tmp_path / "database-volume"
     parent.mkdir()
     root = parent / "evdb"
-    selected = replace(config, host=replace(config.host, data_root=root))
+    selected = replace(
+        config,
+        host=replace(config.host, data_roots=(config.paths.databases, root)),
+    )
 
     host._directories(selected)
 
@@ -395,7 +398,7 @@ def test_existing_host_rejects_requested_data_root_change(config, tmp_path):
     with pytest.raises(host.HostError, match="cannot be changed"):
         host.initialize(
             config.paths.source,
-            {"data_root": str(parent / "evdb")},
+            {"data_roots": [str(parent / "evdb")]},
             paths=config.paths,
         )
 

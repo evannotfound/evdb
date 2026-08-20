@@ -35,8 +35,10 @@ def test_strict_two_file_round_trip_and_project_role_selectors(config):
         "app-test-01/kv",
     ]
     assert config.select("app-test-01/postgres").compose.name == "compose.yaml"
-    assert config.host.data_root == config.paths.databases
-    assert config.select("app-test-01/kv").data == (config.host.data_root / "app-test-01/kv/data")
+    assert config.host.data_roots == (config.paths.databases,)
+    assert config.select("app-test-01/kv").data == (
+        config.host.data_roots[0] / "app-test-01/kv/data"
+    )
     assert config.paths.source.name == "config.yml"
     assert config.paths.secrets.name == "secrets.yml"
     assert config.host.backup.rclone_config.name == "rclone.conf"
@@ -53,29 +55,47 @@ def test_postgres_identity_is_required_without_compatibility_defaults(config):
         load(config.paths.source, paths=config.paths)
 
 
-def test_data_root_is_required_without_compatibility_default(config):
-    text = config.paths.source.read_text().replace(f"  data_root: {config.paths.databases}\n", "")
+def test_data_roots_are_required_without_compatibility_default(config):
+    text = config.paths.source.read_text().replace(
+        f"  data_roots:\n  - {config.paths.databases}\n", ""
+    )
     config.paths.source.write_text(text)
 
-    with pytest.raises(ConfigError, match="host.data_root is required"):
+    with pytest.raises(ConfigError, match="host.data_roots is required"):
         load(config.paths.source, paths=config.paths)
 
 
-def test_custom_data_root_is_explicit_and_derives_role_paths(config, tmp_path):
+def test_role_data_root_is_required_without_compatibility_default(config):
+    text = config.paths.source.read_text().replace(
+        f"      data_root: {config.paths.databases}\n", "", 1
+    )
+    config.paths.source.write_text(text)
+
+    with pytest.raises(ConfigError, match="postgres.data_root is required"):
+        load(config.paths.source, paths=config.paths)
+
+
+def test_custom_data_roots_are_explicit_and_derive_role_paths(config, tmp_path):
     parent = tmp_path / "database-volume"
     parent.mkdir()
     root = parent / "evdb"
-    selected = replace(config, host=replace(config.host, data_root=root))
+    project = config.projects[0]
+    selected = replace(
+        config,
+        host=replace(config.host, data_roots=(config.paths.databases, root)),
+        projects=(replace(project, postgres=replace(project.postgres, data_root=root)),),
+    )
 
     require_valid(selected)
 
-    assert as_dict(selected)["host"]["data_root"] == str(root)
+    assert as_dict(selected)["host"]["data_roots"] == [str(config.paths.databases), str(root)]
+    assert as_dict(selected)["projects"][project.id]["postgres"]["data_root"] == str(root)
     assert selected.select("app-test-01/postgres").data == (root / "app-test-01/postgres/data")
 
 
 @pytest.mark.parametrize("root", [Path("relative/data"), Path("/")])
 def test_data_root_rejects_relative_and_overlapping_paths(config, root):
-    selected = replace(config, host=replace(config.host, data_root=root))
+    selected = replace(config, host=replace(config.host, data_roots=(root,)))
 
     with pytest.raises(ConfigError, match="host.data_root"):
         require_valid(selected)
@@ -83,16 +103,44 @@ def test_data_root_rejects_relative_and_overlapping_paths(config, root):
 
 def test_custom_data_root_requires_existing_immediate_parent(config, tmp_path):
     root = tmp_path / "missing" / "evdb"
-    selected = replace(config, host=replace(config.host, data_root=root))
+    selected = replace(config, host=replace(config.host, data_roots=(root,)))
 
     with pytest.raises(ConfigError, match="parent is missing or unsafe"):
         require_valid(selected)
 
 
 def test_data_root_rejects_managed_backup_overlap(config):
-    selected = replace(config, host=replace(config.host, data_root=config.paths.backups))
+    selected = replace(config, host=replace(config.host, data_roots=(config.paths.backups,)))
 
     with pytest.raises(ConfigError, match="overlaps an evdb managed path"):
+        require_valid(selected)
+
+
+def test_data_root_catalog_rejects_duplicates_and_overlap(config, tmp_path):
+    parent = tmp_path / "database-volume"
+    parent.mkdir()
+    root = parent / "evdb"
+    root.mkdir()
+    nested = root / "fast"
+
+    duplicate = replace(config, host=replace(config.host, data_roots=(root, root)))
+    with pytest.raises(ConfigError, match="must not contain duplicates"):
+        require_valid(duplicate)
+
+    overlapping = replace(config, host=replace(config.host, data_roots=(root, nested)))
+    with pytest.raises(ConfigError, match="must not overlap"):
+        require_valid(overlapping)
+
+
+def test_role_data_root_must_remain_in_host_catalog(config, tmp_path):
+    root = tmp_path / "removed"
+    project = config.projects[0]
+    selected = replace(
+        config,
+        projects=(replace(project, kv=replace(project.kv, data_root=root)),),
+    )
+
+    with pytest.raises(ConfigError, match="app-test-01/kv: data_root is not configured"):
         require_valid(selected)
 
 

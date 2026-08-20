@@ -89,7 +89,7 @@ class Routing:
 class Host:
     id: str
     domain: str
-    data_root: Path
+    data_roots: tuple[Path, ...]
     backup: BackupSettings
     routing: Routing
 
@@ -119,6 +119,7 @@ class HTTP:
 class Postgres:
     image: str
     pgbouncer: PgBouncer
+    data_root: Path
     username: str = "default"
     database: str = "postgres"
 
@@ -129,6 +130,7 @@ class KV:
     image: str
     mode: str
     http: HTTP
+    data_root: Path
     memory: str | None = None
     threads: int | None = None
 
@@ -221,7 +223,7 @@ class Database:
 
     @property
     def data(self) -> Path:
-        return self.host.data_root / self.project / self.role / "data"
+        return self.settings.data_root / self.project / self.role / "data"
 
     @property
     def generated(self) -> Path:

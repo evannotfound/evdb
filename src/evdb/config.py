@@ -195,6 +195,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             pool = project.postgres.pgbouncer
             item["postgres"] = {
                 "image": project.postgres.image,
+                "data_root": str(project.postgres.data_root),
                 "username": project.postgres.username,
                 "database": project.postgres.database,
                 "pgbouncer": {
@@ -210,6 +211,7 @@ def as_dict(config: Config) -> dict[str, Any]:
             role = {
                 "engine": project.kv.engine,
                 "image": project.kv.image,
+                "data_root": str(project.kv.data_root),
                 "mode": project.kv.mode,
                 "http": {
                     "enabled": http.enabled,
@@ -226,7 +228,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         "host": {
             "id": host.id,
             "domain": host.domain,
-            "data_root": str(host.data_root),
+            "data_roots": [str(path) for path in host.data_roots],
             "backup": backup,
             "routing": {
                 "acme_email": host.routing.acme_email,
@@ -288,11 +290,12 @@ def _rclone_credentials(path: Path) -> list[str]:
     return values
 
 
-def defaults(role: str, engine: str = "dragonfly") -> Postgres | KV:
+def defaults(role: str, data_root: Path, engine: str = "dragonfly") -> Postgres | KV:
     if role == "postgres":
         return Postgres(
             DEFAULT_IMAGES["postgres"],
             PgBouncer(True, DEFAULT_IMAGES["pgbouncer"], 100, 20, 5),
+            data_root,
         )
     if role != "kv" or engine not in {"redis", "dragonfly"}:
         raise ConfigError("database role must be postgres or kv")
@@ -301,6 +304,7 @@ def defaults(role: str, engine: str = "dragonfly") -> Postgres | KV:
         DEFAULT_IMAGES[engine],
         "durable",
         HTTP(True, DEFAULT_IMAGES["http"], 20),
+        data_root,
         "256mb" if engine == "dragonfly" else None,
         1 if engine == "dragonfly" else None,
     )
@@ -397,9 +401,10 @@ def require_valid(config: Config) -> None:
         except ConfigError as exc:
             errors.append(str(exc))
     try:
-        validate_data_root(host.data_root, config.paths, host.backup.repository)
+        roots = validate_data_roots(host.data_roots, config.paths, host.backup.repository)
     except ConfigError as exc:
         errors.append(str(exc))
+        roots = ()
     for managed in (config.paths.config, config.paths.state):
         unsafe = _unsafe_directory(managed)
         if unsafe is not None:
@@ -441,6 +446,8 @@ def require_valid(config: Config) -> None:
             settings = getattr(project, role)
             if settings is None:
                 continue
+            if settings.data_root not in roots:
+                errors.append(f"{project.id}/{role}: data_root is not configured on the host")
             native_domain = f"{project.id}.{host.id}.{host.domain}"
             if not _DOMAIN.fullmatch(native_domain) or len(native_domain) > 253:
                 errors.append(f"{project.id}/{role}: native domain is invalid")
@@ -565,12 +572,28 @@ def validate_data_root(
     return path
 
 
+def validate_data_roots(
+    values: tuple[Path, ...] | list[Path],
+    paths: Paths | None = None,
+    repository: str | None = None,
+) -> tuple[Path, ...]:
+    if not isinstance(values, (list, tuple)) or not values:
+        raise ConfigError("host.data_roots must be a non-empty list of paths")
+    roots = tuple(validate_data_root(value, paths, repository) for value in values)
+    if len(set(roots)) != len(roots):
+        raise ConfigError("host.data_roots must not contain duplicates")
+    for index, root in enumerate(roots):
+        if any(_paths_overlap(root, other) for other in roots[index + 1 :]):
+            raise ConfigError("host.data_roots must not overlap")
+    return roots
+
+
 def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
     if {"databases", "instances", "releases"} & set(data):
         raise ConfigError("unsupported source schema")
     _only(data, {"host", "projects"}, "config")
     host_data = _object(_required(data, "host", "config"), "host")
-    _only(host_data, {"id", "domain", "data_root", "backup", "routing"}, "host")
+    _only(host_data, {"id", "domain", "data_roots", "backup", "routing"}, "host")
     backup_data = _object(_required(host_data, "backup", "host"), "host.backup")
     _only(
         backup_data,
@@ -585,7 +608,7 @@ def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
     host = Host(
         _string(host_data, "id", "host"),
         _string(host_data, "domain", "host"),
-        Path(_string(host_data, "data_root", "host")),
+        _data_roots(_required(host_data, "data_roots", "host")),
         BackupSettings(
             _string(backup_data, "repository", "host.backup"),
             Path(rclone_value) if rclone_value is not None else None,
@@ -617,7 +640,7 @@ def _postgres(value: Any, project: str) -> Postgres:
     data = _object(value, f"projects.{project}.postgres")
     _only(
         data,
-        {"image", "username", "database", "pgbouncer"},
+        {"image", "data_root", "username", "database", "pgbouncer"},
         f"projects.{project}.postgres",
     )
     pool = _object(_required(data, "pgbouncer", f"projects.{project}.postgres"), "pgbouncer")
@@ -631,6 +654,7 @@ def _postgres(value: Any, project: str) -> Postgres:
             _integer(pool, "pool_size", "pgbouncer"),
             _integer(pool, "reserve_size", "pgbouncer"),
         ),
+        Path(_string(data, "data_root", f"projects.{project}.postgres")),
         validate_postgres_name(
             _string(data, "username", f"projects.{project}.postgres"), "username"
         ),
@@ -642,7 +666,11 @@ def _postgres(value: Any, project: str) -> Postgres:
 
 def _kv(value: Any, project: str) -> KV:
     data = _object(value, f"projects.{project}.kv")
-    _only(data, {"engine", "image", "mode", "http", "memory", "threads"}, f"projects.{project}.kv")
+    _only(
+        data,
+        {"engine", "image", "data_root", "mode", "http", "memory", "threads"},
+        f"projects.{project}.kv",
+    )
     http = _object(_required(data, "http", f"projects.{project}.kv"), "http")
     _only(http, {"enabled", "image", "connections", "domain"}, "http")
     domain = _required(http, "domain", "http")
@@ -664,6 +692,7 @@ def _kv(value: Any, project: str) -> KV:
             _integer(http, "connections", "http"),
             domain,
         ),
+        Path(_string(data, "data_root", f"projects.{project}.kv")),
         memory,
         threads,
     )
@@ -682,6 +711,16 @@ def _role_secret(value: Any, project: str, role: str) -> RoleSecrets:
 def _credential(value: Any, name: str) -> None:
     if not isinstance(value, str) or not value or any(char in value for char in "\0\r\n"):
         raise ConfigError(f"{name} must be one non-empty line")
+
+
+def _data_roots(value: Any) -> tuple[Path, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) and item for item in value)
+    ):
+        raise ConfigError("host.data_roots must be a non-empty list of paths")
+    return tuple(Path(item) for item in value)
 
 
 def _read(path: Path) -> Any:

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 
@@ -90,9 +91,17 @@ def test_retained_parser_has_top_level_init_status_database_and_backup():
     assert not hasattr(args, "yes")
     init = cli.parser().parse_args(["init", "--restic-password-file", "/private/password"])
     assert init.restic_password_file == "/private/password"
-    assert cli.parser().parse_args(["init", "--data-root", "/mnt/evdb"]).data_root == ("/mnt/evdb")
+    assert cli.parser().parse_args(
+        ["init", "--data-root", "/mnt/evdb", "--data-root", "/data"]
+    ).data_roots == ["/mnt/evdb", "/data"]
     add = cli.parser().parse_args(["database", "add", "app-test-01", "kv"])
     assert add.engine is None
+    assert (
+        cli.parser()
+        .parse_args(["database", "add", "app-test-01", "kv", "--data-root", "/data"])
+        .data_root
+        == "/data"
+    )
 
 
 def test_command_help_contains_actionable_examples_and_creation_identity():
@@ -466,8 +475,9 @@ def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
         [
             "new-test-01",
             "storage.example.com",
-            "",
             "ops@example.com",
+            "",
+            "n",
             "cloudflare",
             "",
             "6",
@@ -486,7 +496,7 @@ def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
     )
 
     assert values["restic_password"] == ""
-    assert values["data_root"] == "/var/lib/evdb/databases"
+    assert values["data_roots"] == ["/var/lib/evdb/databases"]
     assert values["dns"] == {"CLOUDFLARE_DNS_API_TOKEN": "dns-token"}
     assert prompts == ["CLOUDFLARE_DNS_API_TOKEN: ", "Initial Restic password: "]
     generated = host._restic_password(values)
@@ -499,7 +509,7 @@ def test_guided_init_does_not_prompt_over_supplied_restic_password_file(tmp_path
         {
             "host_id": "new-test-01",
             "domain": "storage.example.com",
-            "data_root": str(tmp_path / "data-root"),
+            "data_roots": [str(tmp_path / "data-root")],
             "acme_email": "ops@example.com",
             "dns_provider": "cloudflare",
             "repository": str(tmp_path / "repository"),
@@ -549,8 +559,33 @@ def test_guided_postgres_advanced_identity_is_redacted(config, monkeypatch):
     assert seen["username"] == "app_user"
     assert seen["database_name"] == "app_db"
     assert seen["password"] == "private password"
+    assert seen["data_root"] == config.host.data_roots[0]
     assert "private password" not in "\n".join(output)
     assert "Password: provided" in "\n".join(output)
+
+
+def test_guided_database_creation_selects_from_multiple_data_roots(config, tmp_path, monkeypatch):
+    root = tmp_path / "database-volume"
+    selected = replace(
+        config,
+        host=replace(config.host, data_roots=(config.host.data_roots[0], root)),
+    )
+    answers = iter(["placed-prod-01", "1", "n", "2", "y"])
+    seen = {}
+
+    def add(current, project, role, **values):
+        seen.update(project=project, role=role, **values)
+        return current
+
+    monkeypatch.setattr(database, "add", add)
+    ui._add(
+        selected,
+        lambda prompt: next(answers),
+        lambda value: None,
+        lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
+    )
+
+    assert seen["data_root"] == root
 
 
 @pytest.mark.parametrize(

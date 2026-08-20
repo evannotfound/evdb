@@ -29,7 +29,11 @@ def test_postgres_and_private_pgbouncer_run_in_disposable_compose(config, tmp_pa
         (
             Project(
                 project,
-                postgres=replace(defaults("postgres"), username="app_user", database="app_db"),
+                postgres=replace(
+                    defaults("postgres", config.host.data_roots[0]),
+                    username="app_user",
+                    database="app_db",
+                ),
             ),
         ),
         (ProjectSecrets(project, postgres=RoleSecrets(password)),),
@@ -93,7 +97,7 @@ def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_pat
         project = _http_project(engine, used)
         password = f"local-{engine}-password"
         token = f"local-{engine}-token"
-        projects.append(Project(project, kv=defaults("kv", engine)))
+        projects.append(Project(project, kv=defaults("kv", config.host.data_roots[0], engine)))
         secrets.append(ProjectSecrets(project, kv=RoleSecrets(password, token)))
         credentials[engine] = (password, token)
     selected = _config(config, tmp_path, tuple(projects), tuple(secrets))

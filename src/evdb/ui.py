@@ -156,6 +156,7 @@ def _add(config: Config, input_fn, output, password_fn) -> Config:
         return config
     role = "postgres" if role_choice == "1" else "kv"
     engine = None
+    data_root = config.host.data_roots[0]
     password = None
     username = None
     database_name = None
@@ -191,7 +192,21 @@ def _add(config: Config, input_fn, output, password_fn) -> Config:
         )
         if username is None or database_name is None or password is None:
             return config
-    summary = {"Database": f"{project}/{role}", "Engine": engine or "postgres"}
+    if len(config.host.data_roots) > 1:
+        selected = choose(
+            input_fn,
+            output,
+            "Database data root",
+            [(str(index), str(path)) for index, path in enumerate(config.host.data_roots, 1)],
+        )
+        if selected is None:
+            return config
+        data_root = config.host.data_roots[int(selected) - 1]
+    summary = {
+        "Database": f"{project}/{role}",
+        "Engine": engine or "postgres",
+        "Data root": str(data_root),
+    }
     if role == "postgres":
         summary.update(
             Username=username or "default",
@@ -213,6 +228,7 @@ def _add(config: Config, input_fn, output, password_fn) -> Config:
         password=password,
         username=username,
         database_name=database_name,
+        data_root=data_root,
     )
     _screen(output, f"{project}/{role} is healthy", heading="Created")
     return updated

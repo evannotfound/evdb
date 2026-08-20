@@ -13,6 +13,7 @@ from .config import (
     rclone_remotes,
     repository_parts,
     validate_data_root,
+    validate_data_roots,
     validate_domain,
     validate_email,
     validate_host_id,
@@ -44,8 +45,10 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--domain", metavar="DOMAIN", help="base domain, e.g. storage.example.com")
     init.add_argument(
         "--data-root",
+        dest="data_roots",
         metavar="PATH",
-        help="absolute host-wide database data root",
+        action="append",
+        help="allowed database data root; repeat to configure more than one",
     )
     init.add_argument("--acme-email", metavar="EMAIL", help="ACME account email")
     init.add_argument("--dns-provider", metavar="PROVIDER", help="cataloged lego provider code")
@@ -76,6 +79,7 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("--engine", choices=("dragonfly", "redis"))
     add.add_argument("--username", help="initial Postgres username (creation only)")
     add.add_argument("--database-name", help="initial Postgres database name (creation only)")
+    add.add_argument("--data-root", metavar="PATH", help="configured database data root")
     add.add_argument(
         "--password-file", metavar="PATH", help="private initial Postgres password file"
     )
@@ -142,7 +146,7 @@ def main(
                 for name in (
                     "host_id",
                     "domain",
-                    "data_root",
+                    "data_roots",
                     "acme_email",
                     "dns_provider",
                     "repository",
@@ -205,6 +209,7 @@ def _database(config, args, output, *, terminal: bool) -> int:
             password=password,
             username=args.username,
             database_name=args.database_name,
+            data_root=args.data_root,
         )
         output(f"{args.project}/{args.role} is healthy")
         return 0
@@ -309,13 +314,13 @@ def _tty() -> bool:
 
 
 def _init_values(
-    values: dict[str, str],
+    values: dict[str, object],
     input_fn,
     password_fn=getpass,
     *,
     output=print,
     source: Path | None = None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     result = dict(values)
     while True:
         _init_host(result, input_fn, output)
@@ -377,12 +382,6 @@ def _init_host(result: dict, input_fn, output) -> None:
             validate_domain,
         ),
         (
-            "data_root",
-            "Database data root",
-            "Dedicated directory for all database files; mount storage before Apply.",
-            lambda value: str(validate_data_root(value)),
-        ),
-        (
             "acme_email",
             "ACME email",
             "Address used for certificate registration and expiry notices.",
@@ -398,11 +397,41 @@ def _init_host(result: dict, input_fn, output) -> None:
             label,
             help_text=help_text,
             validate=validate,
-            default=str(Paths().databases) if name == "data_root" else None,
         )
         if value is None:
             raise KeyboardInterrupt
         result[name] = value
+    _init_data_roots(result, input_fn, output)
+
+
+def _init_data_roots(result: dict, input_fn, output) -> None:
+    if result.get("data_roots"):
+        return
+    roots = []
+    while True:
+        value = ui.ask_text(
+            input_fn,
+            output,
+            "Database data root",
+            default=str(Paths().databases) if not roots else None,
+            help_text="Dedicated directory allowed for database placement.",
+            validate=lambda value: _data_root_candidate(roots, value),
+        )
+        if value is None:
+            raise KeyboardInterrupt
+        if value in roots:
+            output("Database data roots must not contain duplicates")
+            continue
+        roots.append(value)
+        if not ui.confirm(input_fn, "Add another database data root?"):
+            result["data_roots"] = roots
+            return
+
+
+def _data_root_candidate(roots: list[str], value: str) -> str:
+    path = validate_data_root(value)
+    validate_data_roots([*(Path(root) for root in roots), path])
+    return str(path)
 
 
 def _init_dns(result: dict, input_fn, output, password_fn) -> None:
@@ -564,7 +593,7 @@ def _init_review(result: dict) -> str:
         {
             "Host": result["host_id"],
             "Base domain": result["domain"],
-            "Database data root": result["data_root"],
+            "Database data roots": "\n".join(result["data_roots"]),
             "Wildcard": f"*.{result['host_id']}.{result['domain']}",
             "ACME email": result["acme_email"],
             "DNS provider": result["dns_provider"],
@@ -584,7 +613,7 @@ def _edit_init(result: dict, input_fn, output) -> None:
     fields = (
         ("1", "Host ID", ("host_id",)),
         ("2", "Base domain", ("domain",)),
-        ("3", "Database data root", ("data_root",)),
+        ("3", "Database data roots", ("data_roots",)),
         ("4", "ACME email", ("acme_email",)),
         ("5", "DNS provider and credentials", ("dns_provider", "dns", "dns_file")),
         ("6", "Backup repository", ("repository", "rclone_config")),
