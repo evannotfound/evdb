@@ -4,8 +4,10 @@
 `host.data_roots` SHALL be a non-empty ordered list of unique normalized absolute non-symlink paths.
 Entries SHALL NOT overlap one another, source, generated assets, Traefik assets, backups, locks, or a
 local Restic repository. A non-canonical root's immediate parent SHALL already exist and be safe. Every
-Postgres and KV role SHALL store one exact catalog entry as `data_root`. evdb SHALL reject a desired role
-bind source that differs from the source recorded in existing generated Compose and SHALL NOT move data.
+custom root parent MAY be operator-owned but SHALL NOT be group/world-writable, and initialization SHALL
+converge each selected root to `root:root` mode `0700`. Every Postgres and KV role SHALL store one exact
+catalog entry as `data_root`. evdb SHALL reject a desired role bind source that differs from the source
+recorded in existing generated Compose and SHALL NOT move data.
 
 #### Scenario: Two roles select different roots
 - **WHEN** Postgres selects `/data` and KV selects `/var/lib/evdb/databases`
@@ -18,6 +20,10 @@ bind source that differs from the source recorded in existing generated Compose 
 #### Scenario: Catalog roots overlap
 - **WHEN** the catalog contains `/data` and `/data/fast`
 - **THEN** validation rejects the catalog before mutation
+
+#### Scenario: Operator owns a private parent
+- **WHEN** `/data` is operator-owned and not group/world-writable and the catalog contains `/data/databases`
+- **THEN** validation accepts the parent and initialization makes `/data/databases` root-owned and private
 
 #### Scenario: Role selects an absent root
 - **WHEN** a role selects `/removed` and that path is not in `host.data_roots`

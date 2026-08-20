@@ -34,7 +34,8 @@ the initial default. List order is preserved, but multiple roots have no implici
 Every root must be a unique normalized absolute path with no symlinked or non-directory existing
 component. Roots must not overlap one another, evdb configuration, generated assets, Traefik, backups,
 locks, or a local Restic repository. For a non-canonical root, the immediate parent must already exist.
-Every role selection must exactly match one catalog entry. Initialization prepares every root.
+The parent may be operator-owned but must not be group/world-writable. Every role selection must exactly
+match one catalog entry. Initialization converges every selected root to `root:root` mode `0700`.
 
 Fresh guided setup collects roots until the operator is done and shows the ordered list in review.
 Operators may later edit `config.yml` and rerun initialization. Adding or removing an unused root is

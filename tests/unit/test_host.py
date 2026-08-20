@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from evdb import files as files_module
 from evdb import host
 from evdb.models import Paths
 from evdb.run import Result
@@ -391,6 +392,20 @@ def test_host_directories_prepare_custom_data_root(config, tmp_path):
     assert root.stat().st_mode & 0o777 == 0o700
 
 
+def test_canonical_host_directories_take_ownership_of_data_roots(config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(host, "CONFIG_DIR", config.paths.config)
+    monkeypatch.setattr(
+        host,
+        "managed_dir",
+        lambda path, mode, owner=None: calls.append((path, mode, owner)),
+    )
+
+    host._directories(config)
+
+    assert (config.host.data_roots[0], 0o700, (0, 0)) in calls
+
+
 def test_existing_host_rejects_requested_data_root_change(config, tmp_path):
     parent = tmp_path / "database-volume"
     parent.mkdir()
@@ -406,6 +421,12 @@ def test_existing_host_rejects_requested_data_root_change(config, tmp_path):
 def test_canonical_source_directory_converges_to_private_root_layout(config, monkeypatch):
     calls = []
     monkeypatch.setattr(host, "CONFIG_DIR", config.paths.config)
+    real_fchown = files_module.os.fchown
+    monkeypatch.setattr(
+        files_module.os,
+        "fchown",
+        lambda descriptor, uid, gid: real_fchown(descriptor, os.getuid(), os.getgid()),
+    )
     monkeypatch.setattr(
         host,
         "run",

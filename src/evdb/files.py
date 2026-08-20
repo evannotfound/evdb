@@ -16,7 +16,12 @@ def private_dir(path: str | Path) -> Path:
     return managed_dir(path, 0o700)
 
 
-def managed_dir(path: str | Path, mode: int | None) -> Path:
+def managed_dir(
+    path: str | Path,
+    mode: int | None,
+    *,
+    owner: tuple[int, int] | None = None,
+) -> Path:
     folder = Path(path)
     _create_dirs(folder)
     descriptor = os.open(
@@ -30,6 +35,8 @@ def managed_dir(path: str | Path, mode: int | None) -> Path:
         details = os.fstat(descriptor)
         if not stat.S_ISDIR(details.st_mode):
             raise OSError(f"managed directory is unsafe: {folder}")
+        if owner is not None:
+            os.fchown(descriptor, *owner)
         if mode is not None:
             os.fchmod(descriptor, mode)
     finally:

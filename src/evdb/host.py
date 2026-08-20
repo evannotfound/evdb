@@ -170,10 +170,12 @@ def _directories(config: Config) -> None:
             (config.paths.state, 0o711),
             (config.paths.backups, 0o711),
             (config.paths.locks, 0o700),
-            *((path, 0o700) for path in config.host.data_roots),
         )
         for path, mode in items:
             managed_dir(path, mode)
+        owner = (0, 0) if config.paths.config == CONFIG_DIR else None
+        for path in config.host.data_roots:
+            managed_dir(path, 0o700, owner=owner)
     except OSError as exc:
         raise HostError(str(exc)) from exc
 

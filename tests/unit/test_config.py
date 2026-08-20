@@ -109,6 +109,34 @@ def test_custom_data_root_requires_existing_immediate_parent(config, tmp_path):
         require_valid(selected)
 
 
+def test_canonical_data_root_accepts_operator_owned_private_parent(config, tmp_path, monkeypatch):
+    parent = tmp_path / "data"
+    parent.mkdir(mode=0o755)
+    root = parent / "databases"
+    selected = replace(
+        config,
+        host=replace(config.host, data_roots=(config.paths.databases, root)),
+    )
+    monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
+
+    require_valid(selected)
+
+
+def test_canonical_data_root_rejects_group_writable_parent(config, tmp_path, monkeypatch):
+    parent = tmp_path / "data"
+    parent.mkdir(mode=0o775)
+    parent.chmod(0o775)
+    root = parent / "databases"
+    selected = replace(
+        config,
+        host=replace(config.host, data_roots=(config.paths.databases, root)),
+    )
+    monkeypatch.setattr(config_module, "CONFIG_DIR", config.paths.config)
+
+    with pytest.raises(ConfigError, match=r"group/world-writable.*mode=0775"):
+        require_valid(selected)
+
+
 def test_data_root_rejects_managed_backup_overlap(config):
     selected = replace(config, host=replace(config.host, data_roots=(config.paths.backups,)))
 

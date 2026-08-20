@@ -565,10 +565,12 @@ def validate_data_root(
             raise ConfigError(f"host.data_root parent is missing or unsafe: {path.parent}") from exc
         if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
             raise ConfigError(f"host.data_root parent is missing or unsafe: {path.parent}")
-        if managed.config == CONFIG_DIR and (parent.st_uid != 0 or parent.st_mode & 0o022):
-            raise ConfigError(f"host.data_root parent must be safely root-owned: {path.parent}")
-        if managed.config == CONFIG_DIR and path.exists() and path.lstat().st_uid != 0:
-            raise ConfigError(f"host.data_root must be root-owned: {path}")
+        if managed.config == CONFIG_DIR and parent.st_mode & 0o022:
+            mode = stat.S_IMODE(parent.st_mode)
+            raise ConfigError(
+                "host.data_root parent must not be group/world-writable: "
+                f"{path.parent} (uid={parent.st_uid}, mode={mode:04o})"
+            )
     return path
 
 
