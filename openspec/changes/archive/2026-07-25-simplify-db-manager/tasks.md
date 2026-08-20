@@ -17,13 +17,13 @@
 - [x] 2.2 Implement atomic lock loading and writing with source compatibility and duplicate-allocation checks
 - [x] 2.3 Resolve configured image tags to platform-specific immutable digests without changing production containers
 - [x] 2.4 Preserve existing locked image digests and update only entries whose configured source image changed
-- [x] 2.5 Seed current Montreal HTTP ports and allocate the next free stable port for new HTTP-enabled KV databases
+- [x] 2.5 Seed current production HTTP ports and allocate the next free stable port for new HTTP-enabled KV databases
 - [x] 2.6 Render normalized runtime JSON with protected remote secret-file paths while keeping source references and values out of runtime output
 - [x] 2.7 Add tests for deterministic normalization, digest changes, stable ports across reorder/add/remove operations, atomic writes, and lock drift
 
-## 3. Montreal Configuration Migration
+## 3. production Configuration Migration
 
-- [x] 3.1 Convert the 25 Montreal databases into one concise `host.yml` with only real per-database exceptions
+- [x] 3.1 Convert the 25 production databases into one concise `host.yml` with only real per-database exceptions
 - [x] 3.2 Create the initial generated lock with current image digests and the 11 existing HTTP port assignments
 - [x] 3.3 Add a golden comparison proving normalized names, engines, containers, projects, paths, domains, ports, database settings, and secret references match the current contract
 - [x] 3.4 Delete the human-authored `postgres.yml` and `kv.yml` after the golden comparison passes
@@ -42,7 +42,7 @@
 ## 5. 1Password Management
 
 - [x] 5.1 Extend the secret module with a local 1Password client that uses subprocess argument arrays and JSON parsing
-- [x] 5.2 Implement convention-based system, Postgres, and KV item and field names matching existing Montreal items
+- [x] 5.2 Implement convention-based system, Postgres, and KV item and field names matching existing production items
 - [x] 5.3 Preflight desktop or service-account authentication and reject Connect-only authentication for write workflows before any change
 - [x] 5.4 Create missing database password and HTTP token fields idempotently using concealed fields and stdin templates
 - [x] 5.5 Read requested database credentials locally without obtaining secret values from the managed host
@@ -148,4 +148,4 @@
 - [x] 14.5 Update Make targets and command tests so routine operator work uses `evdb` rather than direct Ansible or host-local module commands
 - [x] 14.6 Run Ruff checks and formatting, the full unit suite, disposable Docker integrations, Compose validation, Ansible syntax/check mode, and systemd verification
 - [x] 14.7 Run OpenSpec strict validation, secret scanning, and `git diff --check`
-- [x] 14.8 Confirm implementation and tests perform no deployment, Restic write, Docker change, cron change, or systemd change on `montreal-01`
+- [x] 14.8 Confirm implementation and tests perform no deployment, Restic write, Docker change, cron change, or systemd change on `production-host`

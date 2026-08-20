@@ -11,7 +11,7 @@ need first to be truncated.
 The product is pre-v1 personal tooling for Ubuntu hosts. It needs to retain Postgres, PgBouncer,
 Dragonfly, Redis, Redis-over-HTTP, TLS routing, direct lifecycle control, and remote backups, but it
 does not need an enterprise recovery or deployment framework yet. Production migration remains a
-separate change and no implementation or validation may mutate `montreal-01`.
+separate change and no implementation or validation may mutate `production-host`.
 
 ## Goals / Non-Goals
 

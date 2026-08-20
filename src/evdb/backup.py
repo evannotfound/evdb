@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .config import protected, rclone_owner, validate_image
+from .config import protected, repository_owner, repository_parts, validate_image
 from .engines import get
 from .errors import BackupError, ConfigError, Error, ResticError
 from .files import (
@@ -37,7 +37,7 @@ RCLONE = Path("/usr/bin/rclone")
 def initialize(config: Config) -> None:
     require_version()
     with lock(_repository_lock(config), timeout=300):
-        result = _restic(config, ["cat", "config"], check=False, timeout=300)
+        result = _inspect(config)
         if result.code == MISSING_REPOSITORY:
             _restic(config, ["init", "--repository-version", "1"], timeout=300)
             result = _restic(config, ["cat", "config"], timeout=300)
@@ -48,6 +48,20 @@ def initialize(config: Config) -> None:
                 f"({result.code}): {detail}"
             )
         _require_format(config, result)
+
+
+def preflight(config: Config) -> str:
+    require_version()
+    result = _inspect(config)
+    if result.code == MISSING_REPOSITORY:
+        return "missing"
+    if result.code != 0:
+        detail = result.err.strip() or result.out.strip() or "no output"
+        raise ResticError(
+            f"repository {config.host.backup.repository} is unavailable ({result.code}): {detail}"
+        )
+    _require_format(config, result)
+    return "ready"
 
 
 def require_version() -> None:
@@ -88,7 +102,7 @@ def create(
         raise BackupError(f"invalid backup purpose: {purpose}")
     if not database.compose.is_file():
         raise BackupError(f"database generated files are missing: {database.identity}")
-    operator = rclone_owner(config.host.backup.rclone_config)
+    operator = repository_owner(config.host.backup)
     root = _backup_root(config, database)
     require_space(root, config.host.backup.min_free_gb)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -128,7 +142,8 @@ def create(
             snapshot = _upload(config, database, folder)
         except (Error, OSError) as exc:
             raise ResticError(
-                f"{database.identity}: upload to {config.host.backup.repository} failed; "
+                f"{database.identity}: upload to repository "
+                f"{config.host.backup.repository} failed; "
                 f"local backup retained at {folder}: {exc}"
             ) from exc
         record["upload"] = {
@@ -411,7 +426,7 @@ def _restic(
     timeout: int = 7200,
     check: bool = True,
 ) -> Result:
-    operator = rclone_owner(config.host.backup.rclone_config)
+    operator = repository_owner(config.host.backup)
     credentials = protected(config)
     descriptor = os.memfd_create("evdb-restic-password", os.MFD_CLOEXEC)
     try:
@@ -431,31 +446,33 @@ def _restic(
             }
         elif os.geteuid() != operator.uid:
             raise ResticError(
-                f"Restic must run as root or rclone owner {operator.name} ({operator.uid})"
+                f"Restic must run as root or repository operator {operator.name} ({operator.uid})"
             )
         elif os.getegid() != operator.gid or set(os.getgroups()) - {operator.gid} != set(
             operator.groups
         ):
-            raise ResticError(f"Restic process groups do not match rclone owner {operator.name}")
+            raise ResticError(
+                f"Restic process groups do not match repository operator {operator.name}"
+            )
+        command = [
+            str(RESTIC),
+            "--password-file",
+            f"/proc/self/fd/{descriptor}",
+        ]
+        environment = {
+            "HOME": str(operator.home),
+            "USER": operator.name,
+            "LOGNAME": operator.name,
+            "RESTIC_CACHE_DIR": str(operator.home / ".cache/restic"),
+        }
+        if repository_parts(config.host.backup.repository) is not None:
+            command.extend(["-o", f"rclone.program={RCLONE}"])
+            environment["RCLONE_CONFIG"] = str(config.host.backup.rclone_config)
+        command.extend(["-r", config.host.backup.repository, *args])
         return run(
-            [
-                str(RESTIC),
-                "--password-file",
-                f"/proc/self/fd/{descriptor}",
-                "-o",
-                f"rclone.program={RCLONE}",
-                "-r",
-                config.host.backup.repository,
-                *args,
-            ],
+            command,
             timeout=timeout,
-            env={
-                "HOME": str(operator.home),
-                "USER": operator.name,
-                "LOGNAME": operator.name,
-                "RCLONE_CONFIG": str(config.host.backup.rclone_config),
-                "RESTIC_CACHE_DIR": str(operator.home / ".cache/restic"),
-            },
+            env=environment,
             replace_env=True,
             pass_fds=(descriptor,),
             secrets=credentials,
@@ -464,6 +481,10 @@ def _restic(
         )
     finally:
         os.close(descriptor)
+
+
+def _inspect(config: Config) -> Result:
+    return _restic(config, ["cat", "config"], check=False, timeout=300)
 
 
 def _require_format(config: Config, result: Result) -> None:
@@ -522,7 +543,9 @@ def _handoff(folder: Path, operator: Operator) -> None:
                 _readonly(root / name, operator, directory=True)
         _readonly(folder, operator, directory=True)
     except OSError as exc:
-        raise BackupError(f"completed backup cannot be handed to rclone owner: {folder}") from exc
+        raise BackupError(
+            f"completed backup cannot be handed to repository operator: {folder}"
+        ) from exc
 
 
 def _readonly(path: Path, operator: Operator, *, directory: bool) -> None:

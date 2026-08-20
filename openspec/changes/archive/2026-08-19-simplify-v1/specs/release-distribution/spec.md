@@ -71,7 +71,7 @@ Python, pip, pipx, `uv`, or a Python package registry.
 ### Requirement: Disposable host source workflow
 The repository SHALL retain a guarded workflow that syncs only explicit source, test, and locked
 project files to a disposable non-production VPS and runs a native `uv sync --locked` environment.
-It SHALL reject `montreal-01`, copy no ignored files or credentials, and leave
+It SHALL reject `production-host`, copy no ignored files or credentials, and leave
 the installed `/usr/local/bin/evdb` unchanged. Development commands SHALL invoke the checkout's
 executable explicitly rather than temporarily replacing the installed command.
 
@@ -80,7 +80,7 @@ executable explicitly rather than temporarily replacing the installed command.
 - **THEN** its architecture-native environment runs the source revision without a release
 
 #### Scenario: Developer targets production
-- **WHEN** the target resolves to `montreal-01`
+- **WHEN** the target resolves to `production-host`
 - **THEN** the workflow refuses before any copy, command, or link change
 
 #### Scenario: Development command completes

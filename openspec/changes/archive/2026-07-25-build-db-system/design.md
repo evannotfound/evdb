@@ -1,6 +1,6 @@
 ## Context
 
-`montreal-01` currently has 25 managed database instances under `/home/ubuntu/databases`: 14 Postgres, 7 Dragonfly, and 4 Redis. The current scripts back up only 6 Postgres and 4 KV instances. They delete prior local files before upload is known to be good, handle each engine as one batch, do not check Restic results well enough, and cannot produce a safe Dragonfly RDB.
+`production-host` currently has 25 managed database instances under `/home/ubuntu/databases`: 14 Postgres, 7 Dragonfly, and 4 Redis. The current scripts back up only 6 Postgres and 4 KV instances. They delete prior local files before upload is known to be good, handle each engine as one batch, do not check Restic results well enough, and cannot produce a safe Dragonfly RDB.
 
 Read-only Docker inspection confirmed that the managed database, PgBouncer, HTTP sidecar, and native Traefik containers have no Docker CPU, memory, cpuset, or PID limits. Source config records that current resource contract as `unlimited`, and generated Compose preserves it by adding no resource limit keys.
 
@@ -27,7 +27,7 @@ Production uses Ubuntu 22.04 ARM64, Python 3.10, Docker 29, Compose 2.40, Restic
 
 **Non-Goals:**
 
-- Deploying any part of this repository to `montreal-01`.
+- Deploying any part of this repository to `production-host`.
 - Replacing cron, changing Compose ownership, restarting databases, changing images, upgrading Restic, rotating secrets, or touching the OneDrive repositories.
 - Changing any running Redis instance to Dragonfly.
 - Moving database data or redesigning Traefik.
@@ -65,7 +65,7 @@ src/evdb/
 Related deployment and test files use the same names:
 
 ```text
-config/montreal-01/{host,postgres,kv}.yml
+config/production-host/{host,postgres,kv}.yml
 compose/{postgres,redis,dragonfly,traefik}.yml.j2
 ansible/{hosts,backup,databases,restore}.yml
 ansible/roles/{base,app,backup,postgres,kv,traefik}/
@@ -78,7 +78,7 @@ The alternative flat layout was shorter but would mix engine backup and restore 
 
 ### Source YAML and runtime JSON
 
-Humans edit three small YAML files for `montreal-01`. Ansible and local config tools render one JSON file per instance. Production Python reads only JSON.
+Humans edit three small YAML files for `production-host`. Ansible and local config tools render one JSON file per instance. Production Python reads only JSON.
 
 Each instance keeps two simple sections:
 
@@ -181,11 +181,11 @@ Compose templates are separate for Postgres, Redis, and Dragonfly. They preserve
 Traefik is the only service that publishes host ports 5432 and 6379. Postgres, PgBouncer, Redis, and Dragonfly stay internal.
 
 ```text
-<instance>.postgres-montreal-01.storage.evanovation.com:5432
+<instance>.postgres-production-host.storage.evanovation.com:5432
   -> Traefik TLS HostSNI
   -> <instance>-pgbouncer-1:5432
 
-<instance>.kv-montreal-01.storage.evanovation.com:6379
+<instance>.kv-production-host.storage.evanovation.com:6379
   -> Traefik TLS HostSNI
   -> <instance>-redis-1:6379
 ```
@@ -199,7 +199,7 @@ Every enabled KV HTTP sidecar runs in its instance's Compose project, connects t
 Public HTTP is owned by an external proxy:
 
 ```text
-https://<instance>.kv-montreal-01.storage.evanovation.com
+https://<instance>.kv-production-host.storage.evanovation.com
   -> external proxy :443
   -> 127.0.0.1:133xx
   -> serverless-redis-http
@@ -214,7 +214,7 @@ The `app` role installs a root-owned release at `/opt/evdb/releases/<git-sha>` a
 
 The service account owns state and secret files and belongs to the Docker group. Documentation calls out that Docker access is root-equivalent.
 
-Production is never the default target. Make and Ansible require an explicit target, and any production apply also requires an explicit production flag. The integration suite creates disposable local inventory and does not use `montreal-01`. HTTP tests exercise only disposable sidecars and never contact an external proxy.
+Production is never the default target. Make and Ansible require an explicit target, and any production apply also requires an explicit production flag. The integration suite creates disposable local inventory and does not use `production-host`. HTTP tests exercise only disposable sidecars and never contact an external proxy.
 
 ### Systemd jobs and status
 

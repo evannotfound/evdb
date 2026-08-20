@@ -80,7 +80,7 @@
 - [x] 8.4 Build the standalone executable and smoke-test version, init and parser contracts, status JSON, database lifecycle, and backup create/list commands.
 - [x] 8.5 Run installer shell syntax, archive-layout, first-install, configured-update, init-refresh, and failed-refresh tests.
 - [x] 8.6 Validate the `simplify-v1` OpenSpec change and run an independent code and terminal UX review with no unresolved findings.
-- [x] 8.7 Before remote reset, obtain explicit approval for disposable Toronto files and confirm the development helper still rejects `montreal-01` before subprocess execution.
+- [x] 8.7 Before remote reset, obtain explicit approval for disposable Toronto files and confirm the development helper still rejects `production-host` before subprocess execution.
 - [x] 8.8 On approved Toronto disposable state only, initialize the absent shared repository, create retained engine roles, prove native health and HTTP, run manual and all-role backups, verify timer activation and remote snapshots, inspect readable errors, and deactivate the development command.
 
 ## 9. Unify Host Ownership, Storage, and Installation

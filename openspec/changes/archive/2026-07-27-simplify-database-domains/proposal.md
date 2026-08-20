@@ -1,8 +1,8 @@
 ## Why
 
 Current public database hostnames include the database role, such as
-`test-dev-01.kv-montreal-01.storage.evanovation.com` and
-`test-dev-01.postgres-montreal-01.storage.evanovation.com`. The role label repeats information that
+`test-dev-01.kv-production-host.storage.evanovation.com` and
+`test-dev-01.postgres-production-host.storage.evanovation.com`. The role label repeats information that
 is already carried by the protocol and port, and there are no users to preserve the old contract for.
 
 ## What Changes

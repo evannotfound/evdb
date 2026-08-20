@@ -17,10 +17,11 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
     before = b"[remote]\ntype = local\ntoken = refreshed oauth state\n"
     config.host.backup.rclone_config.write_bytes(before)
     host._install_units(tmp_path / "systemd")
-    monkeypatch.setattr(host, "prerequisites", lambda: [])
+    monkeypatch.setattr(host, "prerequisites", lambda current=None: [])
     monkeypatch.setattr(host, "_require_ports", lambda current: None)
     monkeypatch.setattr(host, "_source_ownership", lambda current: order.append("source ownership"))
     monkeypatch.setattr(host, "_traefik", lambda current: order.append("traefik"))
+    monkeypatch.setattr(host, "_wait_certificate", lambda current: order.append("certificate"))
     monkeypatch.setattr(host.docker, "ensure_network", lambda **kwargs: order.append("network"))
     monkeypatch.setattr(host.backup, "initialize", lambda current: order.append("repository"))
     monkeypatch.setattr(
@@ -53,30 +54,13 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
         "source ownership",
         "network",
         "traefik",
+        "certificate",
         "repository",
         "timer",
     ]
     assert ["systemctl", "daemon-reload"] in calls
     assert ["systemctl", "enable", "--now", "evdb-backup.timer"] in calls
     assert not any("evdb-status" in " ".join(call) for call in calls)
-
-
-def test_init_refuses_production_before_subprocesses(config, monkeypatch):
-    config.paths.source.write_text(
-        config.paths.source.read_text().replace("test-01", "montreal-01", 1)
-    )
-    calls = []
-    monkeypatch.setattr(host, "run", lambda *args, **kwargs: calls.append(args))
-
-    from evdb.errors import HostError
-
-    try:
-        host.initialize(config.paths.source, paths=config.paths)
-    except HostError as exc:
-        assert "separate change" in str(exc)
-    else:
-        raise AssertionError("production host was accepted")
-    assert calls == []
 
 
 def test_prerequisites_require_restic_017_without_python_or_uv(tmp_path, monkeypatch):
@@ -104,25 +88,23 @@ def test_prerequisites_require_restic_017_without_python_or_uv(tmp_path, monkeyp
 
 def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_path, monkeypatch):
     dns = tmp_path / "dns.env"
-    dns.write_text("TESTDNS_TOKEN=private\n")
-    rclone = tmp_path / "seed.conf"
-    rclone.write_text("[local]\ntype = local\n")
-    rclone.chmod(0o600)
+    dns.write_text("CLOUDFLARE_DNS_API_TOKEN=private\n")
     values = {
         "host_id": "new-test-01",
         "domain": "storage.example.com",
         "acme_email": "ops@example.com",
-        "dns_provider": "testdns",
+        "dns_provider": "cloudflare",
         "repository": str(tmp_path / "repository"),
         "dns_file": str(dns),
-        "rclone_config": str(rclone),
     }
-    monkeypatch.setattr(host, "prerequisites", lambda: [])
+    monkeypatch.setattr(host, "prerequisites", lambda current=None: [])
     monkeypatch.setattr(host, "_require_ports", lambda current: None)
     monkeypatch.setattr(host, "_source_ownership", lambda current: None)
     monkeypatch.setattr(host, "_traefik", lambda current: None)
+    monkeypatch.setattr(host, "_wait_certificate", lambda current: None)
     monkeypatch.setattr(host.docker, "ensure_network", lambda **kwargs: None)
     monkeypatch.setattr(host.backup, "initialize", lambda current: None)
+    monkeypatch.setattr(host.backup, "preflight", lambda current: "missing")
     monkeypatch.setattr(host, "_install_units", lambda target: None)
     monkeypatch.setattr(host, "run", lambda args, **kwargs: Result(tuple(args), 0, "", ""))
     monkeypatch.setattr(
@@ -154,26 +136,69 @@ def test_database_traefik_publishes_only_native_ports(config, monkeypatch):
     ]
     assert service["ports"] == ["5432:5432/tcp", "6379:6379/tcp"]
     assert not any("entrypoints.https" in item for item in service["command"])
+    assert "--providers.file.filename=/config/tls.yml" in service["command"]
+    dynamic = yaml.safe_load((config.paths.traefik / "tls.yml").read_text())
+    generated = dynamic["tls"]["stores"]["default"]["defaultGeneratedCert"]
+    assert generated == {
+        "resolver": "evdb",
+        "domain": {"main": "*.test-01.storage.example.com"},
+    }
+
+
+def test_acme_readiness_requires_exact_nonempty_wildcard(config):
+    acme = config.paths.traefik / "acme/acme.json"
+    acme.parent.mkdir(parents=True)
+    acme.write_text(
+        json.dumps(
+            {
+                "evdb": {
+                    "Certificates": [
+                        {
+                            "domain": {"main": "*.other.example.com"},
+                            "certificate": "certificate",
+                            "key": "key",
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    acme.chmod(0o600)
+
+    assert not host.certificate_ready(config)
+
+    acme.write_text(
+        json.dumps(
+            {
+                "evdb": {
+                    "Certificates": [
+                        {
+                            "domain": {"main": host.wildcard(config)},
+                            "certificate": "certificate",
+                            "key": "key",
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    assert host.certificate_ready(config)
 
 
 def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, monkeypatch):
     dns = tmp_path / "dns.env"
-    dns.write_text("TESTDNS_TOKEN=private\n")
-    rclone = tmp_path / "seed.conf"
-    rclone.write_text("[local]\ntype = local\n")
-    rclone.chmod(0o600)
+    dns.write_text("CLOUDFLARE_DNS_API_TOKEN=private\n")
     values = {
         "host_id": "retry-test-01",
         "domain": "storage.example.com",
         "acme_email": "ops@example.com",
-        "dns_provider": "testdns",
+        "dns_provider": "cloudflare",
         "repository": str(tmp_path / "repository"),
         "dns_file": str(dns),
-        "rclone_config": str(rclone),
     }
     order = []
     attempts = iter([RuntimeError("injected network failure"), None])
-    monkeypatch.setattr(host, "prerequisites", lambda: [])
+    monkeypatch.setattr(host, "prerequisites", lambda current=None: [])
     monkeypatch.setattr(host, "_require_ports", lambda current: None)
     monkeypatch.setattr(host, "_source_ownership", lambda current: order.append("source"))
 
@@ -185,7 +210,9 @@ def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, 
 
     monkeypatch.setattr(host.docker, "ensure_network", network)
     monkeypatch.setattr(host, "_traefik", lambda current: order.append("traefik"))
+    monkeypatch.setattr(host, "_wait_certificate", lambda current: order.append("certificate"))
     monkeypatch.setattr(host.backup, "initialize", lambda current: order.append("repository"))
+    monkeypatch.setattr(host.backup, "preflight", lambda current: "missing")
     monkeypatch.setattr(host, "_install_units", lambda target: None)
     monkeypatch.setattr(host, "run", lambda args, **kwargs: Result(tuple(args), 0, "", ""))
     monkeypatch.setattr(
@@ -197,7 +224,7 @@ def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, 
     with pytest.raises(RuntimeError, match="injected"):
         host.initialize(paths.source, values, paths=paths, unit_dir=tmp_path / "systemd")
 
-    assert paths.source.is_file() and paths.secrets.is_file() and rclone.is_file()
+    assert paths.source.is_file() and paths.secrets.is_file()
     assert order == ["source", "network"]
 
     result = host.initialize(
@@ -208,7 +235,15 @@ def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, 
     )
 
     assert result["healthy"]
-    assert order == ["source", "network", "source", "network", "traefik", "repository"]
+    assert order == [
+        "source",
+        "network",
+        "source",
+        "network",
+        "traefik",
+        "certificate",
+        "repository",
+    ]
 
 
 def test_unit_convergence_rejects_symlink_and_nonregular_destinations(tmp_path):
@@ -267,20 +302,16 @@ def test_initial_restic_password_file_is_private_and_existing_config_ignores_rep
     password.write_text("existing repository password\n")
     password.chmod(0o600)
     dns = tmp_path / "dns.env"
-    dns.write_text("TESTDNS_TOKEN=private\n")
+    dns.write_text("CLOUDFLARE_DNS_API_TOKEN=private\n")
     values = {
         "host_id": "password-test-01",
         "domain": "storage.example.com",
         "acme_email": "ops@example.com",
-        "dns_provider": "testdns",
+        "dns_provider": "cloudflare",
         "repository": str(tmp_path / "repository"),
         "dns_file": str(dns),
-        "rclone_config": str(tmp_path / "rclone.conf"),
         "restic_password_file": str(password),
     }
-
-    Path(values["rclone_config"]).write_text("[local]\ntype = local\n")
-    Path(values["rclone_config"]).chmod(0o600)
     config = host._initial(values, paths)
 
     assert config.secrets.restic_password == "existing repository password"
@@ -571,20 +602,6 @@ def test_existing_canonical_initialize_bootstraps_before_strict_load(config, mon
         host.initialize(config.paths.source, paths=config.paths)
 
     assert order == ["bootstrap", "load"]
-
-
-def test_existing_canonical_init_guards_actual_montreal_host_before_subprocesses(
-    config, monkeypatch
-):
-    calls = []
-    monkeypatch.setattr(host, "CONFIG_DIR", config.paths.config)
-    monkeypatch.setattr(host.socket, "gethostname", lambda: "montreal-01.example.com")
-    monkeypatch.setattr(host, "run", lambda *args, **kwargs: calls.append(args))
-
-    with pytest.raises(host.HostError, match="separate change"):
-        host.initialize(config.paths.source, paths=config.paths)
-
-    assert calls == []
 
 
 @pytest.mark.parametrize(

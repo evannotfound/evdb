@@ -148,9 +148,9 @@ primary and supplementary groups, username, and existing home from the host acco
 
 ### Requirement: Old source schema is not supported
 The loader SHALL reject `/etc/evdb/host.yml`, separate generated secret trees, machine-owned host
-state, controller-era database lists, engine-first identities, and migration-only release fields.
-Production conversion SHALL remain a separate approved change.
+state, controller-era database lists, engine-first identities, and obsolete release fields. evdb SHALL
+not convert, import, or synthesize current source from an unsupported layout.
 
-#### Scenario: Previous pre-v1 layout is present
+#### Scenario: Unsupported source layout is present
 - **WHEN** initialization finds `host.yml` or machine state without the new canonical source files
-- **THEN** it fails with a concise reset-or-migrate message and does not synthesize compatibility values
+- **THEN** it names the unsupported source and requires the operator to provide current `config.yml`

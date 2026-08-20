@@ -64,7 +64,7 @@ class Paths:
 @dataclass(frozen=True)
 class BackupSettings:
     repository: str
-    rclone_config: Path
+    rclone_config: Path | None = None
     min_free_gb: int = 5
     max_age_hours: int = 26
 
@@ -94,7 +94,7 @@ class Host:
 
     @property
     def timeouts(self) -> dict[str, int]:
-        return {"command": 300, "health": 120, "backup": 8 * 3600}
+        return {"command": 300, "health": 120, "certificate": 900, "backup": 8 * 3600}
 
 
 @dataclass(frozen=True)
@@ -118,6 +118,8 @@ class HTTP:
 class Postgres:
     image: str
     pgbouncer: PgBouncer
+    username: str = "default"
+    database: str = "postgres"
 
 
 @dataclass(frozen=True)

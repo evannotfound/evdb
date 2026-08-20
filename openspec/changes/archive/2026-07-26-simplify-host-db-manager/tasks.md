@@ -4,7 +4,7 @@
 - [x] 1.2 Add invalid fixtures for duplicate roles, missing environment suffixes, engine/setting mismatches, unsafe paths, image majors, and secret-bearing source
 - [x] 1.3 Add canonical path fixtures rooted entirely in temporary `/etc`, `/var/lib`, `/opt`, and data directories
 - [x] 1.4 Add CLI parser contract tests for every grouped interactive and non-interactive command
-- [x] 1.5 Add disposable host helpers that never target `montreal-01`, production Restic remotes, real DNS, cron, or systemd
+- [x] 1.5 Add disposable host helpers that never target `production-host`, production Restic remotes, real DNS, cron, or systemd
 - [x] 1.6 Update package metadata to expose one `evdb` command and declare required runtime dependencies and package assets
 
 ## 2. Project-First Configuration

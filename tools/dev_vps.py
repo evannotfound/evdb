@@ -11,7 +11,6 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 SYNC_PATHS = ("src", "tests", "pyproject.toml", "uv.lock", "Makefile", "README.md")
-PRODUCTION_HOST = "montreal-01"
 DEV_VERSION = "0.0.dev0"
 
 
@@ -35,14 +34,14 @@ def parser() -> argparse.ArgumentParser:
 
 
 def target_host(target: str) -> str:
-    """Reject the production host before any subprocess can run."""
+    """Validate the explicit SSH target before any subprocess can run."""
     match = re.fullmatch(
         r"(?:(?:[a-z_][a-z0-9_-]*)@)?(?P<host>[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)",
         target,
     )
     host = match.group("host") if match else None
-    if host is None or host == PRODUCTION_HOST:
-        raise DevError("development commands cannot target montreal-01")
+    if host is None:
+        raise DevError("development target must be a valid explicit SSH host")
     return host
 
 
@@ -82,7 +81,6 @@ def remote_script(checkout: str, command: Sequence[str]) -> str:
     """Scope source activation to one guarded remote process."""
     return (
         "set -eu; "
-        f'test "$(hostname -s)" != {PRODUCTION_HOST}; '
         f"{_checkout_guard(checkout)}"
         f"cd {shlex.quote(checkout)}; "
         f'exec env EVDB_DEV=1 PATH="{shlex.quote(checkout)}/.venv/bin:$HOME/.local/bin:$PATH" '
@@ -131,11 +129,7 @@ def sync(target: str, checkout: str, *, run=subprocess.run) -> None:
     target_host(target)
     checkout = checkout_path(checkout)
     manifest = sync_manifest(run=run)
-    prepare = (
-        "set -eu; "
-        f'test "$(hostname -s)" != {PRODUCTION_HOST}; '
-        f"{_checkout_guard(checkout, writable=True)}"
-    )
+    prepare = "set -eu; " + _checkout_guard(checkout, writable=True)
     run(ssh_command(target, prepare), check=True)
     run(
         [

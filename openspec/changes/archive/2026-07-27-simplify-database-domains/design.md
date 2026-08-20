@@ -2,8 +2,8 @@
 
 Database identity is project-first: each project may have one Postgres role and one KV role, addressed
 as `<project>/postgres` and `<project>/kv`. The current public hostname formula includes the role in
-the host label, producing names such as `test-dev-01.postgres-montreal-01.storage.evanovation.com`
-and `test-dev-01.kv-montreal-01.storage.evanovation.com`.
+the host label, producing names such as `test-dev-01.postgres-production-host.storage.evanovation.com`
+and `test-dev-01.kv-production-host.storage.evanovation.com`.
 
 The native routing topology already separates roles by entrypoint: Postgres uses host port `5432`, KV
 uses host port `6379`, and KV HTTP is served by an external HTTPS proxy on port `443`. Internal Docker

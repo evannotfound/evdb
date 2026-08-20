@@ -32,7 +32,7 @@
 
 - [x] 5.1 Add a standard-library development helper that requires an explicit host and remote checkout path and invokes `ssh` and `rsync` with subprocess argument arrays.
 - [x] 5.2 Make sync transfer only `src/`, `tests/`, and named project metadata before running remote `uv sync --project PATH --locked`.
-- [x] 5.3 Refuse `montreal-01` before any subprocess call and add tests proving no copy, link, evdb, or host mutation is attempted.
+- [x] 5.3 Refuse `production-host` before any subprocess call and add tests proving no copy, link, evdb, or host mutation is attempted.
 - [x] 5.4 Add explicit activation and deactivation commands that leave `/opt/evdb/current` untouched and restore `/usr/local/bin/evdb` to `/opt/evdb/current/bin/evdb`.
 - [x] 5.5 Document one-time uv/checkout setup, fast explicit-path execution, reversible systemd activation, sudo behavior, architecture independence, and the prohibition on host update while development activation is active.
 - [x] 5.6 Update README development links and command examples without making uv or Python a production prerequisite.

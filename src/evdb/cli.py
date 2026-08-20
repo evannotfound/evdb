@@ -6,14 +6,31 @@ import sys
 from getpass import getpass
 from pathlib import Path
 
-from . import __version__, backup, database, status, ui
-from .config import CONFIG_DIR, load
+from . import __version__, backup, database, dns, status, ui
+from .config import (
+    CONFIG_DIR,
+    load,
+    rclone_remotes,
+    repository_parts,
+    validate_domain,
+    validate_email,
+    validate_host_id,
+)
 from .errors import Error
 from .run import clean
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="evdb")
+    dns.catalog()
+    result = argparse.ArgumentParser(
+        prog="evdb",
+        description="Manage host-local Postgres and Redis-compatible databases.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n  sudo evdb init\n  sudo evdb status\n"
+            "  sudo evdb database add notes-prod-01 postgres"
+        ),
+    )
     result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     result.add_argument(
         "--config", default=os.getenv("EVDB_CONFIG", str(CONFIG_DIR / "config.yml"))
@@ -21,15 +38,23 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command")
 
     init = commands.add_parser("init", help="initialize or refresh this host")
-    init.add_argument("--host-id")
-    init.add_argument("--domain")
-    init.add_argument("--acme-email")
-    init.add_argument("--dns-provider")
-    init.add_argument("--repository")
-    init.add_argument("--restic-password-file")
-    init.add_argument("--dns-file")
-    init.add_argument("--rclone-config")
-    init.add_argument("--yes", action="store_true")
+    init.add_argument("--host-id", metavar="NAME", help="lowercase host name, e.g. example-01")
+    init.add_argument("--domain", metavar="DOMAIN", help="base domain, e.g. storage.example.com")
+    init.add_argument("--acme-email", metavar="EMAIL", help="ACME account email")
+    init.add_argument("--dns-provider", metavar="PROVIDER", help="cataloged lego provider code")
+    init.add_argument(
+        "--repository", metavar="REPOSITORY", help="rclone:REMOTE:PATH or absolute local path"
+    )
+    init.add_argument(
+        "--restic-password-file", metavar="PATH", help="private initial Restic password file"
+    )
+    init.add_argument(
+        "--dns-file", metavar="PATH", help="provider KEY=VALUE file for non-interactive setup"
+    )
+    init.add_argument("--rclone-config", metavar="PATH", help="private native rclone configuration")
+    init.add_argument(
+        "--yes", action="store_true", help="refresh an already configured host without prompts"
+    )
 
     show = commands.add_parser("status", help="show host and database health")
     show.add_argument("database", nargs="?")
@@ -42,7 +67,11 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("project")
     add.add_argument("role", choices=("postgres", "kv"))
     add.add_argument("--engine", choices=("dragonfly", "redis"))
-    add.add_argument("--password-file")
+    add.add_argument("--username", help="initial Postgres username (creation only)")
+    add.add_argument("--database-name", help="initial Postgres database name (creation only)")
+    add.add_argument(
+        "--password-file", metavar="PATH", help="private initial Postgres password file"
+    )
     info = database_commands.add_parser("info")
     info.add_argument("database")
     configure = database_commands.add_parser("configure")
@@ -116,10 +145,10 @@ def main(
                 if getattr(args, name) is not None
             }
             if not source.is_file() and not args.yes and _tty():
-                values = _init_values(values, input_fn, password_fn)
+                values = _init_values(values, input_fn, password_fn, output=output, source=source)
             from . import host
 
-            value = host.initialize(source, values)
+            value = host.initialize(source, values, output=output)
             output(f"{value['host']['id']}: initialization complete")
             return 0 if value["host"]["healthy"] else 1
         if args.command is None:
@@ -157,6 +186,8 @@ def _database(config, args, output, *, terminal: bool) -> int:
             raise Error("--engine is only valid for a KV database")
         if args.role == "kv" and args.password_file:
             raise Error("--password-file is only valid for Postgres")
+        if args.role == "kv" and (args.username or args.database_name):
+            raise Error("--username and --database-name are only valid for Postgres")
         password = database.password_file(args.password_file) if args.password_file else None
         database.add(
             config,
@@ -164,6 +195,8 @@ def _database(config, args, output, *, terminal: bool) -> int:
             args.role,
             engine=args.engine,
             password=password,
+            username=args.username,
+            database_name=args.database_name,
         )
         output(f"{args.project}/{args.role} is healthy")
         return 0
@@ -171,7 +204,7 @@ def _database(config, args, output, *, terminal: bool) -> int:
     if command == "info":
         if not terminal:
             raise Error("database info prints credentials and requires a terminal")
-        output(ui.pairs(database.info(config, target)))
+        output(ui.database_details(database.info(config, target), include_connection=True))
     elif command == "configure":
         values = {
             name: getattr(args, name)
@@ -267,27 +300,288 @@ def _tty() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def _init_values(values: dict[str, str], input_fn, password_fn=getpass) -> dict[str, str]:
-    prompts = (
-        ("host_id", "Host ID"),
-        ("domain", "Base domain"),
-        ("acme_email", "ACME email"),
-        ("dns_provider", "DNS provider"),
-        ("repository", "Restic repository"),
-        ("dns_file", "DNS credential file"),
-        ("rclone_config", "Rclone configuration"),
-    )
+def _init_values(
+    values: dict[str, str],
+    input_fn,
+    password_fn=getpass,
+    *,
+    output=print,
+    source: Path | None = None,
+) -> dict[str, str]:
     result = dict(values)
-    for name, prompt in prompts:
+    while True:
+        _init_host(result, input_fn, output)
+        _init_dns(result, input_fn, output, password_fn)
+        _init_backup(result, input_fn, output)
+        if not result.get("restic_password_file") and "restic_password" not in result:
+            result["restic_password"] = (
+                ui.ask_secret(password_fn, output, "Initial Restic password") or ""
+            )
+
+        error = None
+        try:
+            if source is not None:
+                from .host import _initial
+                from .models import Paths
+
+                _initial(result, Paths(config=source.parent))
+        except Error as exc:
+            error = clean(str(exc))
+
+        output("")
+        output("Review initialization")
+        output(_init_review(result))
+        if error:
+            output("")
+            output(f"Cannot apply: {error}")
+            action = ui.choose(
+                input_fn,
+                output,
+                "Next",
+                [("1", "Edit"), ("0", "Cancel")],
+            )
+        else:
+            action = ui.choose(
+                input_fn,
+                output,
+                "Next",
+                [("1", "Apply"), ("2", "Edit"), ("0", "Cancel")],
+                default="1",
+            )
+            if action == "1":
+                return result
+        if action in {None, "0"}:
+            raise KeyboardInterrupt
+        _edit_init(result, input_fn, output)
+
+
+def _init_host(result: dict, input_fn, output) -> None:
+    fields = (
+        (
+            "host_id",
+            "Host ID",
+            "Used in wildcard and database hostnames; example: example-01",
+            validate_host_id,
+        ),
+        (
+            "domain",
+            "Base domain",
+            "DNS zone used for database hostnames; example: storage.example.com",
+            validate_domain,
+        ),
+        (
+            "acme_email",
+            "ACME email",
+            "Address used for certificate registration and expiry notices.",
+            validate_email,
+        ),
+    )
+    for name, label, help_text, validate in fields:
         if result.get(name):
             continue
-        try:
-            value = input_fn(f"{prompt}: ").strip()
-        except EOFError as exc:
-            raise Error(f"{name.replace('_', '-')} is required") from exc
-        if not value:
-            raise Error(f"{name.replace('_', '-')} is required")
+        value = ui.ask_text(
+            input_fn,
+            output,
+            label,
+            help_text=help_text,
+            validate=validate,
+        )
+        if value is None:
+            raise KeyboardInterrupt
         result[name] = value
-    if not result.get("restic_password_file"):
-        result["restic_password"] = password_fn("Initial Restic password (blank to generate): ")
-    return result
+
+
+def _init_dns(result: dict, input_fn, output, password_fn) -> None:
+    if not result.get("dns_provider"):
+        while True:
+            term = ui.ask_text(
+                input_fn,
+                output,
+                "Search DNS providers",
+                help_text="Enter part of a provider name or code; example: cloudflare",
+            )
+            if term is None:
+                raise KeyboardInterrupt
+            matches = dns.search(term)
+            if not matches:
+                output("No supported DNS providers match that search")
+                continue
+            if len(matches) > 20:
+                output(f"{len(matches)} providers match; enter a more specific search")
+                continue
+            key = ui.choose(
+                input_fn,
+                output,
+                "Provider",
+                [
+                    (str(index), f"{item['name']} ({item['code']})")
+                    for index, item in enumerate(matches, 1)
+                ],
+                default="1" if len(matches) == 1 else None,
+            )
+            if key is None:
+                raise KeyboardInterrupt
+            result["dns_provider"] = matches[int(key) - 1]["code"]
+            break
+    else:
+        result["dns_provider"] = dns.normalize(result["dns_provider"])
+    if result.get("dns_file") or "dns" in result:
+        return
+    selected = dns.provider(result["dns_provider"])
+    output("")
+    output(f"{selected['name']} ({selected['code']})")
+    output(f"Provider help: {selected['help']}")
+    result["dns"] = _dns_variables(
+        selected["credentials"], input_fn, output, password_fn, heading="Credential variables"
+    )
+    if selected["additional"] and ui.confirm(input_fn, "Configure advanced DNS variables?"):
+        result["dns"].update(
+            _dns_variables(
+                selected["additional"],
+                input_fn,
+                output,
+                password_fn,
+                heading="Advanced variables",
+            )
+        )
+
+
+def _dns_variables(items, input_fn, output, password_fn, *, heading: str) -> dict[str, str]:
+    values = {}
+    names = tuple(items)
+    while True:
+        output("")
+        output(heading)
+        options = [(str(index), f"{name} - {items[name]}") for index, name in enumerate(names, 1)]
+        options.append(("0", "Done"))
+        selected = ui.choose(input_fn, output, "Variable", options)
+        if selected in {None, "0"}:
+            return values
+        name = names[int(selected) - 1]
+        if dns.secret_variable(name):
+            value = ui.ask_secret(password_fn, output, name, required=True)
+        else:
+            value = ui.ask_text(input_fn, output, name)
+        if value is None:
+            raise KeyboardInterrupt
+        values[name] = value
+
+
+def _init_backup(result: dict, input_fn, output) -> None:
+    parts = repository_parts(result["repository"]) if result.get("repository") else None
+    if result.get("repository") and parts is None:
+        result.pop("rclone_config", None)
+        return
+    if not result.get("repository"):
+        mode = ui.choose(
+            input_fn,
+            output,
+            "Backup storage",
+            [("1", "Rclone remote"), ("2", "Local filesystem")],
+            default="1",
+        )
+        if mode is None:
+            raise KeyboardInterrupt
+        if mode == "2":
+            value = ui.ask_text(
+                input_fn,
+                output,
+                "Local repository",
+                help_text=(
+                    "Use an absolute path under a safe non-root-owned parent; "
+                    "example: /srv/restic/evdb"
+                ),
+                validate=_local_repository,
+            )
+            if value is None:
+                raise KeyboardInterrupt
+            result["repository"] = value
+            result.pop("rclone_config", None)
+            return
+    if not result.get("rclone_config"):
+        value = ui.ask_text(
+            input_fn,
+            output,
+            "Rclone configuration",
+            help_text=(
+                "Absolute path reported by `rclone config file`; mode 0600 and non-root-owned."
+            ),
+            validate=lambda value: value if rclone_remotes(Path(value)) else _no_remotes(),
+        )
+        if value is None:
+            raise KeyboardInterrupt
+        result["rclone_config"] = value
+    remotes = rclone_remotes(Path(result["rclone_config"]))
+    if not result.get("repository"):
+        key = ui.choose(
+            input_fn,
+            output,
+            "Rclone remote",
+            [(str(index), f"{remote}:") for index, remote in enumerate(remotes, 1)],
+        )
+        if key is None:
+            raise KeyboardInterrupt
+        remote = remotes[int(key) - 1]
+        relative = ui.ask_text(
+            input_fn,
+            output,
+            "Repository path",
+            default=f"evdb/{result['host_id']}",
+            validate=lambda value: value if repository_parts(f"rclone:{remote}:{value}") else value,
+        )
+        if relative is None:
+            raise KeyboardInterrupt
+        result["repository"] = f"rclone:{remote}:{relative}"
+
+
+def _no_remotes():
+    raise Error("rclone configuration contains no remotes")
+
+
+def _local_repository(value: str) -> str:
+    if repository_parts(value) is not None:
+        raise Error("local repository must be an absolute filesystem path")
+    return value
+
+
+def _init_review(result: dict) -> str:
+    credentials = result.get("dns", {})
+    return ui.pairs(
+        {
+            "Host": result["host_id"],
+            "Base domain": result["domain"],
+            "Wildcard": f"*.{result['host_id']}.{result['domain']}",
+            "ACME email": result["acme_email"],
+            "DNS provider": result["dns_provider"],
+            "DNS variables": ", ".join(sorted(credentials))
+            if credentials
+            else (f"file {result['dns_file']}" if result.get("dns_file") else "provider identity"),
+            "Repository": result["repository"],
+            "Rclone config": result.get("rclone_config") or "not used",
+            "Restic password": "file"
+            if result.get("restic_password_file")
+            else ("provided" if result.get("restic_password") else "generated"),
+        }
+    )
+
+
+def _edit_init(result: dict, input_fn, output) -> None:
+    fields = (
+        ("1", "Host ID", ("host_id",)),
+        ("2", "Base domain", ("domain",)),
+        ("3", "ACME email", ("acme_email",)),
+        ("4", "DNS provider and credentials", ("dns_provider", "dns", "dns_file")),
+        ("5", "Backup repository", ("repository", "rclone_config")),
+        ("6", "Restic password", ("restic_password", "restic_password_file")),
+    )
+    selected = ui.choose(
+        input_fn,
+        output,
+        "Edit",
+        [(key, label) for key, label, _names in fields] + [("0", "Cancel")],
+    )
+    if selected in {None, "0"}:
+        return
+    names = next(names for key, _label, names in fields if key == selected)
+    for name in names:
+        result.pop(name, None)

@@ -42,4 +42,4 @@ The current unshipped manager wraps Docker Compose and database recovery in a co
 - Replaces both installed command entry points with one host-local `evdb` command and changes configuration, generated files, state, service units, and documentation paths.
 - Preserves Docker Compose, Docker, Traefik, Restic, rclone, systemd, engine-native backup tools, and disposable integration testing.
 - Requires a published versioned Python package and `uv` for initial installation and exact-version host updates.
-- Requires a separate production migration change to inventory and move the existing Montreal Compose projects, `.env` files, shared Traefik listeners, data paths, timers, and credentials without modifying production during this change.
+- Requires a separate production migration change to inventory and move the existing production Compose projects, `.env` files, shared Traefik listeners, data paths, timers, and credentials without modifying production during this change.

@@ -5,17 +5,29 @@ import socket
 import ssl
 import time
 import uuid
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import yaml
 
+from evdb import host
 from evdb.run import run
 
 REDIS_IMAGE = "redis:7.2.5"
 TRAEFIK_IMAGE = "traefik:v3.7.8"
+PEBBLE_IMAGE = (
+    "ghcr.io/letsencrypt/pebble@"
+    "sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199"
+)
+CHALLENGE_IMAGE = (
+    "ghcr.io/letsencrypt/pebble-challtestsrv@"
+    "sha256:12ce21884def456bcf9786542113949e1f19dc7738d2c70e156c2d0c38a1405b"
+)
+PYTHON_IMAGE = "python@sha256:05b2b8b732ecd268fee8727a369f936f022d1321b59befd13c30ede22769dcdc"
 
 
-def test_traefik_tls_sni_isolates_two_disposable_redis_backends(tmp_path):
+def test_traefik_wildcard_tls_sni_isolates_two_disposable_redis_backends(tmp_path):
     _require_docker()
     if shutil.which("openssl") is None:
         pytest.fail("openssl is required for the Traefik integration")
@@ -32,7 +44,6 @@ def test_traefik_tls_sni_isolates_two_disposable_redis_backends(tmp_path):
     cert = tmp_path / "cert.pem"
     key = tmp_path / "key.pem"
     dynamic = tmp_path / "dynamic.yml"
-    hostnames = tuple(hosts)
     run(
         [
             "openssl",
@@ -44,9 +55,9 @@ def test_traefik_tls_sni_isolates_two_disposable_redis_backends(tmp_path):
             "-days",
             "1",
             "-subj",
-            f"/CN={hostnames[0]}",
+            "/CN=*.test.invalid",
             "-addext",
-            f"subjectAltName=DNS:{hostnames[0]},DNS:{hostnames[1]}",
+            "subjectAltName=DNS:*.test.invalid",
             "-keyout",
             str(key),
             "-out",
@@ -141,6 +152,148 @@ def test_traefik_tls_sni_isolates_two_disposable_redis_backends(tmp_path):
             run(["docker", "network", "rm", network], timeout=60, check=False)
 
 
+def test_traefik_obtains_wildcard_from_disposable_acme(config, tmp_path):
+    _require_docker()
+    suffix = uuid.uuid4().hex[:12]
+    network = f"evdb-acme-it-{suffix}"
+    challenge = f"evdb-acme-it-challenge-{suffix}"
+    bridge = f"evdb-acme-it-bridge-{suffix}"
+    pebble = f"evdb-acme-it-pebble-{suffix}"
+    proxy = f"evdb-acme-it-proxy-{suffix}"
+    created_network = False
+    selected = replace(config, paths=replace(config.paths, state=tmp_path / "state"))
+    acme = selected.paths.traefik / "acme/acme.json"
+    acme.parent.mkdir(parents=True)
+    acme.write_text("{}\n")
+    acme.chmod(0o600)
+    dynamic = selected.paths.traefik / "tls.yml"
+    dynamic.write_text(
+        yaml.safe_dump(
+            {
+                "tls": {
+                    "stores": {
+                        "default": {
+                            "defaultGeneratedCert": {
+                                "resolver": "evdb",
+                                "domain": {"main": host.wildcard(selected)},
+                            }
+                        }
+                    }
+                }
+            },
+            sort_keys=False,
+        )
+    )
+    ca = Path(__file__).parents[1] / "fixtures/pebble.minica.pem"
+
+    try:
+        run(["docker", "network", "create", network], timeout=60)
+        created_network = True
+        run(
+            [
+                "docker",
+                "run",
+                "--detach",
+                "--name",
+                challenge,
+                "--network",
+                network,
+                CHALLENGE_IMAGE,
+                "-defaultIPv6",
+                "",
+                "-defaultIPv4",
+                "127.0.0.1",
+            ],
+            timeout=600,
+        )
+        bridge_script = Path(__file__).parents[1] / "fixtures/dns_bridge.py"
+        run(
+            [
+                "docker",
+                "run",
+                "--detach",
+                "--name",
+                bridge,
+                "--network",
+                network,
+                "--network-alias",
+                "dnsbridge",
+                "--env",
+                f"CHALLENGE_URL=http://{challenge}:8055",
+                "--volume",
+                f"{bridge_script}:/bridge.py:ro",
+                PYTHON_IMAGE,
+                "python",
+                "/bridge.py",
+            ],
+            timeout=600,
+        )
+        run(
+            [
+                "docker",
+                "run",
+                "--detach",
+                "--name",
+                pebble,
+                "--network",
+                network,
+                "--network-alias",
+                "pebble",
+                PEBBLE_IMAGE,
+                "-config",
+                "test/config/pebble-config.json",
+                "-strict",
+                "-dnsserver",
+                f"{challenge}:8053",
+            ],
+            timeout=600,
+        )
+        run(
+            [
+                "docker",
+                "run",
+                "--detach",
+                "--name",
+                proxy,
+                "--network",
+                network,
+                "--env",
+                "HTTPREQ_ENDPOINT=http://dnsbridge:8080",
+                "--env",
+                "LEGO_CA_CERTIFICATES=/pebble.minica.pem",
+                "--volume",
+                f"{dynamic}:/config/tls.yml:ro",
+                "--volume",
+                f"{acme}:/acme.json",
+                "--volume",
+                f"{ca}:/pebble.minica.pem:ro",
+                TRAEFIK_IMAGE,
+                "--providers.file.filename=/config/tls.yml",
+                "--providers.file.watch=false",
+                "--certificatesresolvers.evdb.acme.email=ops@example.com",
+                "--certificatesresolvers.evdb.acme.storage=/acme.json",
+                "--certificatesresolvers.evdb.acme.caserver=https://pebble:14000/dir",
+                "--certificatesresolvers.evdb.acme.dnschallenge=true",
+                "--certificatesresolvers.evdb.acme.dnschallenge.provider=httpreq",
+                f"--certificatesresolvers.evdb.acme.dnschallenge.resolvers={challenge}:8053",
+                "--certificatesresolvers.evdb.acme.dnschallenge.propagation.disableANSChecks=true",
+            ],
+            timeout=600,
+        )
+
+        deadline = time.monotonic() + 120
+        while not host.certificate_ready(selected):
+            if time.monotonic() >= deadline:
+                logs = run(["docker", "logs", proxy], timeout=30, check=False).out
+                pytest.fail(f"disposable wildcard was not issued: {logs}")
+            time.sleep(1)
+    finally:
+        for container in (proxy, pebble, bridge, challenge):
+            run(["docker", "rm", "--force", "--volumes", container], timeout=120, check=False)
+        if created_network:
+            run(["docker", "network", "rm", network], timeout=60, check=False)
+
+
 def _redis_set(container: str, value: str) -> None:
     deadline = time.monotonic() + 30
     while True:
@@ -184,8 +337,6 @@ def _tls_get(port: int, hostname: str) -> str:
 
 
 def _require_docker() -> None:
-    if socket.gethostname().split(".", 1)[0] == "montreal-01":
-        pytest.skip("disposable Docker tests are forbidden on montreal-01")
     if shutil.which("docker") is None:
         pytest.skip("Docker is unavailable")
     result = run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=30, check=False)

@@ -21,7 +21,7 @@ The implementation must continue to use subprocess argument arrays, keep product
 
 **Non-Goals:**
 
-- Deploying this redesign to `montreal-01` or changing any running production container.
+- Deploying this redesign to `production-host` or changing any running production container.
 - Providing a web dashboard, persistent control-plane service, or public API.
 - Managing the external HTTP proxy.
 - Purging database data, backup history, or 1Password items.
@@ -41,7 +41,7 @@ This is preferred over YAML anchors, profiles, or inheritance because those mech
 
 ### Generated lock and observed state
 
-`host.lock.json` will be a tool-owned, secret-free file beside `host.yml`. It will record the platform-specific digest resolved for each host-level image and stable assigned values that cannot be recomputed safely, initially HTTP loopback ports. Existing Montreal ports will seed the first lock; new ports will use the next free value in the configured range. Operators may review and commit the lock but never edit it manually.
+`host.lock.json` will be a tool-owned, secret-free file beside `host.yml`. It will record the platform-specific digest resolved for each host-level image and stable assigned values that cannot be recomputed safely, initially HTTP loopback ports. Existing production ports will seed the first lock; new ports will use the next free value in the configured range. Operators may review and commit the lock but never edit it manually.
 
 Observed Docker facts will not be source configuration. `evdb plan` will obtain the active release manifest and live status over SSH and compare them with the normalized desired model. This replaces the public `current` and `target` sections.
 
@@ -67,7 +67,7 @@ Items are not deleted when config writes, applies, rollbacks, or retirements fai
 
 `evdb show <database>` will combine derived configuration, active release facts, and live engine status into one detail view. For Postgres it will show engine and image versions, state, hostname, port, username, database name, TLS requirement, 1Password item, data path, container name, backup summary, and a complete `postgresql://` URL. For Redis and Dragonfly it will show the corresponding native TLS `rediss://` URL and, when enabled, the public HTTP endpoint and token.
 
-The command intentionally reveals the full connection URL and HTTP token every time, matching the existing Montreal manager behavior selected by the operator. It will resolve credentials from 1Password on the local controller, percent-encode URL components, and print them directly to the terminal. Credentials will not be requested from the remote host, included in SSH or child-process arguments, emitted to structured logs, or persisted in state. If local 1Password authentication cannot resolve a required field, the command will fail rather than print a misleading partial URL.
+The command intentionally reveals the full connection URL and HTTP token every time, matching the existing production manager behavior selected by the operator. It will resolve credentials from 1Password on the local controller, percent-encode URL components, and print them directly to the terminal. Credentials will not be requested from the remote host, included in SSH or child-process arguments, emitted to structured logs, or persisted in state. If local 1Password authentication cannot resolve a required field, the command will fail rather than print a misleading partial URL.
 
 This explicit details command is the only normal output allowed to contain credentials. Status, plan, logs, backup history, release history, and all JSON machine output remain secret-free.
 
@@ -130,7 +130,7 @@ Commands accept a plain database name when it is unique. If the same name exists
 ## Migration Plan
 
 1. Add the new source parser and normalizer alongside fixtures that prove concise entries expand to the current 25-instance deployment contract.
-2. Convert Montreal source config to one `host.yml`, delete the two instance files, and seed `host.lock.json` with current image digests and HTTP ports.
+2. Convert production source config to one `host.yml`, delete the two instance files, and seed `host.lock.json` with current image digests and HTTP ports.
 3. Add the local controller, remote JSON protocol, 1Password manager, and status/lifecycle commands against fakes and disposable hosts.
 4. Adapt Ansible and Compose rendering to normalized input, then add staged release activation and rollback on disposable Docker projects.
 5. Extend isolated restore code with persistent candidates and promotion, including forced failure recovery tests.

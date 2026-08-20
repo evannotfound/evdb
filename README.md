@@ -39,10 +39,12 @@ Choose a host ID and base domain. For a host ID of `example-01` and a base domai
 `storage.example.com`, arrange for `*.example-01.storage.example.com` to resolve to the server from
 your clients. evdb uses DNS-01 to issue certificates but does not create DNS records.
 
-Create a private file containing the environment variables Traefik requires for your DNS provider,
-one `KEY=VALUE` per line. Keep its path for initialization.
+Guided initialization includes every DNS provider supported by the pinned Traefik release. It shows the
+provider's documented variables and help URL, accepts credentials with masked input, and verifies them by
+obtaining one certificate for `*.<host-id>.<base-domain>`. For non-interactive setup, prepare a private
+file containing documented `KEY=VALUE` lines and pass it with `--dns-file`.
 
-Configure your backup remote as the normal non-root user who will own remote access:
+For remote backups, configure rclone as the normal non-root user who will own remote access:
 
 ```sh
 rclone config
@@ -50,9 +52,17 @@ rclone config file
 rclone lsd remote:
 ```
 
-Replace `remote` with the configured remote name. Set the reported rclone configuration file to mode
-`0600`; evdb requires its absolute path and uses it without copying it. A typical Restic repository is
-`rclone:remote:evdb/example-01`.
+Set the reported rclone configuration file to mode `0600`; evdb uses it in place. Guided setup reads its
+configured remotes and asks you to select one, then defaults the repository path to `evdb/<host-id>`.
+
+For a local Restic repository, create only its parent as the non-root backup user. For example:
+
+```sh
+install -d -m 0700 "$HOME/restic"
+```
+
+Guided setup can then use an absent child such as `$HOME/restic/example-01`. Local mode does not require
+rclone and derives the Restic process identity from that safe parent.
 
 ## Install evdb
 
@@ -72,17 +82,18 @@ Start guided initialization:
 sudo evdb init
 ```
 
-Enter the host ID, base domain, ACME email, Traefik DNS provider name, Restic repository, DNS
-credential file, and absolute rclone configuration path prepared above. Leave the initial Restic
-password blank to generate one.
+The append-only setup flow validates each answer, searches supported DNS providers, collects documented
+credentials, selects rclone or local storage, and shows a redacted review before Apply. Leave the initial
+Restic password blank to generate one. Setup waits for the wildcard certificate and verifies or creates
+the Restic repository before enabling automatic backups.
 
 Initialization stores configuration under `/etc/evdb`, managed data under `/var/lib/evdb`, starts the
 TLS router, initializes the Restic repository, and enables automatic daily backups.
 
 ## Create your first database
 
-Project names must end in `-dev-N`, `-test-N`, or `-prod-N`. Create Postgres and retrieve its
-TLS-secured connection URL:
+Project names must end in `-dev-N`, `-test-N`, or `-prod-N`. Create Postgres with a generated managed
+login and retrieve its TLS-secured connection URL:
 
 ```sh
 sudo evdb database add notes-prod-01 postgres
@@ -95,6 +106,18 @@ postgresql://default:<password>@notes-prod-01.example-01.storage.example.com:543
 
 Use the URL with any standard Postgres client. `database info` prints complete credentials and
 therefore requires a terminal.
+
+Guided creation has an Advanced option for preserving an existing username, database name, and password
+when you import data yourself. Automation can provide the same creation-only identity without exposing
+the password in process arguments:
+
+```sh
+sudo evdb database add imported-prod-01 postgres \
+  --username app_user --database-name app_db --password-file /private/postgres-password
+```
+
+evdb does not import the source database or rotate that identity after creation; use standard Postgres
+dump and restore tools for the data transfer.
 
 ## CLI usage
 

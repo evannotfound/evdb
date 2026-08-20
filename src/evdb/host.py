@@ -10,8 +10,16 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from . import backup, docker
-from .config import DEFAULT_IMAGES, dns_values, load, protected, reject_legacy, write
+from . import backup, dns, docker
+from .config import (
+    DEFAULT_IMAGES,
+    dns_values,
+    load,
+    protected,
+    reject_unsupported,
+    repository_parts,
+    write,
+)
 from .errors import CommandError, ConfigError, Error, HostError
 from .files import managed_dir, private_line, write_text
 from .lock import operation
@@ -30,10 +38,11 @@ def initialize(
     *,
     paths: Paths | None = None,
     unit_dir: str | Path = "/etc/systemd/system",
+    output=None,
 ) -> dict[str, Any]:
     source_path = Path(source)
     managed = paths or Paths(config=source_path.parent)
-    reject_legacy(managed)
+    reject_unsupported(managed)
     existing = source_path.exists() or source_path.is_symlink()
     if managed.config == CONFIG_DIR:
         if existing:
@@ -41,12 +50,14 @@ def initialize(
         else:
             _guard_preload(source_path, managed)
     config = load(source_path, paths=managed) if existing else _initial(values or {}, managed)
-    _guard(config)
-    missing = prerequisites()
+    _require_root(config)
+    missing = prerequisites(config)
     if missing:
         raise HostError("missing prerequisites: " + ", ".join(sorted(set(missing))))
     _writable(config, Path(unit_dir))
     _require_ports(config)
+    if not existing:
+        backup.preflight(config)
     with operation(config, write=True, timeout=config.host.timeouts["backup"]):
         _directories(config)
         if not existing:
@@ -57,6 +68,11 @@ def initialize(
         _dns(config)
         docker.ensure_network(timeout=config.host.timeouts["command"])
         _traefik(config)
+        if output:
+            output(f"Waiting for wildcard certificate {wildcard(config)}")
+        _wait_certificate(config)
+        if output:
+            output(f"Wildcard certificate ready: {wildcard(config)}")
         backup.initialize(config)
         _install_units(Path(unit_dir))
         run(["systemctl", "daemon-reload"], timeout=60)
@@ -64,9 +80,12 @@ def initialize(
     return _wait_status(config)
 
 
-def prerequisites() -> list[str]:
+def prerequisites(config: Config | None = None) -> list[str]:
     missing = [name for name in TOOLS if shutil.which(name) is None]
-    for name, path in (("restic", backup.RESTIC), ("rclone", backup.RCLONE)):
+    tools = [("restic", backup.RESTIC)]
+    if config is None or repository_parts(config.host.backup.repository) is not None:
+        tools.append(("rclone", backup.RCLONE))
+    for name, path in tools:
         if not path.is_file() or not os.access(path, os.X_OK):
             missing.append(name)
     if "docker" not in missing:
@@ -88,22 +107,37 @@ def _initial(values: dict[str, Any], paths: Paths) -> Config:
         "acme_email",
         "dns_provider",
         "repository",
-        "dns_file",
-        "rclone_config",
     )
     missing = [name for name in required if not values.get(name)]
     if missing:
-        raise HostError("initialization requires: " + ", ".join(missing))
-    dns = _env_file(Path(values["dns_file"]))
+        raise HostError(
+            "initialization requires: "
+            + ", ".join(missing)
+            + "; repository examples: rclone:remote:evdb/example-01 or /srv/restic/evdb"
+        )
+    provider = dns.normalize(values["dns_provider"])
+    dns_data = values.get("dns")
+    if dns_data is None:
+        if not values.get("dns_file"):
+            raise HostError("initialization requires: dns_file")
+        dns_data = _env_file(Path(values["dns_file"]))
+    else:
+        try:
+            dns_data = dns_values(dict(dns_data), "DNS credentials")
+        except (TypeError, ValueError, ConfigError) as exc:
+            raise HostError(str(exc)) from exc
+    rclone = values.get("rclone_config")
+    if repository_parts(values["repository"]) is not None and not rclone:
+        raise HostError("initialization requires: rclone_config")
     config = Config(
         Host(
             values["host_id"],
             values["domain"],
-            BackupSettings(values["repository"], Path(values["rclone_config"]), 5, 26),
-            Routing(values["acme_email"], values["dns_provider"], DEFAULT_IMAGES["traefik"]),
+            BackupSettings(values["repository"], Path(rclone) if rclone else None, 5, 26),
+            Routing(values["acme_email"], provider, DEFAULT_IMAGES["traefik"]),
         ),
         (),
-        Secrets(_restic_password(values), tuple(sorted(dns.items()))),
+        Secrets(_restic_password(values), tuple(sorted(dns_data.items()))),
         paths,
     )
     from .config import require_valid
@@ -140,6 +174,22 @@ def _dns(config: Config) -> None:
 
 def _traefik(config: Config) -> None:
     provider = config.host.routing.dns_provider
+    dynamic = config.paths.traefik / "tls.yml"
+    docker.write_compose(
+        dynamic,
+        {
+            "tls": {
+                "stores": {
+                    "default": {
+                        "defaultGeneratedCert": {
+                            "resolver": "evdb",
+                            "domain": {"main": wildcard(config)},
+                        }
+                    }
+                }
+            }
+        },
+    )
     data = {
         "name": docker.TRAEFIK_PROJECT,
         "services": {
@@ -151,6 +201,8 @@ def _traefik(config: Config) -> None:
                     "--providers.docker=true",
                     "--providers.docker.exposedbydefault=false",
                     f"--providers.docker.network={docker.NETWORK}",
+                    "--providers.file.filename=/config/tls.yml",
+                    "--providers.file.watch=true",
                     "--ping=true",
                     "--entrypoints.postgres.address=:5432",
                     "--entrypoints.kv.address=:6379",
@@ -165,6 +217,7 @@ def _traefik(config: Config) -> None:
                 "volumes": [
                     "/var/run/docker.sock:/var/run/docker.sock:ro",
                     f"{config.paths.traefik / 'acme'}:/acme",
+                    f"{dynamic}:/config/tls.yml:ro",
                 ],
                 "networks": [docker.NETWORK],
             }
@@ -188,6 +241,71 @@ def _traefik(config: Config) -> None:
     )
 
 
+def wildcard(config: Config) -> str:
+    return f"*.{config.host.id}.{config.host.domain}"
+
+
+def certificate_ready(config: Config) -> bool:
+    path = config.paths.traefik / "acme/acme.json"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise HostError(f"ACME storage is missing or unsafe: {path}") from exc
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or stat.S_IMODE(details.st_mode) != 0o600:
+            raise HostError(f"ACME storage is missing or unsafe: {path}")
+        with os.fdopen(descriptor, encoding="utf-8", closefd=False) as source:
+            value = json.load(source)
+    except (OSError, json.JSONDecodeError, UnicodeError, TypeError) as exc:
+        raise HostError(f"ACME storage is invalid: {path}") from exc
+    finally:
+        os.close(descriptor)
+    certificates = (
+        value.get("evdb", {}).get("Certificates") or [] if isinstance(value, dict) else []
+    )
+    expected = wildcard(config)
+    return any(
+        isinstance(item, dict)
+        and isinstance(item.get("domain"), dict)
+        and (
+            item["domain"].get("main") == expected or expected in (item["domain"].get("sans") or [])
+        )
+        and isinstance(item.get("certificate"), str)
+        and bool(item["certificate"])
+        and isinstance(item.get("key"), str)
+        and bool(item["key"])
+        for item in certificates
+    )
+
+
+def _wait_certificate(config: Config) -> None:
+    import time
+
+    deadline = time.monotonic() + config.host.timeouts["certificate"]
+    while True:
+        if certificate_ready(config):
+            return
+        if time.monotonic() >= deadline:
+            detail = "certificate was not stored"
+            try:
+                logs = docker.logs(
+                    config.paths.traefik / "compose.yaml",
+                    docker.TRAEFIK_PROJECT,
+                    100,
+                    timeout=30,
+                    secrets=protected(config),
+                ).strip()
+                if logs:
+                    detail = redact(logs, protected(config))[-1000:]
+            except Error, OSError:
+                pass
+            raise HostError(f"wildcard certificate {wildcard(config)} failed: {detail}")
+        time.sleep(1)
+
+
 def _wait_status(config: Config) -> dict[str, Any]:
     import time
 
@@ -208,9 +326,6 @@ def _bootstrap_existing(source: Path, paths: Paths) -> None:
 
 
 def _guard_preload(source: Path, paths: Paths) -> None:
-    hostname = socket.gethostname().split(".", 1)[0]
-    if hostname == "montreal-01" or "montreal-01" in source.parts:
-        raise HostError("production migration for montreal-01 is a separate change")
     if source != CONFIG_DIR / "config.yml" or source != paths.source:
         raise HostError("canonical initialization requires /etc/evdb/config.yml")
     if os.geteuid() != 0:
@@ -432,13 +547,6 @@ def _restic_password(values: dict[str, Any]) -> str:
     return supplied
 
 
-def _guard(config: Config) -> None:
-    hostname = socket.gethostname().split(".", 1)[0]
-    if (
-        hostname == "montreal-01"
-        or config.host.id == "montreal-01"
-        or "montreal-01" in config.paths.config.parts
-    ):
-        raise HostError("production migration for montreal-01 is a separate change")
+def _require_root(config: Config) -> None:
     if config.paths.config == CONFIG_DIR and os.geteuid() != 0:
         raise HostError("host initialization requires root; run sudo evdb init")

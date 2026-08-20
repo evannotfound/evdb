@@ -49,10 +49,14 @@ def add(
     *,
     engine: str | None = None,
     password: str | None = None,
+    username: str | None = None,
+    database_name: str | None = None,
 ) -> Config:
     identity = f"{project}/{role}"
     if role == "postgres" and engine is not None:
         raise DatabaseError("--engine is only valid for a KV database")
+    if role != "postgres" and (username is not None or database_name is not None):
+        raise DatabaseError("Postgres identity is only valid for a Postgres database")
     timeout = config.host.timeouts["command"]
     with operation(config, write=True, timeout=timeout):
         current = load(config.paths.source, paths=config.paths)
@@ -67,10 +71,28 @@ def add(
                 )
             if password is not None and existing.credentials.password != _password(password):
                 raise DatabaseError("password rotation is outside v1")
+            if username is not None and existing.settings.username != username:
+                raise DatabaseError(
+                    "changing initialized Postgres identity is outside this operation"
+                )
+            if database_name is not None and existing.settings.database != database_name:
+                raise DatabaseError(
+                    "changing initialized Postgres identity is outside this operation"
+                )
             with lock(current.paths.role_lock(project, role), timeout=timeout):
                 health(current, existing)
             return current
         settings = defaults(role, engine or "dragonfly")
+        if role == "postgres":
+            from .config import validate_postgres_name
+
+            settings = replace(
+                settings,
+                username=validate_postgres_name(username or settings.username, "username"),
+                database=validate_postgres_name(
+                    database_name or settings.database, "database name"
+                ),
+            )
         credential = (
             _password(password) if password is not None else _password(random.token_urlsafe(32))
         )
@@ -269,12 +291,14 @@ def info(config: Config, database: Database) -> dict[str, Any]:
 def connection(database: Database) -> dict[str, Any]:
     password = quote(database.credentials.password, safe="")
     if database.role == "postgres":
-        url = f"postgresql://default:{password}@{database.domain}:5432/postgres?sslmode=require"
+        username = quote(database.settings.username, safe="")
+        name = quote(database.settings.database, safe="")
+        url = f"postgresql://{username}:{password}@{database.domain}:5432/{name}?sslmode=require"
         return {
             "url": url,
-            "username": "default",
+            "username": database.settings.username,
             "password": database.credentials.password,
-            "database": "postgres",
+            "database": database.settings.database,
         }
     value = {
         "url": f"rediss://default:{password}@{database.domain}:6379/0",

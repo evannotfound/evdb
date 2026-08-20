@@ -128,7 +128,7 @@ service contract hash labels.
 Generated files, direct settings changes, each concrete engine, PgBouncer, HTTP, Traefik, host
 initialization, and installer updates SHALL be tested on disposable infrastructure. Tests SHALL NOT
 invoke production hosts, repositories, credentials, Docker changes, or systemd changes on
-`montreal-01`.
+`production-host`.
 
 #### Scenario: Full disposable operation completes
 - **WHEN** the integration suite creates and reconfigures test databases

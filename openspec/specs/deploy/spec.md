@@ -153,9 +153,8 @@ service contract hash labels.
 
 ### Requirement: Local deployment test
 Generated files, direct settings changes, each concrete engine, PgBouncer, HTTP, Traefik, host
-initialization, and installer updates SHALL be tested on disposable infrastructure. Tests SHALL NOT
-invoke production hosts, repositories, credentials, Docker changes, or systemd changes on
-`montreal-01`.
+initialization, and installer updates SHALL be tested only with disposable infrastructure, repositories,
+and credentials selected for that test run.
 
 #### Scenario: Full disposable operation completes
 - **WHEN** the integration suite creates and reconfigures test databases

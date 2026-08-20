@@ -32,6 +32,26 @@ def test_postgres_owns_private_files_services_and_pgbouncer_access(config):
     assert pool["cap_drop"] == ["ALL"]
     assert "pgbouncer.ini" in " ".join(pool["volumes"])
     assert services[target.service("primary")]["image"] == "postgres:16"
+    assert "tls.certresolver" not in text
+
+
+def test_postgres_custom_identity_reaches_primary_and_pgbouncer(config):
+    target = config.select("app-test-01/postgres")
+    target = replace(
+        target,
+        settings=replace(target.settings, username="app user", database="app/data"),
+    )
+
+    files = postgres.files(target)
+    services = postgres.services(target)
+
+    assert '"app user" "local-postgres-password"' in files["pgbouncer-users"]
+    primary = services[target.service("primary")]
+    assert primary["environment"]["POSTGRES_USER"] == "app user"
+    assert primary["environment"]["POSTGRES_DB"] == "app/data"
+    pool = services[target.service("pgbouncer")]
+    assert "app user" in pool["healthcheck"]["test"]
+    assert "app/data" in pool["healthcheck"]["test"]
 
 
 @pytest.mark.parametrize("engine", ["redis", "dragonfly"])

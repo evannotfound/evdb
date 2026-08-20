@@ -4,7 +4,7 @@ The repository currently implements a workstation controller that owns source co
 
 This is disproportionate to the actual topology. Each database and all of its persistent data live on one VPS. Backup schedules must continue when an operator workstation or future central monitor is offline. Database recovery means restoring verified data, not changing a host-wide software release. The current production host also already uses one Compose file per database directory; the proposed release system has not been deployed there.
 
-The redesign makes the installed host command authoritative and keeps the validated engine backup, Restic, isolated restore, Docker health, routing, locking, and subprocess behavior. Implementation and tests remain local and disposable. Moving `montreal-01` is a separate change and MUST NOT occur while implementing this change.
+The redesign makes the installed host command authoritative and keeps the validated engine backup, Restic, isolated restore, Docker health, routing, locking, and subprocess behavior. Implementation and tests remain local and disposable. Moving `production-host` is a separate change and MUST NOT occur while implementing this change.
 
 ## Goals / Non-Goals
 
@@ -30,7 +30,7 @@ The redesign makes the installed host command authoritative and keeps the valida
 - Public HTTP proxy routes, ports 80/443, or their certificates.
 - A resident evdb API daemon, centralized mutation, distributed reconciliation, or global locking.
 - Automatic database image updates.
-- Production cutover, changes to `montreal-01`, or migration of its current `.env`, Compose, Traefik, timer, or data layout.
+- Production cutover, changes to `production-host`, or migration of its current `.env`, Compose, Traefik, timer, or data layout.
 
 ## Decisions
 
@@ -234,7 +234,7 @@ src/evdb/
 3. Replace controller, remote runtime, release, planning, and Ansible tests with disposable host setup, package update, settings recovery, and guided CLI tests.
 4. Remove obsolete modules, playbooks, release paths, old command entry point, and release-focused documentation only after all retained behavior has moved.
 5. Validate generated Compose, dedicated Traefik, two projects per shared native port, HTTP isolation, backups, restore, failed restore recovery, setup idempotence, and failed tool update entirely on disposable infrastructure.
-6. Create a separate OpenSpec production migration that inventories current Montreal projects and credentials, resolves existing project-name collisions, stages the dedicated proxy cutover, preserves data and timers, and defines a host rollback procedure.
+6. Create a separate OpenSpec production migration that inventories current production projects and credentials, resolves existing project-name collisions, stages the dedicated proxy cutover, preserves data and timers, and defines a host rollback procedure.
 
 Implementation of this change has no production rollback because it MUST NOT modify production. Code changes can be reverted normally until the separate migration is approved.
 

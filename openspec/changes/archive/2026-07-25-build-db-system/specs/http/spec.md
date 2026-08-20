@@ -43,7 +43,7 @@ The repository SHALL record each sidecar's intended domain and loopback port as 
 The missing `oai-co-prod-02` route and two current `kv-na01.storage.evanovation.com` domains SHALL be recorded only as informational follow-ups for the external proxy owner during the later production move.
 
 #### Scenario: Initial HTTP contract is rendered
-- **WHEN** all `montreal-01` KV config is rendered
+- **WHEN** all `production-host` KV config is rendered
 - **THEN** it contains 11 unique intended domains and 11 unique loopback ports without a proxy route plan
 
 ### Requirement: HTTP authentication

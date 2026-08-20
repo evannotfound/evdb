@@ -17,6 +17,29 @@ RESTIC = shutil.which("restic")
 RCLONE = shutil.which("rclone")
 
 
+@pytest.mark.skipif(RESTIC is None, reason="Restic is required")
+def test_missing_local_repository_uses_parent_owner_without_rclone(config, tmp_path, monkeypatch):
+    monkeypatch.setattr(backup, "RESTIC", Path(RESTIC))
+    repository = tmp_path / "local-repository"
+    selected = replace(
+        config,
+        host=replace(
+            config.host,
+            backup=replace(
+                config.host.backup,
+                repository=str(repository),
+                rclone_config=None,
+            ),
+        ),
+    )
+
+    backup.initialize(selected)
+
+    assert repository.is_dir()
+    assert (repository / "config").is_file()
+    assert backup.repository_ready(selected)
+
+
 @pytest.mark.skipif(
     RESTIC is None or RCLONE is None,
     reason="Restic and rclone are required",
@@ -31,7 +54,7 @@ def test_missing_rclone_local_repository_is_initialized_without_mkdir(
     home = tmp_path / "operator-home"
     rclone = home / ".config/rclone/rclone.conf"
     rclone.parent.mkdir(parents=True)
-    rclone.write_text("[local]\ntype = local\n")
+    rclone.write_text(f"[local]\ntype = alias\nremote = {root}\n")
     rclone.chmod(0o600)
     account = pwd.getpwuid(os.getuid())
     operator = pwd.struct_passwd(
@@ -52,7 +75,7 @@ def test_missing_rclone_local_repository_is_initialized_without_mkdir(
             config.host,
             backup=replace(
                 config.host.backup,
-                repository=f"rclone:local:{repository}",
+                repository="rclone:local:initially-absent/repository",
                 rclone_config=rclone,
             ),
         ),
@@ -117,7 +140,7 @@ def test_root_drops_repository_work_to_rclone_owner(monkeypatch):
                     rclone,
                     min_free_gb=0,
                 ),
-                Routing("ops@example.com", "testdns", "traefik:v3.7.8"),
+                Routing("ops@example.com", "cloudflare", "traefik:v3.7.8"),
             ),
             (),
             Secrets("disposable-restic-password", ()),

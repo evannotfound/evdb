@@ -11,11 +11,11 @@ dev_vps = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dev_vps)
 
 
-def test_production_guard_runs_before_any_subprocess():
+def test_invalid_target_is_rejected_before_any_subprocess():
     calls = []
-    with pytest.raises(dev_vps.DevError, match="montreal-01"):
+    with pytest.raises(dev_vps.DevError, match="valid explicit SSH host"):
         dev_vps.execute(
-            "montreal-01",
+            "bad target",
             "/srv/evdb-dev",
             "evdb",
             ["init"],
@@ -36,7 +36,7 @@ def test_execute_returns_remote_exit_code_without_raising(monkeypatch):
 
     assert code == 7
     assert calls[0][1]["check"] is False
-    assert "montreal-01" in " ".join(calls[0][0])
+    assert "hostname -s" not in " ".join(calls[0][0])
 
 
 def test_sync_stops_after_fatal_check_ignore(monkeypatch):
@@ -78,5 +78,5 @@ def test_sync_uses_guarded_manifest_fed_rsync(monkeypatch):
     assert "--filter=P **/__pycache__/" in rsync
     assert not any(".rsync-partial" in item for item in rsync)
     preflight = " ".join(calls[0][0])
-    assert 'test "$(hostname -s)" != montreal-01' in preflight
+    assert "hostname -s" not in preflight
     assert "resolved=$(readlink -f /srv/evdb-dev)" in preflight

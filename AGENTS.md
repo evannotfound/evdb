@@ -8,6 +8,3 @@
 - Never commit `.env`, backup files, dumps, rclone config, or resolved secrets.
 - Source config contains `op://` references only.
 - Tests use disposable containers and local Restic repositories only.
-- Do not run deployment, Restic, Docker, cron, or systemd changes on `montreal-01` while
-  implementing `build-db-system`.
-- Production migration is a separate OpenSpec change.

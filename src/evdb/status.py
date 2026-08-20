@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -222,13 +221,11 @@ def _infrastructure(config: Config, errors: list[dict[str, str]]) -> dict[str, A
     except (Error, OSError) as exc:
         listeners = {"5432": None, "6379": None}
         errors.append(_error("listener_assessment_failed", "host/listeners", _message(config, exc)))
-    acme = config.paths.traefik / "acme/acme.json"
     try:
-        details = acme.lstat()
-        acme_ok = stat.S_ISREG(details.st_mode) and details.st_mode & 0o777 == 0o600
-    except FileNotFoundError:
-        acme_ok = False
-    except OSError as exc:
+        from .host import certificate_ready
+
+        acme_ok = certificate_ready(config)
+    except (Error, OSError) as exc:
         acme_ok = None
         errors.append(_error("acme_assessment_failed", "host/acme", _message(config, exc)))
     values = {

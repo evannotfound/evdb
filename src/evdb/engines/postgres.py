@@ -21,11 +21,13 @@ OBJECT_SQL = (
 
 
 def validate(settings: Postgres) -> None:
-    from ..config import validate_image
+    from ..config import validate_image, validate_postgres_name
 
     if not isinstance(settings, Postgres):
         raise ConfigError("postgres settings are invalid")
     validate_image(settings.image, "postgres image")
+    validate_postgres_name(settings.username, "username")
+    validate_postgres_name(settings.database, "database name")
     pool = settings.pgbouncer
     validate_image(pool.image, "pgbouncer image")
     if type(pool.enabled) is not bool:
@@ -43,7 +45,7 @@ def files(database: Database) -> dict[str, str]:
         def quoted(value: str) -> str:
             return '"' + value.replace('"', '""') + '"'
 
-        values["pgbouncer-users"] = f"{quoted('default')} {quoted(password)}\n"
+        values["pgbouncer-users"] = f"{quoted(database.settings.username)} {quoted(password)}\n"
         pool = database.settings.pgbouncer
         values["pgbouncer.ini"] = (
             "[databases]\n"
@@ -69,8 +71,8 @@ def services(database: Database) -> dict[str, Any]:
         "container_name": primary,
         "restart": "unless-stopped",
         "environment": {
-            "POSTGRES_USER": "default",
-            "POSTGRES_DB": "postgres",
+            "POSTGRES_USER": database.settings.username,
+            "POSTGRES_DB": database.settings.database,
             "POSTGRES_PASSWORD_FILE": "/run/secrets/postgres-password",
         },
         "volumes": [
@@ -91,7 +93,18 @@ def services(database: Database) -> dict[str, Any]:
             "command": ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"],
             "depends_on": [primary],
             "healthcheck": docker.healthcheck(
-                ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "default"]
+                [
+                    "CMD",
+                    "pg_isready",
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    "5432",
+                    "-U",
+                    database.settings.username,
+                    "-d",
+                    database.settings.database,
+                ]
             ),
             "volumes": [
                 f"{generated / 'pgbouncer.ini'}:/etc/pgbouncer/pgbouncer.ini:ro",
@@ -110,7 +123,13 @@ def services(database: Database) -> dict[str, Any]:
 def health(database: Database, *, timeout: int = 10) -> bool:
     result = docker.exec(
         database.service("primary"),
-        ["pg_isready", "-U", "default", "-d", "postgres"],
+        [
+            "pg_isready",
+            "-U",
+            database.settings.username,
+            "-d",
+            database.settings.database,
+        ],
         timeout=timeout,
         check=False,
     )
@@ -132,9 +151,9 @@ def health(database: Database, *, timeout: int = 10) -> bool:
                 "-p",
                 "5432",
                 "-U",
-                "default",
+                database.settings.username,
                 "-d",
-                "postgres",
+                database.settings.database,
                 "-c",
                 "SELECT 1",
             ],
@@ -149,12 +168,18 @@ def health(database: Database, *, timeout: int = 10) -> bool:
 
 
 def info(database: Database) -> dict[str, Any]:
-    version = _psql(database.service("primary"), "postgres", "SHOW server_version", timeout=10)
+    version = _psql(
+        database.service("primary"),
+        database.settings.database,
+        "SHOW server_version",
+        username=database.settings.username,
+        timeout=10,
+    )
     pool = database.settings.pgbouncer
     return {
         "version": version,
-        "username": "default",
-        "database": "postgres",
+        "username": database.settings.username,
+        "database": database.settings.database,
         "pgbouncer": pool.enabled,
         "max_clients": pool.max_clients,
         "pool_size": pool.pool_size,
@@ -164,7 +189,13 @@ def info(database: Database) -> dict[str, Any]:
 
 def backup(database: Database, folder: Path, _run_id: str) -> dict[str, Any]:
     container = database.service("primary")
-    rows = _psql(container, "postgres", DATABASE_SQL, timeout=120).splitlines()
+    rows = _psql(
+        container,
+        database.settings.database,
+        DATABASE_SQL,
+        username=database.settings.username,
+        timeout=120,
+    ).splitlines()
     databases = [json.loads(row) for row in rows]
     if not databases:
         raise BackupError(f"{database.identity}: no databases found")
@@ -178,19 +209,41 @@ def backup(database: Database, folder: Path, _run_id: str) -> dict[str, Any]:
         with target.open("wb") as output:
             docker.exec(
                 container,
-                ["pg_dump", "-Fc", "--no-password", "-U", "default", "-d", name],
+                [
+                    "pg_dump",
+                    "-Fc",
+                    "--no-password",
+                    "-U",
+                    database.settings.username,
+                    "-d",
+                    name,
+                ],
                 stdout=output,
                 timeout=7200,
             )
         target.chmod(0o600)
         _check_archive(database.image, target)
-        objects[name] = int(_psql(container, name, OBJECT_SQL, timeout=120))
+        objects[name] = int(
+            _psql(
+                container,
+                name,
+                OBJECT_SQL,
+                username=database.settings.username,
+                timeout=120,
+            )
+        )
         names.append(relative)
     globals_file = folder / "globals.sql"
     with globals_file.open("wb") as output:
         docker.exec(
             container,
-            ["pg_dumpall", "--globals-only", "--no-password", "-U", "default"],
+            [
+                "pg_dumpall",
+                "--globals-only",
+                "--no-password",
+                "-U",
+                database.settings.username,
+            ],
             stdout=output,
             timeout=1800,
         )
@@ -200,7 +253,13 @@ def backup(database: Database, folder: Path, _run_id: str) -> dict[str, Any]:
     names.append("globals.sql")
     return {
         "format": "postgres-custom-v1",
-        "version": _psql(container, "postgres", "SHOW server_version", timeout=120),
+        "version": _psql(
+            container,
+            database.settings.database,
+            "SHOW server_version",
+            username=database.settings.username,
+            timeout=120,
+        ),
         "databases": [item["name"] for item in databases],
         "owners": {item["name"]: item["owner"] for item in databases},
         "objects": objects,
@@ -208,7 +267,14 @@ def backup(database: Database, folder: Path, _run_id: str) -> dict[str, Any]:
     }
 
 
-def _psql(container: str, database: str, sql: str, *, timeout: int) -> str:
+def _psql(
+    container: str,
+    database: str,
+    sql: str,
+    *,
+    username: str,
+    timeout: int,
+) -> str:
     return docker.exec(
         container,
         [
@@ -219,7 +285,7 @@ def _psql(container: str, database: str, sql: str, *, timeout: int) -> str:
             "-v",
             "ON_ERROR_STOP=1",
             "-U",
-            "default",
+            username,
             "-d",
             database,
             "-c",

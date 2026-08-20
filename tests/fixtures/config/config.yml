@@ -2,18 +2,20 @@ host:
   id: test-01
   domain: storage.example.com
   backup:
-    repository: /tmp/evdb-repository
+    repository: rclone:remote:evdb/test-01
     rclone_config: /tmp/evdb-rclone.conf
     min_free_gb: 0
     max_age_hours: 26
   routing:
     acme_email: ops@example.com
-    dns_provider: testdns
+    dns_provider: cloudflare
     traefik_image: traefik:v3.7.8
 projects:
   app-test-01:
     postgres:
       image: postgres:16
+      username: default
+      database: postgres
       pgbouncer:
         enabled: true
         image: edoburu/pgbouncer:v1.25.1-p0

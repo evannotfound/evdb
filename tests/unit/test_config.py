@@ -16,7 +16,9 @@ from evdb.config import (
     load,
     protected,
     rclone_owner,
-    reject_legacy,
+    reject_unsupported,
+    repository_owner,
+    repository_parts,
     require_valid,
     validate_image,
     write,
@@ -41,6 +43,14 @@ def test_strict_two_file_round_trip_and_project_role_selectors(config):
     assert "local-restic-password" in dump_secrets(config.secrets)
 
 
+def test_postgres_identity_is_required_without_compatibility_defaults(config):
+    text = config.paths.source.read_text().replace("      username: default\n", "")
+    config.paths.source.write_text(text)
+
+    with pytest.raises(ConfigError, match="postgres.username is required"):
+        load(config.paths.source, paths=config.paths)
+
+
 def test_atomic_writes_keep_source_and_secret_modes(config):
     write(config)
 
@@ -56,22 +66,22 @@ def test_secret_file_requires_exact_0600(config):
         load(config.paths.source, paths=config.paths)
 
 
-def test_old_host_and_machine_state_are_rejected(paths):
+def test_unsupported_host_and_machine_state_are_rejected(paths):
     paths.config.mkdir(parents=True)
-    legacy = paths.config / "host.yml"
-    legacy.write_text("host: {}\n")
+    unsupported = paths.config / "host.yml"
+    unsupported.write_text("host: {}\n")
 
-    with pytest.raises(ConfigError, match="pre-v1"):
-        load(legacy, paths=paths)
-    with pytest.raises(ConfigError, match="reset.*migrate"):
-        reject_legacy(paths)
+    with pytest.raises(ConfigError, match="unsupported source configuration"):
+        load(unsupported, paths=paths)
+    with pytest.raises(ConfigError, match="provide current config.yml"):
+        reject_unsupported(paths)
 
-    legacy.unlink()
+    unsupported.unlink()
     state = paths.state / "state/host.json"
     state.parent.mkdir(parents=True)
     state.write_text("{}\n")
-    with pytest.raises(ConfigError, match="pre-v1"):
-        reject_legacy(paths)
+    with pytest.raises(ConfigError, match="unsupported source layout"):
+        reject_unsupported(paths)
 
 
 @pytest.mark.parametrize("image", ["postgres", "postgres:latest", " postgres:16"])
@@ -343,6 +353,44 @@ def test_rclone_path_rejects_unsafe_mutable_parent(config):
 
     with pytest.raises(ConfigError, match="parent.*user-writable"):
         require_valid(config)
+
+
+def test_local_repository_omits_rclone_and_derives_parent_owner(config, tmp_path):
+    local = replace(
+        config,
+        host=replace(
+            config.host,
+            backup=replace(
+                config.host.backup,
+                repository=str(tmp_path / "restic"),
+                rclone_config=None,
+            ),
+        ),
+    )
+
+    require_valid(local)
+
+    assert repository_parts(local.host.backup.repository) is None
+    assert repository_owner(local.host.backup).uid == os.getuid()
+    assert "rclone_config" not in as_dict(local)["host"]["backup"]
+
+    (tmp_path / "restic").mkdir()
+    tmp_path.chmod(0o770)
+    with pytest.raises(ConfigError, match="owner differs from its parent"):
+        require_valid(local)
+
+
+def test_rclone_repository_requires_configured_remote(config):
+    invalid = replace(
+        config,
+        host=replace(
+            config.host,
+            backup=replace(config.host.backup, repository="rclone:missing:evdb/test"),
+        ),
+    )
+
+    with pytest.raises(ConfigError, match="remote is not configured"):
+        require_valid(invalid)
 
 
 def test_rclone_credential_read_does_not_follow_symlink(config, tmp_path):

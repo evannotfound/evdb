@@ -14,7 +14,7 @@ until deactivated.
 - **THEN** the remote locked editable environment runs that source revision on the VPS architecture without a tag or GitHub Release
 
 #### Scenario: Developer targets the production host
-- **WHEN** the development sync or activation workflow is given `montreal-01`
+- **WHEN** the development sync or activation workflow is given `production-host`
 - **THEN** it refuses before copying files, changing links, invoking evdb, or modifying host state
 
 #### Scenario: Development activation is removed

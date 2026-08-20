@@ -70,4 +70,4 @@ None.
 - Tests and documentation will be reduced to the retained host initialization, engine lifecycle,
   routing, backup, installer, and guided/direct CLI behavior.
 - The existing pre-v1 on-disk schema is not migrated. Disposable hosts may be reset explicitly;
-  production migration, including `montreal-01`, remains a separate change.
+  production migration, including `production-host`, remains a separate change.

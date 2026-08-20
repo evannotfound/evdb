@@ -110,11 +110,11 @@ def _database(config: Config, identity: str, input_fn, output) -> Config:
                 selected = status.collect(current, target)["databases"][target.identity]
                 details = {key: item for key, item in value.items() if key != "connection"}
                 details["error"] = selected["error"] or "none"
-                _screen(output, pairs(details), heading="Details")
+                _screen(output, database_details(details), heading="Details")
             elif choice == "2":
                 _screen(
                     output,
-                    pairs(database.connection(target)),
+                    connection_details(database.connection(target)),
                     heading="Connection",
                 )
             elif choice == "3":
@@ -157,23 +157,63 @@ def _add(config: Config, input_fn, output, password_fn) -> Config:
     role = "postgres" if role_choice == "1" else "kv"
     engine = None
     password = None
+    username = None
+    database_name = None
     if role == "kv":
         _screen(output, "1. Dragonfly\n2. Redis\n0. Cancel", heading="KV engine")
         selected = _choice(input_fn, output, "Engine", {"0", "1", "2"})
         if selected in {None, "0"}:
             return config
         engine = "dragonfly" if selected == "1" else "redis"
-    else:
-        output("")
-        password = password_fn("Initial Postgres password (blank to generate): ") or None
+    elif confirm(input_fn, "Advanced Postgres identity?"):
+        from .config import validate_postgres_name
+
+        username = ask_text(
+            input_fn,
+            output,
+            "Username",
+            default="default",
+            validate=lambda value: validate_postgres_name(value, "username"),
+        )
+        database_name = ask_text(
+            input_fn,
+            output,
+            "Database name",
+            default="postgres",
+            validate=lambda value: validate_postgres_name(value, "database name"),
+        )
+        password = ask_secret(
+            password_fn,
+            output,
+            "Initial Postgres password",
+            required=True,
+            confirm=True,
+        )
+        if username is None or database_name is None or password is None:
+            return config
+    summary = {"Database": f"{project}/{role}", "Engine": engine or "postgres"}
+    if role == "postgres":
+        summary.update(
+            Username=username or "default",
+            Database=database_name or "postgres",
+            Password="provided" if password else "generated",
+        )
     _screen(
         output,
-        pairs({"Database": f"{project}/{role}", "Engine": engine or "postgres"}),
+        pairs(summary),
         heading="Create database",
     )
     if not _yes(input_fn, "Create? [y/N] "):
         return config
-    updated = database.add(config, project, role, engine=engine, password=password)
+    updated = database.add(
+        config,
+        project,
+        role,
+        engine=engine,
+        password=password,
+        username=username,
+        database_name=database_name,
+    )
     _screen(output, f"{project}/{role} is healthy", heading="Created")
     return updated
 
@@ -338,6 +378,94 @@ def _yes(input_fn, prompt: str) -> bool:
         return False
 
 
+def ask_text(
+    input_fn,
+    output,
+    prompt: str,
+    *,
+    default: str | None = None,
+    help_text: str | None = None,
+    required: bool = True,
+    validate=None,
+) -> str | None:
+    if help_text:
+        output(help_text)
+    while True:
+        suffix = f" [{default}]" if default is not None else ""
+        try:
+            value = input_fn(f"{prompt}{suffix}: ").strip()
+        except EOFError:
+            return None
+        value = value or default
+        if value is None or not value:
+            if not required:
+                return None
+            output(f"{prompt} is required")
+            continue
+        if validate is None:
+            return value
+        try:
+            return validate(value)
+        except (Error, ValueError) as exc:
+            output(clean(str(exc)))
+
+
+def choose(
+    input_fn,
+    output,
+    prompt: str,
+    choices: list[tuple[str, str]],
+    *,
+    default: str | None = None,
+) -> str | None:
+    _options(output, choices)
+    while True:
+        suffix = f" [{default}]" if default is not None else ""
+        try:
+            value = input_fn(f"{prompt}{suffix}: ").strip() or default
+        except EOFError:
+            return None
+        allowed = {key for key, _label in choices}
+        if value in allowed:
+            return value
+        output(_invalid_choice(allowed))
+
+
+def ask_secret(
+    password_fn,
+    output,
+    prompt: str,
+    *,
+    required: bool = False,
+    confirm: bool = False,
+) -> str | None:
+    while True:
+        value = password_fn(f"{prompt}: ")
+        if not value:
+            if required:
+                output(f"{prompt} is required")
+                continue
+            return None
+        if any(char in value for char in "\0\r\n"):
+            output(f"{prompt} must be one non-empty line")
+            continue
+        if confirm and password_fn(f"Confirm {prompt.lower()}: ") != value:
+            output("Passwords do not match")
+            continue
+        return value
+
+
+def confirm(input_fn, prompt: str, *, default: bool = False) -> bool:
+    suffix = " [Y/n] " if default else " [y/N] "
+    try:
+        value = input_fn(prompt + suffix).strip().lower()
+    except EOFError:
+        return False
+    if not value:
+        return default
+    return value in {"y", "yes"}
+
+
 def _parse(value: str, current: Any) -> Any:
     if isinstance(current, bool):
         if value.lower() in {"true", "yes", "on", "1"}:
@@ -354,23 +482,74 @@ def _parse(value: str, current: Any) -> Any:
 
 
 def pairs(values: dict[str, Any]) -> str:
+    lines = _pair_lines(values)
+    return clean("\n".join(lines))
+
+
+def _pair_lines(values: dict[str, Any], *, indent: int = 0) -> list[str]:
     lines = []
+    prefix = " " * indent
     for key, value in values.items():
         label = key.replace("_", " ").title()
         if isinstance(value, dict):
-            lines.append(f"{label}:")
-            lines.extend(
-                f"  {name.replace('_', ' ').title()}: {item}" for name, item in value.items()
-            )
+            lines.append(f"{prefix}{label}:")
+            lines.extend(_pair_lines(value, indent=indent + 2))
+        elif isinstance(value, (list, tuple)):
+            lines.append(f"{prefix}{label}: {', '.join(map(str, value)) or 'none'}")
         else:
-            lines.append(f"{label}: {value}")
+            lines.append(f"{prefix}{label}: {value}")
+    return lines
+
+
+def database_details(value: dict[str, Any], *, include_connection: bool = False) -> str:
+    lines = []
+    summary = {
+        key: value[key]
+        for key in ("database", "engine", "status", "image", "error")
+        if key in value
+    }
+    if summary:
+        lines.extend(_pair_lines(summary))
+    paths = {key: value[key] for key in ("data", "compose") if key in value}
+    for heading, section in (
+        ("Sidecars", value.get("sidecar_images")),
+        ("Settings", value.get("settings")),
+        ("Engine", value.get("engine_info")),
+        ("Backup", value.get("backup")),
+        ("Paths", paths),
+    ):
+        if not section:
+            continue
+        if lines:
+            lines.append("")
+        lines.append(f"{heading}:")
+        lines.extend(_pair_lines(section, indent=2))
+    if include_connection and value.get("connection"):
+        if lines:
+            lines.append("")
+        lines.append("Connection:")
+        lines.extend(_pair_lines(value["connection"], indent=2))
+    return clean("\n".join(lines))
+
+
+def connection_details(value: dict[str, Any]) -> str:
+    native = {
+        key: value[key] for key in ("url", "username", "password", "database") if key in value
+    }
+    optional = {key: item for key, item in value.items() if key not in native}
+    lines = _pair_lines(native)
+    if optional:
+        lines.extend(("", "HTTP:"))
+        lines.extend(_pair_lines(optional, indent=2))
     return clean("\n".join(lines))
 
 
 def backup_history(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return "No backups available"
-    return "\n".join(
+    values = ["Time  Backup  Source  Snapshot"]
+    values.extend(
         f"{row['time']}  {row['backup']}  {row['source']}  {row.get('snapshot') or '-'}"
         for row in rows
     )
+    return "\n".join(values)

@@ -100,7 +100,7 @@ idempotency, and invalid input.
 ### Keep source activation explicitly disposable
 
 Document a one-time checkout under `/srv/evdb-dev`, uv installation, and `uv sync --locked`. Add a
-guarded development helper or Make targets that require an explicit host, refuse `montreal-01`, and
+guarded development helper or Make targets that require an explicit host, refuse `production-host`, and
 rsync only `src/`, `tests/`, and named project metadata. They must not sync the whole workspace.
 
 The fast path invokes `/srv/evdb-dev/.venv/bin/evdb` explicitly. End-to-end systemd testing may

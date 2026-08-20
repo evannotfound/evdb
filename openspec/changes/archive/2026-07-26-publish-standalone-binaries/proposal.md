@@ -45,5 +45,5 @@ project documentation, while maintainers continue to use `uv` for development.
 - Changes the host setup specification, setup documentation, README, project metadata, and
   documentation assertions.
 - GitHub Releases must be public before anonymous installation is advertised. Builds target Ubuntu
-  22.04 or newer on Linux ARM64 and x86_64; production data and `config/montreal-01` remain outside
+  22.04 or newer on Linux ARM64 and x86_64; production data and `config/production-host` remain outside
   this change.

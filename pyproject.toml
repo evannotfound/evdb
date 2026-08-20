@@ -27,7 +27,7 @@ evdb = "evdb.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-evdb = ["units/*.service", "units/*.timer"]
+evdb = ["dns_providers.json", "units/*.service", "units/*.timer"]
 
 [tool.setuptools_scm]
 version_file = "src/evdb/_version.py"

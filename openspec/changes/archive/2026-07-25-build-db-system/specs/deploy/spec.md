@@ -65,7 +65,7 @@ Ansible, rendered Compose, JSON config, and systemd units SHALL be tested on dis
 - **THEN** the test host can run config validation and local backup and restore commands without production credentials
 
 ### Requirement: Production guard
-Production SHALL NOT be a default Ansible target. Any future production run SHALL require the production inventory and an explicit apply flag. This change SHALL NOT run those playbooks against `montreal-01`.
+Production SHALL NOT be a default Ansible target. Any future production run SHALL require the production inventory and an explicit apply flag. This change SHALL NOT run those playbooks against `production-host`.
 
 #### Scenario: Deploy command has no target
 - **WHEN** a deploy target is omitted

@@ -105,7 +105,7 @@ The loader SHALL reject the controller-owned `databases` list, engine-first iden
 
 ### Requirement: Managed database catalog
 **Reason**: Production inventory no longer belongs in a repository-owned source contract; each host owns its project catalog.
-**Migration**: Inventory and conversion of the 25 Montreal databases is specified by the separate production migration change.
+**Migration**: Inventory and conversion of the 25 production databases is specified by the separate production migration change.
 
 ### Requirement: Host-level image versions
 **Reason**: Existing databases must update independently and persist their own primary and sidecar image sources.

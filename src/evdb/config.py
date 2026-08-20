@@ -7,12 +7,13 @@ import pwd
 import re
 import stat
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, quote_plus
 
 import yaml
 
+from . import dns
 from .errors import ConfigError
 from .files import write_text
 from .models import (
@@ -92,7 +93,7 @@ def load(
 ) -> Config:
     source = Path(path)
     if source.name == "host.yml":
-        raise ConfigError("pre-v1 host.yml is unsupported; reset the disposable host or migrate it")
+        raise ConfigError("unsupported source configuration: host.yml")
     if source.name != "config.yml":
         raise ConfigError("source configuration must be named config.yml")
     if not source.is_file() or source.is_symlink():
@@ -142,6 +143,8 @@ def load_secrets(path: str | Path = CONFIG_DIR / "secrets.yml") -> Secrets:
 
 
 def dns_values(values: dict[str, Any], name: str) -> dict[str, str]:
+    if values == {}:
+        return {}
     if not values or not all(
         isinstance(key, str)
         and _DNS_KEY.fullmatch(key)
@@ -178,6 +181,13 @@ def dump_secrets(value: Secrets) -> str:
 
 def as_dict(config: Config) -> dict[str, Any]:
     host = config.host
+    backup = {
+        "repository": host.backup.repository,
+        "min_free_gb": host.backup.min_free_gb,
+        "max_age_hours": host.backup.max_age_hours,
+    }
+    if host.backup.rclone_config is not None:
+        backup["rclone_config"] = str(host.backup.rclone_config)
     projects = {}
     for project in config.projects:
         item: dict[str, Any] = {}
@@ -185,6 +195,8 @@ def as_dict(config: Config) -> dict[str, Any]:
             pool = project.postgres.pgbouncer
             item["postgres"] = {
                 "image": project.postgres.image,
+                "username": project.postgres.username,
+                "database": project.postgres.database,
                 "pgbouncer": {
                     "enabled": pool.enabled,
                     "image": pool.image,
@@ -214,12 +226,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         "host": {
             "id": host.id,
             "domain": host.domain,
-            "backup": {
-                "repository": host.backup.repository,
-                "rclone_config": str(host.backup.rclone_config),
-                "min_free_gb": host.backup.min_free_gb,
-                "max_age_hours": host.backup.max_age_hours,
-            },
+            "backup": backup,
             "routing": {
                 "acme_email": host.routing.acme_email,
                 "dns_provider": host.routing.dns_provider,
@@ -244,7 +251,8 @@ def write(config: Config, *, secrets: bool = True) -> None:
 
 
 def protected(config: Config) -> tuple[str, ...]:
-    values = [*config.secrets.values, *_rclone_credentials(config.host.backup.rclone_config)]
+    rclone = config.host.backup.rclone_config
+    values = [*config.secrets.values, *(_rclone_credentials(rclone) if rclone else ())]
     encoded = set()
     for value in values:
         encoded.update((value, quote(value, safe=""), quote_plus(value), json.dumps(value)[1:-1]))
@@ -364,35 +372,49 @@ def validate_image(value: Any, name: str = "image") -> None:
         raise ConfigError(f"{name} must use an explicit non-latest tag or SHA-256 digest")
 
 
+def validate_postgres_name(value: str, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(char in value for char in "\0\r\n")
+        or len(value.encode()) > 63
+    ):
+        raise ConfigError(f"Postgres {name} must be one non-empty value of at most 63 bytes")
+    return value
+
+
 def require_valid(config: Config) -> None:
     errors = []
     host = config.host
-    if not _NAME.fullmatch(host.id) or len(host.id) > 60:
-        errors.append("host.id must be a safe lowercase name of at most 60 characters")
-    if not _DOMAIN.fullmatch(host.domain) or len(host.domain) > 253:
-        errors.append("host.domain must be a valid lowercase domain")
+    for value, validator in (
+        (host.id, validate_host_id),
+        (host.domain, validate_domain),
+        (host.routing.acme_email, validate_email),
+    ):
+        try:
+            validator(value)
+        except ConfigError as exc:
+            errors.append(str(exc))
     for managed in (config.paths.config, config.paths.state):
         unsafe = _unsafe_directory(managed)
         if unsafe is not None:
             errors.append(f"managed directory is symlinked or unsafe: {unsafe}")
-    if not host.backup.repository or any(
-        character in host.backup.repository for character in "\0\r\n"
-    ):
-        errors.append("host.backup.repository must be non-empty")
-    if re.search(r"://[^/@\s]+@", host.backup.repository):
-        errors.append("host.backup.repository must not contain credentials")
     try:
-        rclone_owner(host.backup.rclone_config)
+        repository_owner(host.backup)
     except ConfigError as exc:
         errors.append(str(exc))
     if type(host.backup.min_free_gb) is not int or host.backup.min_free_gb < 0:
         errors.append("host.backup.min_free_gb must be non-negative")
     if type(host.backup.max_age_hours) is not int or host.backup.max_age_hours < 1:
         errors.append("host.backup.max_age_hours must be positive")
-    if not _EMAIL.fullmatch(host.routing.acme_email):
-        errors.append("host.routing.acme_email must be a valid email")
-    if not _NAME.fullmatch(host.routing.dns_provider):
-        errors.append("host.routing.dns_provider must be a safe name")
+    try:
+        dns.require_versions(host.routing.traefik_image)
+        canonical = dns.normalize(host.routing.dns_provider)
+        if canonical != host.routing.dns_provider:
+            errors.append(f"host.routing.dns_provider must use canonical provider name {canonical}")
+        dns.validate_variables(canonical, dict(config.secrets.dns))
+    except ConfigError as exc:
+        errors.append(str(exc))
     try:
         validate_image(host.routing.traefik_image, "host.routing.traefik_image")
     except ConfigError as exc:
@@ -465,18 +487,36 @@ def require_valid(config: Config) -> None:
         raise ConfigError("config failed:\n- " + "\n- ".join(errors))
 
 
-def reject_legacy(paths: Paths) -> None:
-    legacy = (paths.config / "host.yml", paths.state / "state/host.json")
-    found = next((path for path in legacy if path.exists() or path.is_symlink()), None)
+def reject_unsupported(paths: Paths) -> None:
+    unsupported = (paths.config / "host.yml", paths.state / "state/host.json")
+    found = next((path for path in unsupported if path.exists() or path.is_symlink()), None)
     if found and not paths.source.exists():
+        raise ConfigError(f"unsupported source layout at {found}; provide current config.yml")
+
+
+def validate_host_id(value: str) -> str:
+    if not isinstance(value, str) or not _NAME.fullmatch(value) or len(value) > 60:
+        raise ConfigError("host ID must be a safe lowercase name of at most 60 characters")
+    return value
+
+
+def validate_domain(value: str) -> str:
+    if not isinstance(value, str) or not _DOMAIN.fullmatch(value) or len(value) > 253:
         raise ConfigError(
-            f"pre-v1 state is unsupported at {found}; reset the disposable host or migrate it"
+            "base domain must be a valid lowercase domain; example: storage.example.com"
         )
+    return value
+
+
+def validate_email(value: str) -> str:
+    if not isinstance(value, str) or not _EMAIL.fullmatch(value):
+        raise ConfigError("ACME email must be valid; example: operations@example.com")
+    return value
 
 
 def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
     if {"databases", "instances", "releases"} & set(data):
-        raise ConfigError("pre-v1 source schema is unsupported")
+        raise ConfigError("unsupported source schema")
     _only(data, {"host", "projects"}, "config")
     host_data = _object(_required(data, "host", "config"), "host")
     _only(host_data, {"id", "domain", "backup", "routing"}, "host")
@@ -488,12 +528,15 @@ def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
     )
     routing_data = _object(_required(host_data, "routing", "host"), "host.routing")
     _only(routing_data, {"acme_email", "dns_provider", "traefik_image"}, "host.routing")
+    rclone_value = backup_data.get("rclone_config")
+    if rclone_value is not None and (not isinstance(rclone_value, str) or not rclone_value):
+        raise ConfigError("host.backup.rclone_config must be a non-empty string or omitted")
     host = Host(
         _string(host_data, "id", "host"),
         _string(host_data, "domain", "host"),
         BackupSettings(
             _string(backup_data, "repository", "host.backup"),
-            Path(_string(backup_data, "rclone_config", "host.backup")),
+            Path(rclone_value) if rclone_value is not None else None,
             _integer(backup_data, "min_free_gb", "host.backup", minimum=0),
             _integer(backup_data, "max_age_hours", "host.backup", minimum=1),
         ),
@@ -520,7 +563,11 @@ def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
 
 def _postgres(value: Any, project: str) -> Postgres:
     data = _object(value, f"projects.{project}.postgres")
-    _only(data, {"image", "pgbouncer"}, f"projects.{project}.postgres")
+    _only(
+        data,
+        {"image", "username", "database", "pgbouncer"},
+        f"projects.{project}.postgres",
+    )
     pool = _object(_required(data, "pgbouncer", f"projects.{project}.postgres"), "pgbouncer")
     _only(pool, {"enabled", "image", "max_clients", "pool_size", "reserve_size"}, "pgbouncer")
     return Postgres(
@@ -531,6 +578,12 @@ def _postgres(value: Any, project: str) -> Postgres:
             _integer(pool, "max_clients", "pgbouncer"),
             _integer(pool, "pool_size", "pgbouncer"),
             _integer(pool, "reserve_size", "pgbouncer"),
+        ),
+        validate_postgres_name(
+            _string(data, "username", f"projects.{project}.postgres"), "username"
+        ),
+        validate_postgres_name(
+            _string(data, "database", f"projects.{project}.postgres"), "database name"
         ),
     )
 
@@ -617,6 +670,58 @@ def _source_owners(paths: Paths) -> tuple[tuple[int, int] | None, tuple[int, int
     return (0, 0), (0, 0)
 
 
+def repository_parts(value: str) -> tuple[str, str] | None:
+    if not isinstance(value, str) or not value or any(char in value for char in "\0\r\n"):
+        raise ConfigError("host.backup.repository must be a non-empty one-line value")
+    if value.startswith("rclone:"):
+        remote_path = value.removeprefix("rclone:")
+        if ":" not in remote_path:
+            raise ConfigError("rclone repository must have form rclone:<remote>:<path>")
+        remote, relative = remote_path.split(":", 1)
+        path = PurePosixPath(relative)
+        if (
+            not remote
+            or not relative
+            or ":" in remote
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise ConfigError("rclone repository must have form rclone:<remote>:<safe-path>")
+        return remote, relative
+    if "://" in value or re.match(r"^[a-z][a-z0-9+.-]*:", value, re.IGNORECASE):
+        raise ConfigError("repository must use rclone:<remote>:<path> or an absolute local path")
+    path = Path(value)
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError("local repository must be a normalized absolute path") from exc
+    if not path.is_absolute() or path != resolved:
+        raise ConfigError("local repository must be a normalized absolute path")
+    unsafe = _unsafe_directory(path)
+    if unsafe is not None:
+        raise ConfigError(f"local repository is symlinked or unsafe: {unsafe}")
+    return None
+
+
+def rclone_remotes(path: Path) -> tuple[str, ...]:
+    parser = _rclone_parser(path)
+    return tuple(sorted(parser.sections()))
+
+
+def repository_owner(settings: BackupSettings) -> Operator:
+    parts = repository_parts(settings.repository)
+    if parts is not None:
+        if settings.rclone_config is None:
+            raise ConfigError("rclone repository requires host.backup.rclone_config")
+        remote, _relative = parts
+        if remote not in rclone_remotes(settings.rclone_config):
+            raise ConfigError(f"rclone repository remote is not configured: {remote}:")
+        return rclone_owner(settings.rclone_config)
+    if settings.rclone_config is not None:
+        raise ConfigError("local repository must omit host.backup.rclone_config")
+    return _local_owner(Path(settings.repository))
+
+
 def rclone_owner(path: Path) -> Operator:
     try:
         resolved = path.resolve(strict=False)
@@ -628,56 +733,105 @@ def rclone_owner(path: Path) -> Operator:
     os.close(descriptor)
     if stat.S_IMODE(details.st_mode) != 0o600:
         raise ConfigError(f"rclone configuration must have mode 0600: {path}")
-    if details.st_uid == 0:
-        raise ConfigError(f"rclone configuration must be owned by a non-root user: {path}")
+    operator = _operator(details.st_uid, path)
     try:
-        account = pwd.getpwuid(details.st_uid)
-    except KeyError as exc:
-        raise ConfigError(f"rclone configuration owner is unknown: {path}") from exc
-    home = Path(account.pw_dir)
-    try:
-        resolved_home = home.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
-        raise ConfigError(f"rclone configuration owner has an unsafe home: {home}") from exc
-    if not home.is_absolute() or home != resolved_home:
-        raise ConfigError(f"rclone configuration owner has an unsafe home: {home}")
-    try:
-        home_details = home.lstat()
         parent = path.parent.lstat()
     except OSError as exc:
-        raise ConfigError(
-            f"rclone configuration owner has an unsafe home or parent: {path}"
-        ) from exc
-    if (
-        not stat.S_ISDIR(home_details.st_mode)
-        or home_details.st_uid != account.pw_uid
-        or home_details.st_mode & 0o022
-    ):
-        raise ConfigError(f"rclone configuration owner has an unsafe home: {home}")
+        raise ConfigError(f"rclone configuration has an unsafe parent: {path}") from exc
     if (
         not stat.S_ISDIR(parent.st_mode)
-        or parent.st_uid != account.pw_uid
+        or parent.st_uid != details.st_uid
         or parent.st_mode & 0o022
         or parent.st_mode & 0o300 != 0o300
     ):
         raise ConfigError(
             f"rclone configuration parent must be safely user-writable: {path.parent}"
         )
-    for current in dict.fromkeys((*path.parent.parents, *home.parents)):
+    return operator
+
+
+def _local_owner(path: Path) -> Operator:
+    repository_parts(str(path))
+    try:
+        if path.exists() or path.is_symlink():
+            details = path.lstat()
+            if not stat.S_ISDIR(details.st_mode) or path.is_symlink():
+                raise ConfigError(f"local repository is missing or unsafe: {path}")
+            parent = path.parent.lstat()
+            if (
+                not stat.S_ISDIR(parent.st_mode)
+                or parent.st_uid != details.st_uid
+                or parent.st_mode & 0o022
+                or parent.st_mode & 0o300 != 0o300
+            ):
+                raise ConfigError(f"local repository owner differs from its parent: {path}")
+            selected = path
+        else:
+            selected = path.parent
+            details = selected.lstat()
+    except OSError as exc:
+        raise ConfigError(f"local repository parent is missing or unsafe: {path.parent}") from exc
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid == 0
+        or details.st_mode & 0o022
+        or details.st_mode & 0o300 != 0o300
+    ):
+        raise ConfigError(
+            "local repository or parent must be safely user-writable "
+            f"by a non-root owner: {selected}"
+        )
+    return _operator(details.st_uid, selected)
+
+
+def _operator(uid: int, source: Path) -> Operator:
+    if uid == 0:
+        raise ConfigError(f"repository operator must be non-root: {source}")
+    try:
+        account = pwd.getpwuid(uid)
+    except KeyError as exc:
+        raise ConfigError(f"repository owner is unknown: {source}") from exc
+    home = Path(account.pw_dir)
+    try:
+        resolved_home = home.resolve(strict=False)
+        home_details = home.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(f"repository operator has an unsafe home: {home}") from exc
+    if (
+        not home.is_absolute()
+        or home != resolved_home
+        or not stat.S_ISDIR(home_details.st_mode)
+        or home_details.st_uid != account.pw_uid
+        or home_details.st_mode & 0o022
+    ):
+        raise ConfigError(f"repository operator has an unsafe home: {home}")
+    for current in dict.fromkeys((*source.parent.parents, *home.parents)):
         try:
             ancestor = current.lstat()
         except OSError as exc:
-            raise ConfigError(f"rclone configuration has an unsafe ancestor: {current}") from exc
+            raise ConfigError(f"repository operator has an unsafe ancestor: {current}") from exc
         shared = ancestor.st_uid == 0 and ancestor.st_mode & stat.S_ISVTX
         if not stat.S_ISDIR(ancestor.st_mode) or (ancestor.st_mode & 0o022 and not shared):
-            raise ConfigError(f"rclone configuration has an unsafe ancestor: {current}")
+            raise ConfigError(f"repository operator has an unsafe ancestor: {current}")
     try:
         groups = tuple(
             sorted(set(os.getgrouplist(account.pw_name, account.pw_gid)) - {account.pw_gid})
         )
     except OSError as exc:
-        raise ConfigError(f"rclone configuration owner groups are unavailable: {path}") from exc
+        raise ConfigError(f"repository operator groups are unavailable: {source}") from exc
     return Operator(account.pw_uid, account.pw_gid, account.pw_name, home, groups)
+
+
+def _rclone_parser(path: Path) -> configparser.RawConfigParser:
+    opened = _open_rclone(path)
+    descriptor, _details = opened
+    parser = configparser.RawConfigParser(interpolation=None)
+    try:
+        with os.fdopen(descriptor, encoding="utf-8") as source:
+            parser.read_file(source)
+    except (configparser.Error, OSError, UnicodeError) as exc:
+        raise ConfigError(f"invalid rclone configuration: {path}") from exc
+    return parser
 
 
 def _open_rclone(path: Path, *, missing_ok: bool = False) -> tuple[int, os.stat_result] | None:

@@ -35,6 +35,35 @@ def test_add_persists_source_credentials_and_generated_files_before_start(config
     assert calls == [("up", target.compose, target.compose_project)]
 
 
+def test_add_persists_custom_postgres_identity_and_encodes_connection(config, monkeypatch):
+    _runtime(monkeypatch)
+
+    updated = database.add(
+        config,
+        "identity-prod-01",
+        "postgres",
+        username="app user",
+        database_name="app/data",
+        password="custom password",
+    )
+
+    target = updated.select("identity-prod-01/postgres")
+    connection = database.connection(target)
+    assert target.settings.username == "app user"
+    assert target.settings.database == "app/data"
+    assert connection["username"] == "app user"
+    assert connection["database"] == "app/data"
+    assert "app%20user" in connection["url"]
+    assert "/app%2Fdata?" in connection["url"]
+
+
+def test_existing_postgres_rejects_different_creation_identity(config, monkeypatch):
+    monkeypatch.setattr(database, "health", lambda *args: pytest.fail("health after mismatch"))
+
+    with pytest.raises(DatabaseError, match="initialized Postgres identity"):
+        database.add(config, "app-test-01", "postgres", username="other")
+
+
 def test_failed_creation_leaves_readable_source_and_generated_files(config, monkeypatch):
     monkeypatch.setattr(database.random, "token_urlsafe", lambda size: "generated-value")
     monkeypatch.setattr(database.docker, "validate_compose", lambda *args, **kwargs: None)

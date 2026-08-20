@@ -94,6 +94,17 @@ def test_retained_parser_has_top_level_init_status_database_and_backup():
     assert add.engine is None
 
 
+def test_command_help_contains_actionable_examples_and_creation_identity():
+    root = cli.parser().format_help()
+    init = next(action.choices["init"] for action in cli.parser()._actions if action.choices)
+    add = next(action.choices["database"] for action in cli.parser()._actions if action.choices)
+    add = add._subparsers._group_actions[0].choices["add"]
+
+    assert "sudo evdb init" in root
+    assert "rclone:REMOTE:PATH or absolute local path" in init.format_help()
+    assert "--username" in add.format_help() and "--database-name" in add.format_help()
+
+
 def test_explicit_lifecycle_executes_without_confirmation(config, monkeypatch):
     calls = []
     monkeypatch.setattr(cli, "load", lambda path: config)
@@ -449,26 +460,32 @@ def test_host_screen_explicitly_shows_network_traefik_acme_and_runtime_fields():
 
 def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
     prompts = []
+    secrets = iter(["dns-token", ""])
     answers = iter(
         [
             "new-test-01",
             "storage.example.com",
             "ops@example.com",
-            "testdns",
+            "cloudflare",
+            "",
+            "6",
+            "0",
+            "n",
+            "2",
             str(tmp_path / "repository"),
-            str(tmp_path / "dns.env"),
-            str(tmp_path / "rclone.conf"),
+            "",
         ]
     )
 
     values = cli._init_values(
         {},
         lambda prompt: next(answers),
-        lambda prompt: prompts.append(prompt) or "",
+        lambda prompt: prompts.append(prompt) or next(secrets),
     )
 
     assert values["restic_password"] == ""
-    assert prompts == ["Initial Restic password (blank to generate): "]
+    assert values["dns"] == {"CLOUDFLARE_DNS_API_TOKEN": "dns-token"}
+    assert prompts == ["CLOUDFLARE_DNS_API_TOKEN: ", "Initial Restic password: "]
     generated = host._restic_password(values)
     assert generated and generated != values["restic_password"]
 
@@ -480,18 +497,56 @@ def test_guided_init_does_not_prompt_over_supplied_restic_password_file(tmp_path
             "host_id": "new-test-01",
             "domain": "storage.example.com",
             "acme_email": "ops@example.com",
-            "dns_provider": "testdns",
+            "dns_provider": "cloudflare",
             "repository": str(tmp_path / "repository"),
             "dns_file": str(tmp_path / "dns.env"),
-            "rclone_config": str(tmp_path / "rclone.conf"),
             "restic_password_file": str(path),
         },
-        lambda prompt: pytest.fail(f"unexpected text prompt: {prompt}"),
+        lambda prompt: (
+            "" if prompt.startswith("Next") else pytest.fail(f"unexpected text prompt: {prompt}")
+        ),
         lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
     )
 
     assert values["restic_password_file"] == str(path)
     assert "restic_password" not in values
+
+
+def test_append_only_text_prompt_retries_locally_without_control_sequences():
+    answers = iter(["bad domain", "storage.example.com"])
+    output = []
+
+    value = ui.ask_text(
+        lambda prompt: next(answers),
+        output.append,
+        "Base domain",
+        validate=__import__("evdb.config", fromlist=["validate_domain"]).validate_domain,
+    )
+
+    assert value == "storage.example.com"
+    assert any("example: storage.example.com" in line for line in output)
+    assert "\x1b" not in "\n".join(output)
+
+
+def test_guided_postgres_advanced_identity_is_redacted(config, monkeypatch):
+    answers = iter(["custom-prod-01", "1", "y", "app_user", "app_db", "y"])
+    passwords = iter(["private password", "private password"])
+    seen = {}
+    output = []
+
+    def add(current, project, role, **values):
+        seen.update(project=project, role=role, **values)
+        return current
+
+    monkeypatch.setattr(database, "add", add)
+
+    ui._add(config, lambda prompt: next(answers), output.append, lambda prompt: next(passwords))
+
+    assert seen["username"] == "app_user"
+    assert seen["database_name"] == "app_db"
+    assert seen["password"] == "private password"
+    assert "private password" not in "\n".join(output)
+    assert "Password: provided" in "\n".join(output)
 
 
 @pytest.mark.parametrize(

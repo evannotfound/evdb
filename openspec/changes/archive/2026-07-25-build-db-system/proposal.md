@@ -13,7 +13,7 @@ Evanovation's database setup is spread across host files, shared Compose templat
 - Add Restic upload, snapshot tracking, retention, prune, and repository check support while keeping repository format v1.
 - Add Ansible, Compose templates, and systemd units for the finished system and test them on disposable local hosts.
 - Add local integration tests, CI, secret scanning, and operator documentation.
-- Keep production unchanged. Deployment to `montreal-01`, replacement of cron, Restic upgrades, image changes, secret rotation, container restarts, and Compose takeover will be handled by a later production move.
+- Keep production unchanged. Deployment to `production-host`, replacement of cron, Restic upgrades, image changes, secret rotation, container restarts, and Compose takeover will be handled by a later production move.
 
 ## Capabilities
 

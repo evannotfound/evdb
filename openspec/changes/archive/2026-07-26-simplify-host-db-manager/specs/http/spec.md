@@ -109,5 +109,5 @@ Credential-bearing information SHALL require an exact project/role identity when
 ## REMOVED Requirements
 
 ### Requirement: Initial external route facts
-**Reason**: Montreal-specific route gaps and legacy domains belong to the separate production migration, not the general host-owned HTTP contract.
+**Reason**: production-specific route gaps and legacy domains belong to the separate production migration, not the general host-owned HTTP contract.
 **Migration**: Record and resolve them during the approved external proxy migration.

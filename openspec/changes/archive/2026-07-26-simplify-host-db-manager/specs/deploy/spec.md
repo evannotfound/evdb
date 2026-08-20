@@ -131,7 +131,7 @@ Settings operations SHALL compare the installed role, concrete engine, source im
 - **THEN** evdb refuses to treat the conversion as a settings update
 
 ### Requirement: Local deployment test
-Generated YAML, direct settings transactions, failed-settings recovery, dedicated Traefik, host setup, and tool updates SHALL be tested on disposable local infrastructure. Tests SHALL NOT invoke production hosts, repositories, credentials, Docker changes, cron changes, or systemd changes on `montreal-01`.
+Generated YAML, direct settings transactions, failed-settings recovery, dedicated Traefik, host setup, and tool updates SHALL be tested on disposable local infrastructure. Tests SHALL NOT invoke production hosts, repositories, credentials, Docker changes, cron changes, or systemd changes on `production-host`.
 
 #### Scenario: Full disposable operation completes
 - **WHEN** the integration suite adds and configures test databases

@@ -48,6 +48,7 @@ integration-collect:
 
 binary:
 	$(PYINSTALLER) --clean --noconfirm --onefile --name evdb --paths src \
+		--add-data src/evdb/dns_providers.json:evdb \
 		--add-data src/evdb/units:evdb/units src/evdb/__main__.py
 
 require-db:

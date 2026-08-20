@@ -186,6 +186,5 @@ def route(database, service_port: int) -> dict[str, str]:
         f"traefik.tcp.routers.{key}.entrypoints": entrypoint,
         f"traefik.tcp.routers.{key}.rule": f"HostSNI(`{database.domain}`)",
         f"traefik.tcp.routers.{key}.tls": "true",
-        f"traefik.tcp.routers.{key}.tls.certresolver": "evdb",
         f"traefik.tcp.services.{key}.loadbalancer.server.port": str(service_port),
     }

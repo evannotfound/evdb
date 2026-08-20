@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 
@@ -62,7 +63,7 @@ def test_checked_backup_manifest_upload_and_local_cleanup(config, monkeypatch):
 
 
 def test_completed_backup_handoff_is_recursive_and_rejects_symlinks(config, tmp_path):
-    operator = backup.rclone_owner(config.host.backup.rclone_config)
+    operator = backup.repository_owner(config.host.backup)
     folder = tmp_path / "complete"
     nested = folder / "nested"
     nested.mkdir(parents=True)
@@ -219,7 +220,7 @@ def test_restic_uses_operator_identity_and_memory_password_descriptor(config, mo
 
     assert result.code == 0
     assert seen["password"] == config.secrets.restic_password + "\n"
-    owner = backup.rclone_owner(config.host.backup.rclone_config)
+    owner = backup.repository_owner(config.host.backup)
     assert seen["descriptor_mode"] == 0o400
     assert seen["descriptor_owner"] == (owner.uid, owner.gid)
     assert seen["password_path"] == f"/proc/self/fd/{seen['descriptor']}"
@@ -229,13 +230,11 @@ def test_restic_uses_operator_identity_and_memory_password_descriptor(config, mo
     assert config.secrets.restic_password not in seen["env"].values()
     assert "RESTIC_PASSWORD" not in seen["env"]
     assert seen["env"] == {
-        "HOME": str(backup.rclone_owner(config.host.backup.rclone_config).home),
-        "USER": backup.rclone_owner(config.host.backup.rclone_config).name,
-        "LOGNAME": backup.rclone_owner(config.host.backup.rclone_config).name,
+        "HOME": str(backup.repository_owner(config.host.backup).home),
+        "USER": backup.repository_owner(config.host.backup).name,
+        "LOGNAME": backup.repository_owner(config.host.backup).name,
         "RCLONE_CONFIG": str(config.host.backup.rclone_config),
-        "RESTIC_CACHE_DIR": str(
-            backup.rclone_owner(config.host.backup.rclone_config).home / ".cache/restic"
-        ),
+        "RESTIC_CACHE_DIR": str(backup.repository_owner(config.host.backup).home / ".cache/restic"),
     }
     assert seen["kwargs"]["replace_env"] is True
     assert seen["kwargs"]["user"] == owner.uid
@@ -243,6 +242,34 @@ def test_restic_uses_operator_identity_and_memory_password_descriptor(config, mo
     assert seen["kwargs"]["extra_groups"] == owner.groups
     with pytest.raises(OSError):
         os.fstat(seen["descriptor"])
+
+
+def test_local_restic_omits_every_rclone_input(config, tmp_path, monkeypatch):
+    local = replace(
+        config,
+        host=replace(
+            config.host,
+            backup=replace(
+                config.host.backup,
+                repository=str(tmp_path / "repository"),
+                rclone_config=None,
+            ),
+        ),
+    )
+    seen = {}
+
+    def run(args, **kwargs):
+        seen.update(args=args, env=kwargs["env"])
+        return Result(tuple(args), 0, '{"version":1}\n', "")
+
+    monkeypatch.setattr(backup, "run", run)
+    monkeypatch.setattr(backup.os, "geteuid", lambda: 0)
+
+    backup._restic(local, ["cat", "config"])
+
+    assert not any("rclone" in value for value in seen["args"])
+    assert "RCLONE_CONFIG" not in seen["env"]
+    assert seen["args"][seen["args"].index("-r") + 1] == str(tmp_path / "repository")
 
 
 def test_create_all_redacts_exact_and_encoded_credentials(config, monkeypatch):
