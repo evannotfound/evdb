@@ -51,9 +51,10 @@ jobs:
         run: |
           VERSION="$(dist/evdb --version)"
           test "v${VERSION#evdb }" = "${GITHUB_REF_NAME}"
-          uv run pyi-archive_viewer -l dist/evdb > binary-members.txt
+          uv run pyi-archive_viewer -r -b dist/evdb > binary-members.txt
           grep -F "evdb/units/evdb-backup.service" binary-members.txt
           grep -F "evdb/units/evdb-backup.timer" binary-members.txt
+          grep -Fx " rich.console" binary-members.txt
       - name: Assemble release executable
         run: |
           ASSET="evdb_linux_${{ matrix.arch }}"

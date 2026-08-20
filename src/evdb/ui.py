@@ -1,12 +1,166 @@
 from __future__ import annotations
 
+import os
+import re
 import shutil
 from getpass import getpass
-from typing import Any
+from typing import IO, Any
+
+from rich.console import Console
+from rich.text import Text
 
 from .errors import Error
 from .models import Config, Database
 from .run import clean
+
+_PROMPT_DEFAULT = re.compile(r"\[([^]]+)](?=\s*:?[ ]*$)")
+
+
+class Terminal:
+    def __init__(self, console: Console):
+        self.console = console
+
+    def __call__(self, value: Any = "") -> None:
+        self.text(value)
+
+    def text(
+        self,
+        value: Any = "",
+        *,
+        style: str | None = None,
+        states: tuple[tuple[str, str], ...] = (),
+        bold_lines: tuple[int, ...] = (),
+    ) -> None:
+        text = Text(clean(str(value)), style=style)
+        _style_states(text, states)
+        _style_lines(text, bold_lines)
+        self.console.print(text, soft_wrap=True)
+
+    def heading(self, value: str, *, error: bool = False) -> None:
+        self.text(value, style="bold red" if error else "bold")
+
+    def input(self, prompt: str) -> str:
+        return self.console.input(_prompt(prompt))
+
+    def read_secret(self, prompt: str) -> str:
+        self.console.print(_prompt(prompt), end="")
+        return getpass("", echo_char="*")
+
+    def error(self, value: Any) -> None:
+        text = Text(clean(str(value)))
+        end = text.plain.find(":")
+        text.stylize("bold red", 0, end + 1 if end >= 0 else len(text))
+        self.console.print(text, soft_wrap=True)
+
+    def status(self, value: dict[str, Any]) -> None:
+        from . import status
+
+        self.text(
+            status.render(value, width=self.console.width),
+            states=_overview_states(value),
+            bold_lines=(0, 1),
+        )
+
+
+def terminal(
+    *,
+    file: IO[str] | None = None,
+    stderr: bool = False,
+    force_terminal: bool | None = None,
+) -> Terminal:
+    return Terminal(
+        Console(
+            file=file,
+            stderr=stderr,
+            force_terminal=force_terminal,
+            highlight=False,
+            markup=False,
+            no_color=_no_color(),
+        )
+    )
+
+
+def _no_color() -> bool | None:
+    if os.getenv("NO_COLOR") is not None or os.getenv("TERM") == "dumb":
+        return True
+    return None
+
+
+def _prompt(value: str) -> Text:
+    text = Text(value)
+    match = _PROMPT_DEFAULT.search(value)
+    label_end = match.start() if match else len(value.rstrip(" :"))
+    text.stylize("bold cyan", 0, label_end)
+    if match:
+        default = match.group(1)
+        upper = next((index for index, char in enumerate(default) if char.isupper()), None)
+        start = match.start(1) + (upper or 0)
+        end = start + 1 if upper is not None else match.end(1)
+        text.stylize("bold", start, end)
+    return text
+
+
+def _style_states(text: Text, states: tuple[tuple[str, str], ...]) -> None:
+    for value, style in states:
+        if not value:
+            continue
+        pattern = rf"(?<!\w){re.escape(value)}(?!\w)"
+        for match in re.finditer(pattern, text.plain):
+            text.stylize(style, match.start(), match.end())
+
+
+def _style_lines(text: Text, lines: tuple[int, ...]) -> None:
+    start = 0
+    for number, line in enumerate(text.plain.splitlines(keepends=True)):
+        end = start + len(line.rstrip("\n"))
+        if number in lines:
+            text.stylize("bold", start, end)
+        start += len(line)
+
+
+def _state_style(value: str) -> str | None:
+    if value in {"healthy", "ready", "current", "complete", "completed", "listening"}:
+        return "green"
+    if value in {"needs attention", "stale/missing", "unknown", "stopped", "low"}:
+        return "yellow"
+    if value in {"unhealthy", "failed", "missing", "missing or unsafe"}:
+        return "red"
+    return None
+
+
+def _overview_states(value: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    from . import status
+
+    host_state = "healthy" if value["host"]["healthy"] else "needs attention"
+    states = [(host_state, _state_style(host_state))]
+    for item in value["databases"].values():
+        health = item["health"]
+        states.append((health, _state_style(health)))
+        backup = status.backup_text(item["latest_backup"])
+        if item["latest_backup"]["state"] == "current":
+            states.append((backup, "green"))
+        elif item["latest_backup"]["state"] == "stale":
+            states.append((backup, "yellow"))
+    return tuple((text, style) for text, style in states if style)
+
+
+def show_status(output, value: dict[str, Any]) -> None:
+    from . import status
+
+    if isinstance(output, Terminal):
+        output.status(value)
+    else:
+        output(status.render(value))
+
+
+def success(output, value: str) -> None:
+    states = tuple(
+        (word, "green") for word in ("healthy", "complete", "completed") if word in value
+    )
+    if isinstance(output, Terminal):
+        output.text(value, states=states)
+    else:
+        output(value)
 
 
 def read_secret(prompt: str) -> str:
@@ -47,7 +201,14 @@ def run(
     current = config
     while True:
         value = status.collect(current)
-        _screen(output, overview(value), heading="Databases")
+        width = output.console.width if isinstance(output, Terminal) else None
+        _screen(
+            output,
+            overview(value, width=width),
+            heading="Databases",
+            states=_overview_states(value),
+            bold_lines=(0, 2),
+        )
         rows = {str(index) for index, _identity in enumerate(value["databases"], 1)}
         add = len(rows) + 1
         host = add + 1
@@ -65,7 +226,7 @@ def run(
             else:
                 _host(value, output)
         except Error as exc:
-            _screen(output, f"evdb: {exc}", heading="Error")
+            _screen(output, f"evdb: {exc}", heading="Error", error=True)
 
 
 def _database(config: Config, identity: str, input_fn, output) -> Config:
@@ -92,6 +253,9 @@ def _database(config: Config, identity: str, input_fn, output) -> Config:
             output,
             pairs(summary),
             heading=target.identity,
+            states=((observed["health"], _state_style(observed["health"])),)
+            if _state_style(observed["health"])
+            else (),
         )
         state_action = "Stop" if observed["running"] else "Start"
         options = [
@@ -129,6 +293,7 @@ def _database(config: Config, identity: str, input_fn, output) -> Config:
                         output,
                         f"{identity} settings saved and healthy",
                         heading="Settings",
+                        states=(("healthy", "green"),),
                     )
             elif choice == "4":
                 (database.stop if observed["running"] else database.start)(current, target)
@@ -136,16 +301,27 @@ def _database(config: Config, identity: str, input_fn, output) -> Config:
                     output,
                     f"{identity}: {state_action.lower()} complete",
                     heading=state_action,
+                    states=(("complete", "green"),),
                 )
             elif choice == "5":
                 database.restart(current, target)
-                _screen(output, f"{identity}: restart complete", heading="Restart")
+                _screen(
+                    output,
+                    f"{identity}: restart complete",
+                    heading="Restart",
+                    states=(("complete", "green"),),
+                )
             elif choice == "6":
                 current = _backups(current, target, input_fn, output)
             else:
                 _screen(output, database.logs(current, target), heading="Logs")
         except Error as exc:
-            _screen(output, f"evdb: {exc}", heading=f"{target.identity} error")
+            _screen(
+                output,
+                f"evdb: {exc}",
+                heading=f"{target.identity} error",
+                error=True,
+            )
 
 
 def _add(config: Config, input_fn, output, password_fn) -> Config:
@@ -234,7 +410,12 @@ def _add(config: Config, input_fn, output, password_fn) -> Config:
         database_name=database_name,
         data_root=data_root,
     )
-    _screen(output, f"{project}/{role} is healthy", heading="Created")
+    _screen(
+        output,
+        f"{project}/{role} is healthy",
+        heading="Created",
+        states=(("healthy", "green"),),
+    )
     return updated
 
 
@@ -253,7 +434,7 @@ def _settings(target: Database, input_fn, output) -> dict[str, Any] | None:
                 candidate = {**values, name: _parse(entered, old)}
                 database._settings(target, candidate, ())
             except Error as exc:
-                _screen(output, str(exc), heading=f"Invalid {name}")
+                _screen(output, str(exc), heading=f"Invalid {name}", error=True)
                 continue
             values = candidate
             break
@@ -287,12 +468,18 @@ def _backups(config: Config, target: Database, input_fn, output) -> Config:
                     f"at {result['finished']}\n"
                     f"Snapshot: {result['snapshot']}\nRepository: {result['repository']}",
                     heading="Backup complete",
+                    states=(("completed", "green"),),
                 )
             else:
                 rows = backup.history(config, target)
                 _screen(output, backup_history(rows), heading="Backup history")
         except Error as exc:
-            _screen(output, f"evdb: {exc}", heading=f"{target.identity} backup error")
+            _screen(
+                output,
+                f"evdb: {exc}",
+                heading=f"{target.identity} backup error",
+                error=True,
+            )
 
 
 def _host(value: dict[str, Any], output) -> None:
@@ -303,6 +490,24 @@ def _host(value: dict[str, Any], output) -> None:
         for item in value["errors"]
         if item["scope"].startswith("host/")
     ]
+    storage_state = (
+        ("ok", "green")
+        if host["storage"].get("ok")
+        else ("low", "yellow")
+        if host["storage"].get("available", True)
+        else ("unknown", "yellow")
+    )
+    states = [storage_state]
+    states.extend(
+        _state_tone(ready, "listening", "missing") for ready in infrastructure["listeners"].values()
+    )
+    states.extend(
+        (
+            _state_tone(infrastructure["network"], "healthy", "missing"),
+            _state_tone(infrastructure["traefik"], "healthy", "unhealthy"),
+            _state_tone(infrastructure["acme"], "ready", "missing or unsafe"),
+        )
+    )
     _screen(
         output,
         pairs(
@@ -340,6 +545,7 @@ def _host(value: dict[str, Any], output) -> None:
             }
         ),
         heading="Host",
+        states=tuple(states),
     )
 
 
@@ -349,11 +555,30 @@ def _state(value: bool | None, ready: str, missing: str) -> str:
     return ready if value else missing
 
 
-def _screen(output, text: str, *, heading: str | None = None) -> None:
+def _state_tone(value: bool | None, ready: str, missing: str) -> tuple[str, str]:
+    text = _state(value, ready, missing)
+    return text, "yellow" if value is None else "green" if value else "red"
+
+
+def _screen(
+    output,
+    text: str,
+    *,
+    heading: str | None = None,
+    states: tuple[tuple[str, str], ...] = (),
+    bold_lines: tuple[int, ...] = (),
+    error: bool = False,
+) -> None:
     output("")
     if heading:
-        output(clean(heading))
-    output(clean(text))
+        if isinstance(output, Terminal):
+            output.heading(clean(heading), error=error)
+        else:
+            output(clean(heading))
+    if isinstance(output, Terminal):
+        output.text(clean(text), states=states, bold_lines=bold_lines)
+    else:
+        output(clean(text))
     output("")
 
 

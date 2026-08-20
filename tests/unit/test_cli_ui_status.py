@@ -1,13 +1,15 @@
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from urllib.parse import quote
 
 import pytest
+from rich.console import Console
 
 from evdb import cli, database, docker, host, status, ui
 from evdb.errors import BackupError, CommandError, DatabaseError
-from evdb.run import Result
+from evdb.run import Result, clean
 
 
 def _value(*, error=None):
@@ -64,6 +66,28 @@ def _value(*, error=None):
             else []
         ),
     }
+
+
+def _terminal(*, width=100):
+    stream = StringIO()
+    console = Console(
+        file=stream,
+        force_terminal=True,
+        color_system="standard",
+        width=width,
+        highlight=False,
+        markup=False,
+    )
+    return ui.Terminal(console), stream
+
+
+class _Output(StringIO):
+    def __init__(self, terminal):
+        super().__init__()
+        self.terminal = terminal
+
+    def isatty(self):
+        return self.terminal
 
 
 @pytest.mark.parametrize(
@@ -127,6 +151,55 @@ def test_production_secret_input_uses_asterisk_feedback(monkeypatch):
     assert calls == [("API token: ", "*")]
 
 
+def test_terminal_uses_literal_text_and_semantic_styles():
+    output, stream = _terminal(width=60)
+
+    output.text("[bold red]literal[/] healthy", states=(("healthy", "green"),))
+
+    rendered = stream.getvalue()
+    assert "[bold red]literal[/]" in rendered
+    assert "\x1b[32mhealthy" in rendered
+    assert clean(rendered) == "[bold red]literal[/] healthy\n"
+
+
+def test_terminal_prompt_emphasizes_question_and_effective_default():
+    output, _stream = _terminal()
+    prompt = ui._prompt("Continue? [Y/n] ")
+
+    question = prompt.get_style_at_offset(output.console, 0)
+    yes = prompt.get_style_at_offset(output.console, prompt.plain.index("Y"))
+    no = prompt.get_style_at_offset(output.console, prompt.plain.rindex("n"))
+
+    assert question.bold and question.color is not None
+    assert yes.bold
+    assert not no.bold
+
+
+@pytest.mark.parametrize(("name", "value"), [("NO_COLOR", "1"), ("TERM", "dumb")])
+def test_terminal_respects_no_color_settings(monkeypatch, name, value):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    monkeypatch.setenv(name, value)
+    stream = StringIO()
+    output = ui.terminal(file=stream, force_terminal=True)
+
+    output.text("healthy", states=(("healthy", "green"),))
+
+    assert stream.getvalue() == "healthy\n"
+
+
+def test_terminal_status_keeps_alignment_and_styles_mixed_states():
+    output, stream = _terminal(width=60)
+
+    output.status(_value())
+
+    rendered = stream.getvalue()
+    plain = clean(rendered)
+    assert "\x1b[32m" in rendered and "\x1b[33m" in rendered
+    assert "healthy" in plain and "stopped" in plain
+    assert max(map(len, plain.splitlines())) <= 60
+
+
 def test_explicit_lifecycle_executes_without_confirmation(config, monkeypatch):
     calls = []
     monkeypatch.setattr(cli, "load", lambda path: config)
@@ -156,6 +229,54 @@ def test_cli_catches_expected_errors_but_unexpected_faults_keep_traceback(config
 
     with pytest.raises(RuntimeError, match="bug"):
         cli.main(["--config", str(config.paths.source), "status"], output=lambda value: None)
+
+
+@pytest.mark.parametrize("terminal", [True, False])
+def test_cli_styles_status_only_on_terminal_stdout(config, monkeypatch, terminal):
+    stdout = _Output(terminal)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setattr(cli.sys, "stdout", stdout)
+    monkeypatch.setattr(cli.sys, "stderr", _Output(False))
+    monkeypatch.setattr(cli, "load", lambda path: config)
+    monkeypatch.setattr(cli.status, "collect", lambda *args: _value())
+
+    code = cli.main(["--config", str(config.paths.source), "status"])
+
+    assert code == 0
+    assert ("\x1b[" in stdout.getvalue()) is terminal
+
+
+def test_cli_styles_terminal_stderr_independently(tmp_path, monkeypatch):
+    stdout = _Output(False)
+    stderr = _Output(True)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setattr(cli.sys, "stdout", stdout)
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+
+    code = cli.main(["--config", str(tmp_path / "missing.yml"), "status"])
+
+    assert code == 1
+    assert stdout.getvalue() == ""
+    assert "\x1b[" in stderr.getvalue()
+    assert clean(stderr.getvalue()).startswith("evdb:")
+
+
+def test_status_json_bypasses_terminal_presenter(config, monkeypatch):
+    stdout = _Output(True)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setattr(cli.sys, "stdout", stdout)
+    monkeypatch.setattr(cli.sys, "stderr", _Output(False))
+    monkeypatch.setattr(cli, "load", lambda path: config)
+    monkeypatch.setattr(cli.status, "collect", lambda *args: _value())
+
+    code = cli.main(["--config", str(config.paths.source), "status", "--json"])
+
+    assert code == 0
+    assert "\x1b" not in stdout.getvalue()
+    json.loads(stdout.getvalue())
 
 
 def test_status_json_is_credential_free_and_repository_visible(config, monkeypatch):
@@ -329,6 +450,36 @@ def test_guided_root_has_headings_blank_rhythm_and_no_duplicate_database_options
     assert sum("app-test-01/kv" in item for item in output) == 1
     assert "Add database" in "\n".join(output)
     assert "\x1b" not in "\n".join(output)
+
+
+def test_guided_database_and_host_views_style_structured_states(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    output, stream = _terminal()
+    monkeypatch.setattr(
+        database,
+        "observe",
+        lambda *args: {"running": False, "healthy": False, "health": "stopped"},
+    )
+
+    ui._database(config, target.identity, lambda prompt: "0", output)
+
+    selected = stream.getvalue()
+    assert "\x1b[33mstopped" in selected
+    assert "Status: stopped" in clean(selected)
+
+    stream.seek(0)
+    stream.truncate()
+    value = _value()
+    value["host"]["storage"]["ok"] = False
+    value["host"]["infrastructure"]["network"] = False
+    value["host"]["infrastructure"]["traefik"] = None
+    ui._host(value, output)
+
+    rendered = stream.getvalue()
+    assert "\x1b[31mmissing" in rendered
+    assert "\x1b[33munknown" in rendered
+    assert "Network: missing" in clean(rendered)
+    assert "Traefik: unknown" in clean(rendered)
 
 
 def test_guided_database_details_errors_and_credentials_stay_in_context(config, monkeypatch):

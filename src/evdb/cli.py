@@ -125,11 +125,20 @@ def main(
     password_fn=None,
 ) -> int:
     injected = output is not None
-    terminal = not injected and sys.stdout.isatty()
-    input_fn = input_fn or input
-    output = output or print
-    error = error or (lambda value: print(value, file=sys.stderr))
-    password_fn = password_fn or ui.read_secret
+    plain_output = output or print
+    presenter = ui.terminal() if not injected and sys.stdout.isatty() else None
+    terminal = presenter is not None
+    input_fn = input_fn or (presenter.input if presenter and sys.stdin.isatty() else input)
+    output = presenter or plain_output
+    if error is None:
+        error = (
+            ui.terminal(stderr=True).error
+            if sys.stderr.isatty()
+            else lambda value: print(value, file=sys.stderr)
+        )
+    password_fn = password_fn or (
+        presenter.read_secret if presenter and sys.stdin.isatty() else ui.read_secret
+    )
     args = parser().parse_args(argv)
     try:
         source = Path(args.config)
@@ -160,7 +169,7 @@ def main(
             from . import host
 
             value = host.initialize(source, values, output=output)
-            output(f"{value['host']['id']}: initialization complete")
+            ui.success(output, f"{value['host']['id']}: initialization complete")
             return 0 if value["host"]["healthy"] else 1
         if args.command is None:
             if not _tty():
@@ -171,7 +180,10 @@ def main(
         if args.command == "status":
             target = config.select(args.database) if args.database else None
             value = status.collect(config, target)
-            output(status.dumps(value) if args.json else status.render(value))
+            if args.json:
+                plain_output(status.dumps(value))
+            else:
+                ui.show_status(output, value)
             return 0 if value["healthy"] else 1
         if args.command == "database":
             return _database(config, args, output, terminal=terminal)
@@ -210,7 +222,7 @@ def _database(config, args, output, *, terminal: bool) -> int:
             database_name=args.database_name,
             data_root=args.data_root,
         )
-        output(f"{args.project}/{args.role} is healthy")
+        ui.success(output, f"{args.project}/{args.role} is healthy")
         return 0
     target = config.select(args.database)
     if command == "info":
@@ -237,12 +249,12 @@ def _database(config, args, output, *, terminal: bool) -> int:
             if getattr(args, name) is not None
         }
         database.configure(config, target, values, reset=tuple(args.reset))
-        output(f"{target.identity} settings saved and healthy")
+        ui.success(output, f"{target.identity} settings saved and healthy")
     elif command == "logs":
         output(database.logs(config, target, lines=args.lines))
     else:
         getattr(database, command)(config, target)
-        output(f"{target.identity}: {command} complete")
+        ui.success(output, f"{target.identity}: {command} complete")
     return 0
 
 
@@ -262,19 +274,24 @@ def _backup(config, args, output) -> int:
         failed = False
         for identity, value in results.items():
             failed = failed or not value["ok"]
-            output(
+            text = (
                 f"{identity}: backup {value['backup']} snapshot {value['snapshot']}"
                 if value["ok"]
                 else f"{identity}: {value['error']}"
             )
+            if value["ok"]:
+                ui.success(output, text)
+            else:
+                output(text)
         return 1 if failed else 0
     if not args.database:
         raise Error("database is required unless --all is used")
     target = config.select(args.database)
     value = backup.create(config, target)
-    output(
+    ui.success(
+        output,
         f"{target.identity}: backup {value['backup']} completed at {value['finished']}; "
-        f"snapshot {value['snapshot']}; repository {value['repository']}"
+        f"snapshot {value['snapshot']}; repository {value['repository']}",
     )
     return 0
 
