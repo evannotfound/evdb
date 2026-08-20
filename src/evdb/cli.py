@@ -12,11 +12,13 @@ from .config import (
     load,
     rclone_remotes,
     repository_parts,
+    validate_data_root,
     validate_domain,
     validate_email,
     validate_host_id,
 )
 from .errors import Error
+from .models import Paths
 from .run import clean
 
 
@@ -40,6 +42,11 @@ def parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init", help="initialize or refresh this host")
     init.add_argument("--host-id", metavar="NAME", help="lowercase host name, e.g. example-01")
     init.add_argument("--domain", metavar="DOMAIN", help="base domain, e.g. storage.example.com")
+    init.add_argument(
+        "--data-root",
+        metavar="PATH",
+        help="absolute host-wide database data root",
+    )
     init.add_argument("--acme-email", metavar="EMAIL", help="ACME account email")
     init.add_argument("--dns-provider", metavar="PROVIDER", help="cataloged lego provider code")
     init.add_argument(
@@ -135,6 +142,7 @@ def main(
                 for name in (
                     "host_id",
                     "domain",
+                    "data_root",
                     "acme_email",
                     "dns_provider",
                     "repository",
@@ -322,7 +330,6 @@ def _init_values(
         try:
             if source is not None:
                 from .host import _initial
-                from .models import Paths
 
                 _initial(result, Paths(config=source.parent))
         except Error as exc:
@@ -370,6 +377,12 @@ def _init_host(result: dict, input_fn, output) -> None:
             validate_domain,
         ),
         (
+            "data_root",
+            "Database data root",
+            "Dedicated directory for all database files; mount storage before Apply.",
+            lambda value: str(validate_data_root(value)),
+        ),
+        (
             "acme_email",
             "ACME email",
             "Address used for certificate registration and expiry notices.",
@@ -385,6 +398,7 @@ def _init_host(result: dict, input_fn, output) -> None:
             label,
             help_text=help_text,
             validate=validate,
+            default=str(Paths().databases) if name == "data_root" else None,
         )
         if value is None:
             raise KeyboardInterrupt
@@ -550,6 +564,7 @@ def _init_review(result: dict) -> str:
         {
             "Host": result["host_id"],
             "Base domain": result["domain"],
+            "Database data root": result["data_root"],
             "Wildcard": f"*.{result['host_id']}.{result['domain']}",
             "ACME email": result["acme_email"],
             "DNS provider": result["dns_provider"],
@@ -569,10 +584,11 @@ def _edit_init(result: dict, input_fn, output) -> None:
     fields = (
         ("1", "Host ID", ("host_id",)),
         ("2", "Base domain", ("domain",)),
-        ("3", "ACME email", ("acme_email",)),
-        ("4", "DNS provider and credentials", ("dns_provider", "dns", "dns_file")),
-        ("5", "Backup repository", ("repository", "rclone_config")),
-        ("6", "Restic password", ("restic_password", "restic_password_file")),
+        ("3", "Database data root", ("data_root",)),
+        ("4", "ACME email", ("acme_email",)),
+        ("5", "DNS provider and credentials", ("dns_provider", "dns", "dns_file")),
+        ("6", "Backup repository", ("repository", "rclone_config")),
+        ("7", "Restic password", ("restic_password", "restic_password_file")),
     )
     selected = ui.choose(
         input_fn,

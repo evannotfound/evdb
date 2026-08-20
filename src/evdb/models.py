@@ -89,6 +89,7 @@ class Routing:
 class Host:
     id: str
     domain: str
+    data_root: Path
     backup: BackupSettings
     routing: Routing
 
@@ -220,7 +221,7 @@ class Database:
 
     @property
     def data(self) -> Path:
-        return self.paths.databases / self.project / self.role / "data"
+        return self.host.data_root / self.project / self.role / "data"
 
     @property
     def generated(self) -> Path:

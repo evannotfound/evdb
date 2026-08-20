@@ -18,6 +18,7 @@ from .config import (
     protected,
     reject_unsupported,
     repository_parts,
+    validate_data_root,
     write,
 )
 from .errors import CommandError, ConfigError, Error, HostError
@@ -50,6 +51,15 @@ def initialize(
         else:
             _guard_preload(source_path, managed)
     config = load(source_path, paths=managed) if existing else _initial(values or {}, managed)
+    if existing and values and values.get("data_root") is not None:
+        try:
+            requested = validate_data_root(
+                values["data_root"], managed, config.host.backup.repository
+            )
+        except ConfigError as exc:
+            raise HostError(str(exc)) from exc
+        if requested != config.host.data_root:
+            raise HostError("host.data_root cannot be changed after initialization")
     _require_root(config)
     missing = prerequisites(config)
     if missing:
@@ -133,6 +143,7 @@ def _initial(values: dict[str, Any], paths: Paths) -> Config:
         Host(
             values["host_id"],
             values["domain"],
+            Path(values.get("data_root", paths.databases)),
             BackupSettings(values["repository"], Path(rclone) if rclone else None, 5, 26),
             Routing(values["acme_email"], provider, DEFAULT_IMAGES["traefik"]),
         ),
@@ -157,7 +168,7 @@ def _directories(config: Config) -> None:
             (config.paths.state, 0o711),
             (config.paths.backups, 0o711),
             (config.paths.locks, 0o700),
-            (config.paths.databases, 0o700),
+            (config.host.data_root, 0o700),
         ):
             managed_dir(path, mode)
     except OSError as exc:
@@ -509,7 +520,7 @@ def _env_file(path: Path) -> dict[str, str]:
 
 
 def _writable(config: Config, unit_dir: Path) -> None:
-    roots = (config.paths.config, config.paths.state, unit_dir)
+    roots = (config.paths.config, config.paths.state, config.host.data_root, unit_dir)
     for path in roots:
         current = path
         while True:

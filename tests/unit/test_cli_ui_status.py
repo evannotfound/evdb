@@ -90,6 +90,7 @@ def test_retained_parser_has_top_level_init_status_database_and_backup():
     assert not hasattr(args, "yes")
     init = cli.parser().parse_args(["init", "--restic-password-file", "/private/password"])
     assert init.restic_password_file == "/private/password"
+    assert cli.parser().parse_args(["init", "--data-root", "/mnt/evdb"]).data_root == ("/mnt/evdb")
     add = cli.parser().parse_args(["database", "add", "app-test-01", "kv"])
     assert add.engine is None
 
@@ -465,6 +466,7 @@ def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
         [
             "new-test-01",
             "storage.example.com",
+            "",
             "ops@example.com",
             "cloudflare",
             "",
@@ -484,6 +486,7 @@ def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
     )
 
     assert values["restic_password"] == ""
+    assert values["data_root"] == "/var/lib/evdb/databases"
     assert values["dns"] == {"CLOUDFLARE_DNS_API_TOKEN": "dns-token"}
     assert prompts == ["CLOUDFLARE_DNS_API_TOKEN: ", "Initial Restic password: "]
     generated = host._restic_password(values)
@@ -496,6 +499,7 @@ def test_guided_init_does_not_prompt_over_supplied_restic_password_file(tmp_path
         {
             "host_id": "new-test-01",
             "domain": "storage.example.com",
+            "data_root": str(tmp_path / "data-root"),
             "acme_email": "ops@example.com",
             "dns_provider": "cloudflare",
             "repository": str(tmp_path / "repository"),

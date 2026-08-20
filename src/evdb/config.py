@@ -226,6 +226,7 @@ def as_dict(config: Config) -> dict[str, Any]:
         "host": {
             "id": host.id,
             "domain": host.domain,
+            "data_root": str(host.data_root),
             "backup": backup,
             "routing": {
                 "acme_email": host.routing.acme_email,
@@ -395,6 +396,10 @@ def require_valid(config: Config) -> None:
             validator(value)
         except ConfigError as exc:
             errors.append(str(exc))
+    try:
+        validate_data_root(host.data_root, config.paths, host.backup.repository)
+    except ConfigError as exc:
+        errors.append(str(exc))
     for managed in (config.paths.config, config.paths.state):
         unsafe = _unsafe_directory(managed)
         if unsafe is not None:
@@ -514,12 +519,58 @@ def validate_email(value: str) -> str:
     return value
 
 
+def validate_data_root(
+    value: str | Path,
+    paths: Paths | None = None,
+    repository: str | None = None,
+) -> Path:
+    path = Path(value)
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError("host.data_root must be a normalized absolute path") from exc
+    if not path.is_absolute() or path != resolved:
+        raise ConfigError("host.data_root must be a normalized absolute path")
+    unsafe = _unsafe_directory(path)
+    if unsafe is not None:
+        raise ConfigError(f"host.data_root is symlinked or unsafe: {unsafe}")
+
+    managed = paths or Paths()
+    reserved = (
+        managed.config,
+        managed.projects,
+        managed.traefik,
+        managed.backups,
+        managed.locks,
+    )
+    if any(_paths_overlap(path, item) for item in reserved):
+        raise ConfigError("host.data_root overlaps an evdb managed path")
+    if (
+        repository is not None
+        and repository_parts(repository) is None
+        and _paths_overlap(path, Path(repository))
+    ):
+        raise ConfigError("host.data_root overlaps the local backup repository")
+    if path != managed.databases:
+        try:
+            parent = path.parent.lstat()
+        except OSError as exc:
+            raise ConfigError(f"host.data_root parent is missing or unsafe: {path.parent}") from exc
+        if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+            raise ConfigError(f"host.data_root parent is missing or unsafe: {path.parent}")
+        if managed.config == CONFIG_DIR and (parent.st_uid != 0 or parent.st_mode & 0o022):
+            raise ConfigError(f"host.data_root parent must be safely root-owned: {path.parent}")
+        if managed.config == CONFIG_DIR and path.exists() and path.lstat().st_uid != 0:
+            raise ConfigError(f"host.data_root must be root-owned: {path}")
+    return path
+
+
 def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
     if {"databases", "instances", "releases"} & set(data):
         raise ConfigError("unsupported source schema")
     _only(data, {"host", "projects"}, "config")
     host_data = _object(_required(data, "host", "config"), "host")
-    _only(host_data, {"id", "domain", "backup", "routing"}, "host")
+    _only(host_data, {"id", "domain", "data_root", "backup", "routing"}, "host")
     backup_data = _object(_required(host_data, "backup", "host"), "host.backup")
     _only(
         backup_data,
@@ -534,6 +585,7 @@ def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
     host = Host(
         _string(host_data, "id", "host"),
         _string(host_data, "domain", "host"),
+        Path(_string(host_data, "data_root", "host")),
         BackupSettings(
             _string(backup_data, "repository", "host.backup"),
             Path(rclone_value) if rclone_value is not None else None,
@@ -862,6 +914,19 @@ def _unsafe_directory(path: Path) -> Path | None:
         if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
             return current
     return None
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        pass
+    try:
+        right.relative_to(left)
+        return True
+    except ValueError:
+        return False
 
 
 def _json_credentials(value: str) -> list[str]:

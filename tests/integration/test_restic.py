@@ -135,6 +135,7 @@ def test_root_drops_repository_work_to_rclone_owner(monkeypatch):
             Host(
                 "privilege-test-01",
                 "storage.example.com",
+                root / "state/databases",
                 BackupSettings(
                     f"rclone:local:{remote / 'repository'}",
                     rclone,

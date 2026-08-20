@@ -1,5 +1,6 @@
 import os
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -34,7 +35,8 @@ def test_strict_two_file_round_trip_and_project_role_selectors(config):
         "app-test-01/kv",
     ]
     assert config.select("app-test-01/postgres").compose.name == "compose.yaml"
-    assert config.select("app-test-01/kv").data == (config.paths.databases / "app-test-01/kv/data")
+    assert config.host.data_root == config.paths.databases
+    assert config.select("app-test-01/kv").data == (config.host.data_root / "app-test-01/kv/data")
     assert config.paths.source.name == "config.yml"
     assert config.paths.secrets.name == "secrets.yml"
     assert config.host.backup.rclone_config.name == "rclone.conf"
@@ -49,6 +51,49 @@ def test_postgres_identity_is_required_without_compatibility_defaults(config):
 
     with pytest.raises(ConfigError, match="postgres.username is required"):
         load(config.paths.source, paths=config.paths)
+
+
+def test_data_root_is_required_without_compatibility_default(config):
+    text = config.paths.source.read_text().replace(f"  data_root: {config.paths.databases}\n", "")
+    config.paths.source.write_text(text)
+
+    with pytest.raises(ConfigError, match="host.data_root is required"):
+        load(config.paths.source, paths=config.paths)
+
+
+def test_custom_data_root_is_explicit_and_derives_role_paths(config, tmp_path):
+    parent = tmp_path / "database-volume"
+    parent.mkdir()
+    root = parent / "evdb"
+    selected = replace(config, host=replace(config.host, data_root=root))
+
+    require_valid(selected)
+
+    assert as_dict(selected)["host"]["data_root"] == str(root)
+    assert selected.select("app-test-01/postgres").data == (root / "app-test-01/postgres/data")
+
+
+@pytest.mark.parametrize("root", [Path("relative/data"), Path("/")])
+def test_data_root_rejects_relative_and_overlapping_paths(config, root):
+    selected = replace(config, host=replace(config.host, data_root=root))
+
+    with pytest.raises(ConfigError, match="host.data_root"):
+        require_valid(selected)
+
+
+def test_custom_data_root_requires_existing_immediate_parent(config, tmp_path):
+    root = tmp_path / "missing" / "evdb"
+    selected = replace(config, host=replace(config.host, data_root=root))
+
+    with pytest.raises(ConfigError, match="parent is missing or unsafe"):
+        require_valid(selected)
+
+
+def test_data_root_rejects_managed_backup_overlap(config):
+    selected = replace(config, host=replace(config.host, data_root=config.paths.backups))
+
+    with pytest.raises(ConfigError, match="overlaps an evdb managed path"):
+        require_valid(selected)
 
 
 def test_atomic_writes_keep_source_and_secret_modes(config):

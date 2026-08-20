@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import yaml
+
 from . import docker
 from .config import add_role, defaults, load, protected, replace_role, validate_image, write
 from .engines import get
@@ -20,6 +22,12 @@ from .run import clean, redact
 def render(config: Config, database: Database) -> dict[str, Any]:
     engine = get(database.engine)
     engine.validate(database.settings)
+    data = {
+        "name": database.compose_project,
+        "services": engine.services(database),
+        "networks": {docker.NETWORK: {"external": True, "name": docker.NETWORK}},
+    }
+    _require_stable_data_bind(database, data)
     try:
         managed_dir(database.data, None)
     except OSError as exc:
@@ -27,11 +35,6 @@ def render(config: Config, database: Database) -> dict[str, Any]:
     generated = private_dir(database.generated)
     for name, text in engine.files(database).items():
         write_text(generated / name, text, mode=0o640)
-    data = {
-        "name": database.compose_project,
-        "services": engine.services(database),
-        "networks": {docker.NETWORK: {"external": True, "name": docker.NETWORK}},
-    }
     docker.write_compose(database.compose, data)
     docker.validate_compose(
         database.compose,
@@ -40,6 +43,51 @@ def render(config: Config, database: Database) -> dict[str, Any]:
         secrets=protected(config),
     )
     return data
+
+
+def _require_stable_data_bind(database: Database, desired: dict[str, Any]) -> None:
+    compose = database.compose
+    if not compose.exists() and not compose.is_symlink():
+        return
+    if compose.is_symlink() or not compose.is_file():
+        raise DatabaseError(f"generated Compose is missing or unsafe: {compose}")
+    try:
+        current = yaml.safe_load(compose.read_text())
+        service = database.service("primary")
+        desired_service = desired["services"][service]
+        target = _data_target(desired_service, database.data)
+        current_source = _bind_source(current["services"][service], target)
+    except (KeyError, TypeError, OSError, yaml.YAMLError) as exc:
+        raise DatabaseError(f"generated Compose data bind is missing or unsafe: {compose}") from exc
+    if current_source != database.data:
+        raise DatabaseError(
+            f"database data root cannot change for {database.identity}: "
+            f"{current_source} -> {database.data}"
+        )
+
+
+def _data_target(service: dict[str, Any], source: Path) -> str:
+    prefix = f"{source}:"
+    matches = [
+        volume.removeprefix(prefix).split(":", 1)[0]
+        for volume in service["volumes"]
+        if isinstance(volume, str) and volume.startswith(prefix)
+    ]
+    if len(matches) != 1:
+        raise KeyError("data bind")
+    return matches[0]
+
+
+def _bind_source(service: dict[str, Any], target: str) -> Path:
+    suffix = f":{target}"
+    matches = [
+        Path(volume.removesuffix(suffix))
+        for volume in service["volumes"]
+        if isinstance(volume, str) and volume.endswith(suffix)
+    ]
+    if len(matches) != 1:
+        raise KeyError("data bind")
+    return matches[0]
 
 
 def add(

@@ -326,6 +326,36 @@ def test_render_preserves_existing_mode_restricted_data_directory(config, monkey
     )
 
 
+def test_render_uses_custom_host_data_root(config, tmp_path, monkeypatch):
+    parent = tmp_path / "database-volume"
+    parent.mkdir()
+    selected = replace(config, host=replace(config.host, data_root=parent / "evdb"))
+    target = selected.select("app-test-01/kv")
+    monkeypatch.setattr(database.docker, "validate_compose", lambda *args, **kwargs: None)
+
+    data = database.render(selected, target)
+
+    assert target.data.is_dir()
+    assert data["services"][target.service("primary")]["volumes"][0] == f"{target.data}:/data"
+
+
+def test_render_rejects_changed_data_root_before_mutation(config, tmp_path, monkeypatch):
+    target = config.select("app-test-01/kv")
+    monkeypatch.setattr(database.docker, "validate_compose", lambda *args, **kwargs: None)
+    database.render(config, target)
+    before = target.compose.read_text()
+    parent = tmp_path / "database-volume"
+    parent.mkdir()
+    selected = replace(config, host=replace(config.host, data_root=parent / "evdb"))
+    changed = selected.select(target.identity)
+
+    with pytest.raises(DatabaseError, match="data root cannot change"):
+        database.render(selected, changed)
+
+    assert not changed.data.exists()
+    assert target.compose.read_text() == before
+
+
 def test_info_reports_latest_validated_backup_without_credentials(config, monkeypatch):
     target = config.select("app-test-01/kv")
     monkeypatch.setattr(

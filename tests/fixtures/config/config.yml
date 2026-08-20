@@ -1,6 +1,7 @@
 host:
   id: test-01
   domain: storage.example.com
+  data_root: /tmp/evdb-data-root
   backup:
     repository: rclone:remote:evdb/test-01
     rclone_config: /tmp/evdb-rclone.conf

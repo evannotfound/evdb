@@ -316,6 +316,7 @@ def test_initial_restic_password_file_is_private_and_existing_config_ignores_rep
     config = host._initial(values, paths)
 
     assert config.secrets.restic_password == "existing repository password"
+    assert config.host.data_root == paths.databases
     password.chmod(0o644)
     with pytest.raises(host.HostError, match="private regular"):
         host._initial(values, paths)
@@ -369,10 +370,34 @@ def test_host_directories_expose_only_backup_traversal(config):
     for path in (
         config.paths.projects,
         config.paths.traefik,
-        config.paths.databases,
+        config.host.data_root,
         config.paths.locks,
     ):
         assert path.stat().st_mode & 0o777 == 0o700
+
+
+def test_host_directories_prepare_custom_data_root(config, tmp_path):
+    parent = tmp_path / "database-volume"
+    parent.mkdir()
+    root = parent / "evdb"
+    selected = replace(config, host=replace(config.host, data_root=root))
+
+    host._directories(selected)
+
+    assert root.is_dir()
+    assert root.stat().st_mode & 0o777 == 0o700
+
+
+def test_existing_host_rejects_requested_data_root_change(config, tmp_path):
+    parent = tmp_path / "database-volume"
+    parent.mkdir()
+
+    with pytest.raises(host.HostError, match="cannot be changed"):
+        host.initialize(
+            config.paths.source,
+            {"data_root": str(parent / "evdb")},
+            paths=config.paths,
+        )
 
 
 def test_canonical_source_directory_converges_to_private_root_layout(config, monkeypatch):

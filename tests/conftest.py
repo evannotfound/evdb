@@ -24,6 +24,7 @@ def config(paths, tmp_path):
     rclone.write_bytes((FIXTURE / "rclone.conf").read_bytes())
     rclone.chmod(0o600)
     text = (FIXTURE / "config.yml").read_text()
+    text = text.replace("/tmp/evdb-data-root", str(paths.databases))
     text = text.replace("/tmp/evdb-repository", str(tmp_path / "repository"))
     text = text.replace("/tmp/evdb-rclone.conf", str(rclone))
     paths.source.write_text(text)
