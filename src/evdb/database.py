@@ -436,10 +436,9 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
 
 
 def _current(settings: Postgres | KV, name: str):
-    if name == "pgbouncer":
-        return settings.pgbouncer.enabled
-    if name.startswith("pgbouncer_"):
-        return getattr(settings.pgbouncer, name.removeprefix("pgbouncer_"))
+    if name in {"pgbouncer", "pgbouncer_image", "max_clients", "pool_size", "reserve_size"}:
+        attribute = {"pgbouncer": "enabled", "pgbouncer_image": "image"}.get(name, name)
+        return getattr(settings.pgbouncer, attribute)
     if name == "http":
         return settings.http.enabled
     if name.startswith("http_"):

@@ -460,6 +460,20 @@ def test_settings_invalid_field_retries_locally(config):
     assert "integer value required" in output
 
 
+def test_postgres_settings_display_nested_pool_values(config):
+    target = config.select("app-test-01/postgres")
+    answers = iter([""] * 6)
+    output = []
+
+    values = ui._settings(target, lambda prompt: next(answers), output.append)
+
+    assert values is None
+    text = "\n".join(output)
+    assert "Max Clients: 100" in text
+    assert "Pool Size: 20" in text
+    assert "Reserve Size: 5" in text
+
+
 def test_host_screen_explicitly_shows_network_traefik_acme_and_runtime_fields():
     output = []
 

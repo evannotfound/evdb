@@ -159,6 +159,32 @@ def test_configure_writes_and_invokes_compose_once(config, monkeypatch):
     assert len(calls) == 1
 
 
+def test_postgres_pool_settings_reset_to_defaults(config):
+    target = config.select("app-test-01/postgres")
+    target = replace(
+        target,
+        settings=replace(
+            target.settings,
+            pgbouncer=replace(
+                target.settings.pgbouncer,
+                max_clients=250,
+                pool_size=40,
+                reserve_size=10,
+            ),
+        ),
+    )
+
+    settings = database._settings(
+        target,
+        {},
+        ("max_clients", "pool_size", "reserve_size"),
+    )
+
+    assert settings.pgbouncer.max_clients == 100
+    assert settings.pgbouncer.pool_size == 20
+    assert settings.pgbouncer.reserve_size == 5
+
+
 def test_logs_are_bounded_and_pass_exact_credentials_for_redaction(config, monkeypatch):
     target = config.select("app-test-01/kv")
     target.compose.parent.mkdir(parents=True)
