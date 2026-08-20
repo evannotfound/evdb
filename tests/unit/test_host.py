@@ -89,7 +89,7 @@ def test_prerequisites_require_restic_017_without_python_or_uv(tmp_path, monkeyp
 
 def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_path, monkeypatch):
     dns = tmp_path / "dns.env"
-    dns.write_text("CLOUDFLARE_DNS_API_TOKEN=private\n")
+    dns.write_text("CF_DNS_API_TOKEN=private\n")
     values = {
         "host_id": "new-test-01",
         "domain": "storage.example.com",
@@ -189,7 +189,7 @@ def test_acme_readiness_requires_exact_nonempty_wildcard(config):
 
 def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, monkeypatch):
     dns = tmp_path / "dns.env"
-    dns.write_text("CLOUDFLARE_DNS_API_TOKEN=private\n")
+    dns.write_text("CF_DNS_API_TOKEN=private\n")
     values = {
         "host_id": "retry-test-01",
         "domain": "storage.example.com",
@@ -304,7 +304,7 @@ def test_initial_restic_password_file_is_private_and_existing_config_ignores_rep
     password.write_text("existing repository password\n")
     password.chmod(0o600)
     dns = tmp_path / "dns.env"
-    dns.write_text("CLOUDFLARE_DNS_API_TOKEN=private\n")
+    dns.write_text("CF_DNS_API_TOKEN=private\n")
     values = {
         "host_id": "password-test-01",
         "domain": "storage.example.com",

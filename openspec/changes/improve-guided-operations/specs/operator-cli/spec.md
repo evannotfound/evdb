@@ -17,8 +17,8 @@ before one Apply confirmation.
 
 ### Requirement: Guided provider and repository selection
 Guided initialization SHALL search and select canonical DNS providers from the catalog bundled for the
-pinned Traefik and lego versions. It SHALL present the selected provider's documented credential
-variables and help URL and collect selected secret values with masked input. For rclone storage it SHALL
+pinned Traefik and lego versions. It SHALL present the selected provider's current credential variables
+and help URL and collect selected secret values with one `*` per typed character. For rclone storage it SHALL
 validate the native configuration, list its configured remotes, select one remote, and collect a safe
 repository path instead of accepting a free-form repository URL. It SHALL also offer an explicit local
 repository mode.
@@ -30,6 +30,10 @@ repository mode.
 #### Scenario: Provider search has no match
 - **WHEN** the operator searches for a DNS provider not present in the bundled catalog
 - **THEN** evdb reports no supported match and repeats provider selection without accepting the search text as a provider code
+
+#### Scenario: Operator types an interactive secret
+- **WHEN** guided setup or database creation requests a secret from a terminal
+- **THEN** each typed character displays as `*` and the actual value is never echoed
 
 ### Requirement: Grounded contextual presentation
 Human output SHALL use task-specific sections, key/value summaries, numbered choices, concise append-only
@@ -61,7 +65,7 @@ Direct Postgres creation SHALL accept optional `--username`, `--database-name`, 
 `--password-file PATH` creation inputs. Guided creation SHALL generate the default managed identity
 without requesting a password unless the operator enters Advanced configuration. Advanced creation SHALL
 collect username and database name as visible validated values and collect and confirm the password with
-masked input. The validated password SHALL be stored only in `secrets.yml` and derived private role
+asterisk-masked input. The validated password SHALL be stored only in `secrets.yml` and derived private role
 files. No inline password argument, environment input, echoed prompt, preview, status, or machine output
 SHALL be accepted.
 

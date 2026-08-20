@@ -476,14 +476,8 @@
       },
       "code": "cloudflare",
       "credentials": {
-        "CF_API_EMAIL": "Account email",
-        "CF_API_KEY": "API key",
         "CF_DNS_API_TOKEN": "API token with DNS:Edit permission (since v3.1.0)",
-        "CF_ZONE_API_TOKEN": "API token with Zone:Read permission (since v3.1.0)",
-        "CLOUDFLARE_API_KEY": "Alias to CF_API_KEY",
-        "CLOUDFLARE_DNS_API_TOKEN": "Alias to CF_DNS_API_TOKEN",
-        "CLOUDFLARE_EMAIL": "Alias to CF_API_EMAIL",
-        "CLOUDFLARE_ZONE_API_TOKEN": "Alias to CF_ZONE_API_TOKEN"
+        "CF_ZONE_API_TOKEN": "API token with Zone:Read permission (since v3.1.0)"
       },
       "description": "",
       "help": "https://go-acme.github.io/lego/dns/cloudflare/",
@@ -756,8 +750,7 @@
         "DESIGNATE_PROPAGATION_TIMEOUT": "Maximum waiting time for DNS propagation in seconds (Default: 600)",
         "DESIGNATE_TTL": "The TTL of the TXT record used for the DNS challenge in seconds (Default: 10)",
         "DESIGNATE_ZONE_NAME": "The zone name to use in the OpenStack Project to manage TXT records.",
-        "OS_PROJECT_ID": "Project ID",
-        "OS_TENANT_NAME": "Tenant name (deprecated see OS_PROJECT_NAME and OS_PROJECT_ID)"
+        "OS_PROJECT_ID": "Project ID"
       },
       "code": "designate",
       "credentials": {
@@ -1386,7 +1379,6 @@
       },
       "code": "gandiv5",
       "credentials": {
-        "GANDIV5_API_KEY": "API key (Deprecated)",
         "GANDIV5_PERSONAL_ACCESS_TOKEN": "Personal Access Token"
       },
       "description": "",
@@ -2661,12 +2653,7 @@
         "OCI_POLLING_INTERVAL": "Time between DNS propagation check in seconds (Default: 2)",
         "OCI_PROFILE": "Profile name. (only for `OCI_AUTH_TYPE=user_principal`)",
         "OCI_PROPAGATION_TIMEOUT": "Maximum waiting time for DNS propagation in seconds (Default: 60)",
-        "OCI_TTL": "The TTL of the TXT record used for the DNS challenge in seconds (Default: 120)",
-        "TF_VAR_fingerprint": "Alias on `OCI_FINGERPRINT`",
-        "TF_VAR_private_key_path": "Alias on `OCI_PRIVATE_KEY_PATH`",
-        "TF_VAR_region": "Alias on `OCI_REGION`",
-        "TF_VAR_tenancy_ocid": "Alias on `OCI_TENANCY_OCID`",
-        "TF_VAR_user_ocid": "Alias on `OCI_USER_OCID`"
+        "OCI_TTL": "The TTL of the TXT record used for the DNS challenge in seconds (Default: 120)"
       },
       "code": "oraclecloud",
       "credentials": {

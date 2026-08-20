@@ -36,7 +36,7 @@ replacement and database data transfer are performed independently by the operat
 **Goals:**
 
 - Make fresh initialization explanatory, locally validated, editable, and deliberate before mutation.
-- Prevent unsupported DNS providers and undocumented variables while supporting the complete provider
+- Prevent unsupported DNS providers and obsolete variables while supporting the complete provider
   catalog for the pinned Traefik and lego versions.
 - Prove ACME end to end during initialization and reuse one host wildcard for all native routes.
 - Make rclone repository construction selectable and local repositories genuinely independent of rclone.
@@ -59,7 +59,9 @@ replacement and database data transfer are performed independently by the operat
 ### Keep prompting append-only and separate it from domain validation
 
 Extend the existing UI boundary with small line-oriented primitives for text, numbered selection,
-confirmation, and masked secret input. Each primitive accepts injected input/output functions, optional
+confirmation, and asterisk-masked secret input. Production secret input uses Python's standard-library
+`getpass` with one `*` per typed character while injected password functions retain their one-argument
+test boundary. Each primitive accepts injected input/output functions, optional
 default and help text, and a validator that returns a value or a concise error. Lists print once per
 attempt; invalid input prints one error and repeats the same question. `KeyboardInterrupt` continues to
 cancel through `cli.main()`, and EOF cancels without applying.
@@ -80,9 +82,11 @@ append-only interaction model that makes rclone's setup robust.
 Add a development tool that downloads the exact tagged lego source selected by the pinned Traefik image,
 parses provider TOML with standard-library `tomllib`, and writes a deterministic compact package-data
 catalog. The generated data records Traefik and lego versions plus canonical provider code, display name,
-credential and additional variables, descriptions, and the canonical lego help URL. Canonical provider
-codes come from provider metadata; recognized aliases normalize to their canonical code but are not
-shown as separate choices.
+current credential and additional variables, descriptions, and the canonical lego help URL. Variables
+marked as aliases or deprecated are omitted, and Cloudflare exposes only `CF_DNS_API_TOKEN` and
+`CF_ZONE_API_TOKEN` because its legacy email and global-key path is not marked deprecated upstream.
+Canonical provider codes come from provider metadata; recognized provider aliases normalize to their
+canonical code but are not shown as separate choices.
 
 Project checks verify that catalog metadata matches `DEFAULT_IMAGES["traefik"]`, the expected lego
 version, and selected known provider records. The release build embeds the catalog and smoke-tests that it
@@ -90,14 +94,14 @@ can be read from the frozen executable. Runtime setup never downloads provider d
 
 The provider selector asks for a name/code search term and prints only matching numbered rows, with an
 explicit path to browse further matches. After selection, it shows the provider description and official
-URL. Credential collection is a numbered editor over documented variables. Secret-looking values use
-masked input; paths, identifiers, regions, booleans, and ordinary names use visible input with local type
+URL. Credential collection is a numbered editor over current variables. Secret-looking values use
+asterisk-masked input; paths, identifiers, regions, booleans, and ordinary names use visible input with local type
 or path validation. Additional provider settings are behind an Advanced choice. The review shows only
 variable names and `provided` status.
 
 The catalog does not pretend that every listed credential is simultaneously required. Providers such as
 Cloudflare, Route53, Azure, and Google expose alternative keys, files, profiles, or workload identities.
-The wizard presents the exact provider help and lets the operator select the documented variables for the
+The wizard presents the exact provider help and lets the operator select the current variables for the
 chosen authentication path. Final wildcard issuance is authoritative. Direct non-interactive setup keeps
 `--dns-file`; parsing rejects unknown keys for the selected provider before source changes.
 
@@ -214,6 +218,8 @@ one secret-free document.
   during idempotent add, omit it from settings, and reject mismatches before mutation.
 - [The broader guided flow becomes verbose] -> Use progressive sections, filtered provider results,
   defaults, local retries, one review, and tables only for repeated comparable values.
+- [Asterisk feedback reveals secret length and changes terminal line editing] -> Accept that explicit
+  operator-visible trade-off while keeping actual characters out of terminal output.
 
 ## Delivery
 

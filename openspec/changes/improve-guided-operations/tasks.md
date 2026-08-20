@@ -2,6 +2,7 @@
 
 - [x] 1.1 Add a standard-library development generator and deterministic package-data catalog for every canonical provider in lego v5.2.2, including Traefik/lego version metadata, documented variables, descriptions, help URLs, and canonical alias normalization.
 - [x] 1.2 Add catalog loading, search, provider normalization, variable validation, version-consistency checks, package configuration, and focused tests that prove unsupported providers and undocumented variables are rejected.
+- [x] 1.3 Curate generated credential and additional variables to omit aliases and deprecated names, restrict Cloudflare to its current token variables, and cover the resulting validation boundary.
 
 ## 2. Repository Modes And Identity
 
@@ -13,6 +14,7 @@
 - [x] 3.1 Consolidate line-oriented text, numbered selection, confirmation, masked secret, default, validation-retry, EOF, and cancellation behavior in the existing UI boundary with transcript tests and no terminal control sequences.
 - [x] 3.2 Replace fresh `_init_values` prompting with editable Host, DNS, and Backup sections that search the provider catalog, collect only documented provider variables, select rclone remotes or local storage, preflight the candidate, and show one credential-redacted Apply/Edit/Cancel review.
 - [x] 3.3 Expand argparse descriptions, metavars, option help, examples, and non-interactive missing-input errors while preserving `--dns-file`, secret-free arguments, grouped commands, and installer-only existing-host `init --yes` behavior.
+- [x] 3.4 Show one asterisk per character for production interactive secret input while preserving injected prompt functions and secret validation behavior.
 
 ## 4. Verified Wildcard Routing
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from getpass import getpass
 from pathlib import Path
 
 from . import __version__, backup, database, dns, status, ui
@@ -130,7 +129,7 @@ def main(
     input_fn = input_fn or input
     output = output or print
     error = error or (lambda value: print(value, file=sys.stderr))
-    password_fn = password_fn or getpass
+    password_fn = password_fn or ui.read_secret
     args = parser().parse_args(argv)
     try:
         source = Path(args.config)
@@ -316,7 +315,7 @@ def _tty() -> bool:
 def _init_values(
     values: dict[str, object],
     input_fn,
-    password_fn=getpass,
+    password_fn=ui.read_secret,
     *,
     output=print,
     source: Path | None = None,

@@ -19,6 +19,15 @@ ALIASES = {
     "rfc2136": "dnsupdate",
     "webnames": "webnamesru",
 }
+CLOUDFLARE_CREDENTIALS = ("CF_DNS_API_TOKEN", "CF_ZONE_API_TOKEN")
+
+
+def current_variables(values: dict[str, str]) -> dict[str, str]:
+    return {
+        name: description
+        for name, description in sorted(values.items())
+        if not any(marker in description.casefold() for marker in ("alias", "deprecated"))
+    }
 
 
 def generate() -> dict:
@@ -46,6 +55,9 @@ def generate() -> dict:
             if not isinstance(code, str) or not isinstance(name, str):
                 continue
             configuration = data.get("Configuration", {})
+            credentials = current_variables(configuration.get("Credentials", {}))
+            if code == "cloudflare":
+                credentials = {key: credentials[key] for key in CLOUDFLARE_CREDENTIALS}
             providers.append(
                 {
                     "code": code,
@@ -53,8 +65,8 @@ def generate() -> dict:
                     "description": str(data.get("Description", "")).strip(),
                     "url": str(data.get("URL", "")).strip(),
                     "help": f"https://go-acme.github.io/lego/dns/{code}/",
-                    "credentials": dict(sorted(configuration.get("Credentials", {}).items())),
-                    "additional": dict(sorted(configuration.get("Additional", {}).items())),
+                    "credentials": credentials,
+                    "additional": current_variables(configuration.get("Additional", {})),
                 }
             )
     providers.sort(key=lambda item: item["code"])

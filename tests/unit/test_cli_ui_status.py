@@ -115,6 +115,18 @@ def test_command_help_contains_actionable_examples_and_creation_identity():
     assert "--username" in add.format_help() and "--database-name" in add.format_help()
 
 
+def test_production_secret_input_uses_asterisk_feedback(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        ui,
+        "getpass",
+        lambda prompt, *, echo_char: calls.append((prompt, echo_char)) or "private",
+    )
+
+    assert ui.read_secret("API token: ") == "private"
+    assert calls == [("API token: ", "*")]
+
+
 def test_explicit_lifecycle_executes_without_confirmation(config, monkeypatch):
     calls = []
     monkeypatch.setattr(cli, "load", lambda path: config)
@@ -480,7 +492,7 @@ def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
             "n",
             "cloudflare",
             "",
-            "6",
+            "1",
             "0",
             "n",
             "2",
@@ -497,8 +509,8 @@ def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
 
     assert values["restic_password"] == ""
     assert values["data_roots"] == ["/var/lib/evdb/databases"]
-    assert values["dns"] == {"CLOUDFLARE_DNS_API_TOKEN": "dns-token"}
-    assert prompts == ["CLOUDFLARE_DNS_API_TOKEN: ", "Initial Restic password: "]
+    assert values["dns"] == {"CF_DNS_API_TOKEN": "dns-token"}
+    assert prompts == ["CF_DNS_API_TOKEN: ", "Initial Restic password: "]
     generated = host._restic_password(values)
     assert generated and generated != values["restic_password"]
 

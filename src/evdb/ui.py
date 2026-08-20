@@ -9,6 +9,10 @@ from .models import Config, Database
 from .run import clean
 
 
+def read_secret(prompt: str) -> str:
+    return getpass(prompt, echo_char="*")
+
+
 def overview(value: dict[str, Any], *, width: int | None = None) -> str:
     from . import status
 
@@ -36,7 +40,7 @@ def run(
     *,
     input_fn=input,
     output=print,
-    password_fn=getpass,
+    password_fn=read_secret,
 ) -> int:
     from . import status
 

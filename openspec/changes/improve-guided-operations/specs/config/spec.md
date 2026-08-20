@@ -2,14 +2,19 @@
 
 ### Requirement: Versioned DNS provider catalog
 The standalone command SHALL contain a generated catalog of canonical DNS provider codes, display names,
-documented credential variables, descriptions, and help URLs from the exact lego version embedded in the
-pinned Traefik image. Source validation SHALL accept only cataloged canonical providers and documented
-provider variables. Updating the pinned Traefik or lego version SHALL require updating and checking the
-catalog metadata in the same source change.
+current credential and additional variables, descriptions, and help URLs from the exact lego version
+embedded in the pinned Traefik image. The catalog SHALL omit variables marked as aliases or deprecated,
+and Cloudflare SHALL expose only `CF_DNS_API_TOKEN` and `CF_ZONE_API_TOKEN`. Source validation SHALL
+accept only cataloged canonical providers and current cataloged provider variables. Updating the pinned
+Traefik or lego version SHALL require updating and checking the catalog metadata in the same source change.
 
 #### Scenario: Supported provider is selected
 - **WHEN** setup selects a provider present in the catalog bundled for Traefik `v3.7.8` and lego `v5.2.2`
-- **THEN** configuration stores its canonical code and accepts only variables documented for that provider
+- **THEN** configuration stores its canonical code and accepts only current variables cataloged for that provider
+
+#### Scenario: Obsolete provider variable is supplied
+- **WHEN** source contains a deprecated credential or credential alias omitted from the selected provider
+- **THEN** validation rejects it as an unsupported DNS variable
 
 #### Scenario: Catalog and image versions differ
 - **WHEN** source changes the pinned Traefik image without matching provider catalog metadata
@@ -57,7 +62,7 @@ Generated passwords and HTTP tokens SHALL be written under the matching role in 
 
 ### Requirement: Configuration validation
 Validation SHALL reject unsafe project IDs, missing environment suffixes, duplicate roles, unsupported
-engines or DNS providers, DNS variables not documented for the selected provider, unsafe repository
+engines or DNS providers, DNS variables not current for the selected provider, unsafe repository
 settings, colliding routes or HTTP identities, incomplete routing or backup settings, `latest` or
 unversioned images, invalid or missing Postgres identity, invalid role-specific settings, missing
 matching secrets, unexpected secret keys, and source files with unsafe ownership or modes. `config.yml`
