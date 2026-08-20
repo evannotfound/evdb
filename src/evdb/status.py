@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,13 +17,41 @@ from .run import clean, redact, run
 VERSION = 2
 
 
-def collect(config: Config, database: Database | None = None) -> dict[str, Any]:
+def collect(
+    config: Config,
+    database: Database | None = None,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
     errors = []
-    host = _host(config, errors)
-    databases = {}
     selected = (database,) if database else config.databases
+    remote_snapshots = None
+    backup_failure = None
+    repository = None
+    if any(target.durable for target in selected):
+        _progress(progress, "Reading backup repository")
+        try:
+            remote_snapshots = backup.host_snapshots(config)
+            repository = {
+                "url": config.host.backup.repository,
+                "ready": True,
+                "available": True,
+            }
+        except (Error, OSError) as exc:
+            backup_failure = exc
+            remote_snapshots = []
+            repository = _repository_error(config, errors, exc)
+    _progress(progress, "Checking host")
+    host = _host(config, errors, repository=repository)
+    databases = {}
     for target in selected:
-        item, item_errors = _database(config, target)
+        _progress(progress, f"Checking {target.identity}")
+        item, item_errors = _database(
+            config,
+            target,
+            remote_snapshots=remote_snapshots,
+            backup_failure=backup_failure,
+        )
         databases[target.identity] = item
         errors.extend(item_errors)
     healthy = host["healthy"] and all(item["healthy"] for item in databases.values())
@@ -37,6 +66,11 @@ def collect(config: Config, database: Database | None = None) -> dict[str, Any]:
 
 def dumps(value: dict[str, Any]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _progress(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
 
 
 def render(value: dict[str, Any], *, width: int | None = None) -> str:
@@ -62,7 +96,12 @@ def render(value: dict[str, Any], *, width: int | None = None) -> str:
     return "\n".join(lines)
 
 
-def _host(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
+def _host(
+    config: Config,
+    errors: list[dict[str, str]],
+    *,
+    repository: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     paths = config.paths
     try:
         storage = _disk(paths.state, config.host.backup.min_free_gb)
@@ -78,26 +117,8 @@ def _host(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
         errors.append(_error("disk_low", "host/storage", "free space is below policy"))
     infrastructure = _infrastructure(config, errors)
     timer = _timer(config, errors)
-    repository = {
-        "url": config.host.backup.repository,
-        "ready": None,
-        "available": False,
-    }
-    try:
-        repository["ready"] = backup.repository_ready(config)
-        repository["available"] = True
-    except (Error, OSError) as exc:
-        errors.append(
-            _error(
-                "repository_assessment_failed",
-                "host/repository",
-                _message(config, exc),
-            )
-        )
-    if repository["available"] and not repository["ready"]:
-        errors.append(
-            _error("repository_unavailable", "host/repository", config.host.backup.repository)
-        )
+    repository = repository or _repository(config, errors)
+
     healthy = (
         storage["ok"] and infrastructure["healthy"] and timer["ok"] and repository["ready"] is True
     )
@@ -113,7 +134,36 @@ def _host(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
     }
 
 
-def _database(config: Config, target: Database) -> tuple[dict[str, Any], list[dict[str, str]]]:
+def _repository(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
+    value = {"url": config.host.backup.repository, "ready": None, "available": False}
+    try:
+        value["ready"] = backup.repository_ready(config)
+        value["available"] = True
+    except (Error, OSError) as exc:
+        return _repository_error(config, errors, exc)
+    if value["available"] and not value["ready"]:
+        errors.append(
+            _error("repository_unavailable", "host/repository", config.host.backup.repository)
+        )
+    return value
+
+
+def _repository_error(
+    config: Config,
+    errors: list[dict[str, str]],
+    exc: BaseException,
+) -> dict[str, Any]:
+    errors.append(_error("repository_assessment_failed", "host/repository", _message(config, exc)))
+    return {"url": config.host.backup.repository, "ready": None, "available": False}
+
+
+def _database(
+    config: Config,
+    target: Database,
+    *,
+    remote_snapshots: list[dict[str, Any]] | None = None,
+    backup_failure: BaseException | None = None,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
     errors = []
     try:
         from .database import observe
@@ -124,22 +174,33 @@ def _database(config: Config, target: Database) -> tuple[dict[str, Any], list[di
         errors.append(_error("assessment_failed", target.identity, _message(config, exc)))
     latest = None
     if target.durable:
-        try:
-            rows = backup.history(config, target)
-            remote = [
-                row
-                for row in rows
-                if row.get("remote") and isinstance(row.get("snapshot"), str) and row["snapshot"]
-            ]
-            latest = max(
-                remote,
-                key=lambda row: _date(row.get("time")) or datetime.min.replace(tzinfo=UTC),
-                default=None,
-            )
-        except (Error, OSError) as exc:
+        if backup_failure is not None:
             errors.append(
-                _error("backup_assessment_failed", target.identity, _message(config, exc))
+                _error(
+                    "backup_assessment_failed",
+                    target.identity,
+                    _message(config, backup_failure),
+                )
             )
+        else:
+            try:
+                rows = backup.history(config, target, remote_snapshots=remote_snapshots)
+                remote = [
+                    row
+                    for row in rows
+                    if row.get("remote")
+                    and isinstance(row.get("snapshot"), str)
+                    and row["snapshot"]
+                ]
+                latest = max(
+                    remote,
+                    key=lambda row: _date(row.get("time")) or datetime.min.replace(tzinfo=UTC),
+                    default=None,
+                )
+            except (Error, OSError) as exc:
+                errors.append(
+                    _error("backup_assessment_failed", target.identity, _message(config, exc))
+                )
         date = _date(latest.get("time")) if latest and latest.get("remote") else None
         stale = (
             date is None

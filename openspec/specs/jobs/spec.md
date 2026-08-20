@@ -39,6 +39,10 @@ configuration comparison, and full errors until a database is selected or explic
 - **WHEN** the operator selects a role from the guided overview
 - **THEN** its full image, paths, settings, backup records, and current error are shown outside the root table
 
+#### Scenario: Status assesses several durable databases
+- **WHEN** one status collection includes multiple durable roles from the same host repository
+- **THEN** evdb reads the host snapshot list once and filters that result by each role's complete identity
+
 ### Requirement: Host status
 Status SHALL include host identity, running evdb version, Traefik and network health, native listeners,
 free `/var/lib/evdb` storage, one backup timer state, repository availability, and source validation.

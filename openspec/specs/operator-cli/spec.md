@@ -21,8 +21,8 @@ layout. In a color-capable terminal, headings and questions SHALL be emphasized,
 SHALL be visually distinct from alternatives, and healthy, warning, and failure states SHALL use distinct
 styles. Color SHALL supplement explicit wording rather than replace any state label. The presenter SHALL
 separate screens, results, errors, and prompts with blank lines, preserve numbered input, and avoid
-cursor-addressed navigation. Plain or injected output SHALL contain no terminal control sequences or Rich
-markup.
+cursor-addressed navigation except for replacing one transient loading-status line. Plain or injected
+output SHALL contain no terminal control sequences or Rich markup.
 
 #### Scenario: Guided flow advances between screens
 - **WHEN** the operator selects a database and then a backup action
@@ -44,6 +44,10 @@ markup.
 - **WHEN** terminal settings disable color
 - **THEN** labels and wording preserve every state distinction and interaction default without requiring color
 
+#### Scenario: Interactive assessment takes noticeable time
+- **WHEN** the guided root, Details, backup, or log view waits for synchronous external work
+- **THEN** one transient terminal status line identifies the current phase and is removed before the completed screen or error is appended
+
 ### Requirement: Context-aware database menu
 The guided root SHALL use a table only for the database overview. Selecting a role SHALL open a
 key/value summary and numbered actions for Details, Connection, Settings, Start or Stop, Restart,
@@ -53,6 +57,10 @@ details SHALL appear only in their relevant submenu.
 #### Scenario: Operator opens Postgres details
 - **WHEN** the operator selects a Postgres role and opens Details
 - **THEN** the view shows its full configured images and PgBouncer settings without widening the root table
+
+#### Scenario: Details refreshes backup information
+- **WHEN** the operator opens Details from a database menu whose runtime was just assessed
+- **THEN** evdb reuses that runtime assessment, performs one fresh matching backup-history query, and does not repeat the complete host assessment
 
 #### Scenario: Operator configures Redis
 - **WHEN** the operator opens Settings for Redis-backed KV

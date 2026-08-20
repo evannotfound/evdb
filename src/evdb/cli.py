@@ -179,10 +179,12 @@ def main(
         config = load(source)
         if args.command == "status":
             target = config.select(args.database) if args.database else None
-            value = status.collect(config, target)
             if args.json:
+                value = status.collect(config, target)
                 plain_output(status.dumps(value))
             else:
+                with ui.loading(output, "Checking status") as update:
+                    value = status.collect(config, target, progress=update)
                 ui.show_status(output, value)
             return 0 if value["healthy"] else 1
         if args.command == "database":

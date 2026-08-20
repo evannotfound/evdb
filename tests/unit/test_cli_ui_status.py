@@ -200,6 +200,17 @@ def test_terminal_status_keeps_alignment_and_styles_mixed_states():
     assert max(map(len, plain.splitlines())) <= 60
 
 
+def test_terminal_loading_updates_one_transient_line():
+    output, stream = _terminal()
+
+    with output.loading("Starting checks") as update:
+        update("Reading backup repository")
+
+    rendered = stream.getvalue()
+    assert "\x1b[" in rendered
+    assert "Reading backup repository" in rendered
+
+
 def test_explicit_lifecycle_executes_without_confirmation(config, monkeypatch):
     calls = []
     monkeypatch.setattr(cli, "load", lambda path: config)
@@ -224,7 +235,9 @@ def test_explicit_lifecycle_executes_without_confirmation(config, monkeypatch):
 def test_cli_catches_expected_errors_but_unexpected_faults_keep_traceback(config, monkeypatch):
     monkeypatch.setattr(cli, "load", lambda path: config)
     monkeypatch.setattr(
-        cli.status, "collect", lambda *args: (_ for _ in ()).throw(RuntimeError("bug"))
+        cli.status,
+        "collect",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("bug")),
     )
 
     with pytest.raises(RuntimeError, match="bug"):
@@ -239,7 +252,7 @@ def test_cli_styles_status_only_on_terminal_stdout(config, monkeypatch, terminal
     monkeypatch.setattr(cli.sys, "stdout", stdout)
     monkeypatch.setattr(cli.sys, "stderr", _Output(False))
     monkeypatch.setattr(cli, "load", lambda path: config)
-    monkeypatch.setattr(cli.status, "collect", lambda *args: _value())
+    monkeypatch.setattr(cli.status, "collect", lambda *args, **kwargs: _value())
 
     code = cli.main(["--config", str(config.paths.source), "status"])
 
@@ -270,7 +283,7 @@ def test_status_json_bypasses_terminal_presenter(config, monkeypatch):
     monkeypatch.setattr(cli.sys, "stdout", stdout)
     monkeypatch.setattr(cli.sys, "stderr", _Output(False))
     monkeypatch.setattr(cli, "load", lambda path: config)
-    monkeypatch.setattr(cli.status, "collect", lambda *args: _value())
+    monkeypatch.setattr(cli.status, "collect", lambda *args, **kwargs: _value())
 
     code = cli.main(["--config", str(config.paths.source), "status", "--json"])
 
@@ -282,7 +295,8 @@ def test_status_json_bypasses_terminal_presenter(config, monkeypatch):
 def test_status_json_is_credential_free_and_repository_visible(config, monkeypatch):
     monkeypatch.setattr(status, "free_gb", lambda path: 100.0)
     monkeypatch.setattr(status.backup, "repository_ready", lambda current: True)
-    monkeypatch.setattr(status.backup, "history", lambda *args: [])
+    monkeypatch.setattr(status.backup, "host_snapshots", lambda current: [])
+    monkeypatch.setattr(status.backup, "history", lambda *args, **kwargs: [])
     monkeypatch.setattr(
         status,
         "run",
@@ -309,6 +323,50 @@ def test_status_json_is_credential_free_and_repository_visible(config, monkeypat
     assert "transaction" not in text
     assert "restore" not in text
     assert set(value["host"]["infrastructure"]["listeners"]) == {"5432", "6379"}
+
+
+def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
+    snapshots = [{"id": "shared"}]
+    calls = []
+    repository_calls = []
+    progress = []
+
+    def history(current, target, *, remote_snapshots=None):
+        calls.append((target.identity, remote_snapshots))
+        return []
+
+    monkeypatch.setattr(
+        status.backup,
+        "host_snapshots",
+        lambda current: repository_calls.append(current) or snapshots,
+    )
+    monkeypatch.setattr(
+        status.backup,
+        "repository_ready",
+        lambda current: pytest.fail("host snapshot listing already proved repository access"),
+    )
+    monkeypatch.setattr(status.backup, "history", history)
+    monkeypatch.setattr(
+        database,
+        "observe",
+        lambda *args: {"running": True, "healthy": True, "health": "healthy"},
+    )
+    monkeypatch.setattr(
+        status,
+        "_host",
+        lambda current, errors, *, repository=None: {"healthy": repository["ready"]},
+    )
+
+    status.collect(config, progress=progress.append)
+
+    durable = {target.identity for target in config.databases if target.durable}
+    assert repository_calls == [config]
+    assert {identity for identity, _snapshots in calls} == durable
+    assert all(remote is snapshots for _identity, remote in calls)
+    assert progress[:2] == ["Reading backup repository", "Checking host"]
+    assert {message.removeprefix("Checking ") for message in progress[2:]} == {
+        target.identity for target in config.databases
+    }
 
 
 @pytest.mark.parametrize("width", [60, 100, 160])
@@ -377,7 +435,7 @@ def test_status_uses_newest_confirmed_remote_snapshot(config, monkeypatch):
     monkeypatch.setattr(
         status.backup,
         "history",
-        lambda *args: [
+        lambda *args, **kwargs: [
             {
                 "time": (now - timedelta(hours=30)).isoformat(),
                 "remote": True,
@@ -423,7 +481,7 @@ def test_status_errors_redact_nested_rclone_tokens_and_strip_controls(config, mo
     monkeypatch.setattr(
         status.backup,
         "history",
-        lambda *args: (_ for _ in ()).throw(
+        lambda *args, **kwargs: (_ for _ in ()).throw(
             BackupError(f"\x1b[31mremote failed {secret} {quote(secret, safe='')}\x1b[0m")
         ),
     )
@@ -440,7 +498,7 @@ def test_guided_root_has_headings_blank_rhythm_and_no_duplicate_database_options
     monkeypatch, config
 ):
     output = []
-    monkeypatch.setattr(status, "collect", lambda current: _value())
+    monkeypatch.setattr(status, "collect", lambda *args, **kwargs: _value())
 
     result = ui.run(config, input_fn=lambda prompt: "0", output=output.append)
 
@@ -491,6 +549,7 @@ def test_guided_database_details_errors_and_credentials_stay_in_context(config, 
         "engine": target.engine,
         "status": "stopped",
         "image": target.image,
+        "error": "bounded local assessment error",
         "sidecar_images": {"http": target.settings.http.image},
         "data": str(target.data),
         "compose": str(target.compose),
@@ -510,11 +569,17 @@ def test_guided_database_details_errors_and_credentials_stay_in_context(config, 
         "observe",
         lambda *args: {"running": False, "healthy": False, "health": "stopped"},
     )
-    monkeypatch.setattr(database, "info", lambda *args: info)
+    seen = {}
+
+    def render_info(*args, **kwargs):
+        seen.update(kwargs)
+        return info
+
+    monkeypatch.setattr(database, "info", render_info)
     monkeypatch.setattr(
         status,
         "collect",
-        lambda *args: _value(error="bounded local assessment error"),
+        lambda *args, **kwargs: pytest.fail("Details must not repeat full status collection"),
     )
     choices = iter(["1", "2", "0"])
     output = []
@@ -523,6 +588,7 @@ def test_guided_database_details_errors_and_credentials_stay_in_context(config, 
 
     details = output[output.index("Details") + 1]
     connection = output[output.index("Connection") + 1]
+    assert seen["observed"]["health"] == "stopped"
     assert target.image in details
     assert "bounded local assessment error" in details
     assert "history-backup" in details and "history-snapshot" in details
@@ -791,6 +857,7 @@ def test_status_json_survives_unavailable_host_and_database_probes(config, monke
     monkeypatch.setattr(status, "run", failed)
     monkeypatch.setattr(status.docker, "state", failed)
     monkeypatch.setattr(status.backup, "repository_ready", failed)
+    monkeypatch.setattr(status.backup, "host_snapshots", failed)
     monkeypatch.setattr(status.backup, "history", failed)
     monkeypatch.setattr(database, "observe", failed)
 
@@ -831,6 +898,7 @@ def test_status_json_survives_unavailable_host_and_database_probes(config, monke
 
 
 def test_status_does_not_hide_unexpected_probe_faults(config, monkeypatch):
+    monkeypatch.setattr(status.backup, "host_snapshots", lambda current: [])
     monkeypatch.setattr(
         status,
         "free_gb",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets as random
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -311,13 +312,28 @@ def observe(config: Config, database: Database) -> dict[str, Any]:
     }
 
 
-def info(config: Config, database: Database) -> dict[str, Any]:
-    observed = observe(config, database)
+def info(
+    config: Config,
+    database: Database,
+    *,
+    observed: dict[str, Any] | None = None,
+    runtime_error: str | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    if observed is None:
+        if progress is not None:
+            progress("Checking database runtime")
+        observed = observe(config, database)
     engine = get(database.engine)
+    errors = [runtime_error] if runtime_error else []
+    if progress is not None:
+        progress("Reading engine details")
     try:
         details = engine.info(database) if observed["running"] else {}
     except (Error, OSError) as exc:
-        details = {"error": clean(str(exc))}
+        message = clean(str(exc))
+        details = {"error": message}
+        errors.append(message)
     backup_summary = {
         "state": "disabled" if not database.durable else "missing",
         "availability": None,
@@ -328,6 +344,8 @@ def info(config: Config, database: Database) -> dict[str, Any]:
     if database.durable:
         from . import backup
 
+        if progress is not None:
+            progress("Reading backup history")
         try:
             rows = backup.history(config, database)
             if rows:
@@ -340,15 +358,18 @@ def info(config: Config, database: Database) -> dict[str, Any]:
                     snapshot=latest["snapshot"],
                 )
         except (Error, OSError) as exc:
+            message = clean(redact(str(exc), protected(config)))[:500]
             backup_summary.update(
                 state="error",
-                error=clean(redact(str(exc), protected(config)))[:500],
+                error=message,
             )
+            errors.append(message)
     return {
         "database": database.identity,
         "engine": database.engine,
         "status": observed["health"],
         "image": database.image,
+        "error": errors[0] if errors else "none",
         "sidecar_images": _sidecar_images(database),
         "data": str(database.data),
         "compose": str(database.compose),

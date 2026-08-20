@@ -219,6 +219,24 @@ def test_kv_info_reports_public_and_loopback_http_endpoints(config, monkeypatch)
     assert value["backup"]["state"] == "missing"
 
 
+def test_info_reuses_observed_runtime_and_queries_fresh_backup_history(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    observed = {"running": False, "healthy": False, "health": "stopped"}
+    calls = []
+    monkeypatch.setattr(
+        database,
+        "observe",
+        lambda *args: pytest.fail("current guided observation should be reused"),
+    )
+    monkeypatch.setattr(backup, "history", lambda *args: calls.append(args) or [])
+
+    value = database.info(config, target, observed=observed)
+
+    assert value["status"] == "stopped"
+    assert value["error"] == "none"
+    assert len(calls) == 1
+
+
 def test_add_reloads_under_write_lock_and_preserves_concurrent_source(config, monkeypatch):
     calls = _runtime(monkeypatch)
     monkeypatch.setattr(database.random, "token_urlsafe", lambda size: "generated")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+from contextlib import contextmanager
 from getpass import getpass
 from typing import IO, Any
 
@@ -45,6 +46,13 @@ class Terminal:
     def read_secret(self, prompt: str) -> str:
         self.console.print(_prompt(prompt), end="")
         return getpass("", echo_char="*")
+
+    @contextmanager
+    def loading(self, message: str):
+        with self.console.status(
+            Text(message), spinner_style="cyan", refresh_per_second=8
+        ) as status:
+            yield lambda value: status.update(status=Text(value))
 
     def error(self, value: Any) -> None:
         text = Text(clean(str(value)))
@@ -153,6 +161,15 @@ def show_status(output, value: dict[str, Any]) -> None:
         output(status.render(value))
 
 
+@contextmanager
+def loading(output, message: str):
+    if isinstance(output, Terminal) and output.console.is_terminal and os.getenv("TERM") != "dumb":
+        with output.loading(message) as update:
+            yield update
+    else:
+        yield lambda _value: None
+
+
 def success(output, value: str) -> None:
     states = tuple(
         (word, "green") for word in ("healthy", "complete", "completed") if word in value
@@ -200,7 +217,8 @@ def run(
 
     current = config
     while True:
-        value = status.collect(current)
+        with loading(output, "Checking host and databases") as update:
+            value = status.collect(current, progress=update)
         width = output.console.width if isinstance(output, Terminal) else None
         _screen(
             output,
@@ -220,7 +238,13 @@ def run(
         try:
             if int(choice) <= len(value["databases"]):
                 identity = tuple(value["databases"])[int(choice) - 1]
-                current = _database(current, identity, input_fn, output)
+                current = _database(
+                    current,
+                    identity,
+                    input_fn,
+                    output,
+                    initial=value["databases"][identity],
+                )
             elif int(choice) == add:
                 current = _add(current, input_fn, output, password_fn)
             else:
@@ -229,18 +253,30 @@ def run(
             _screen(output, f"evdb: {exc}", heading="Error", error=True)
 
 
-def _database(config: Config, identity: str, input_fn, output) -> Config:
-    from . import database, status
+def _database(
+    config: Config,
+    identity: str,
+    input_fn,
+    output,
+    *,
+    initial: dict[str, Any] | None = None,
+) -> Config:
+    from . import database
 
     current = config
+    observed = initial
+    initial_error = initial.get("error") if initial and initial.get("running") is None else None
     while True:
         target = current.select(identity)
-        local_error = None
-        try:
-            observed = database.observe(current, target)
-        except Error as exc:
-            observed = {"running": False, "healthy": False, "health": "unknown"}
-            local_error = clean(str(exc))
+        local_error = initial_error
+        initial_error = None
+        if observed is None:
+            try:
+                with loading(output, f"Checking {identity}"):
+                    observed = database.observe(current, target)
+            except Error as exc:
+                observed = {"running": False, "healthy": False, "health": "unknown"}
+                local_error = clean(str(exc))
         summary = {
             "Database": target.identity,
             "Engine": target.engine,
@@ -274,10 +310,15 @@ def _database(config: Config, identity: str, input_fn, output) -> Config:
             return current
         try:
             if choice == "1":
-                value = database.info(current, target)
-                selected = status.collect(current, target)["databases"][target.identity]
+                with loading(output, f"Loading {identity} details") as update:
+                    value = database.info(
+                        current,
+                        target,
+                        observed=observed,
+                        runtime_error=local_error,
+                        progress=update,
+                    )
                 details = {key: item for key, item in value.items() if key != "connection"}
-                details["error"] = selected["error"] or "none"
                 _screen(output, database_details(details), heading="Details")
             elif choice == "2":
                 _screen(
@@ -314,7 +355,9 @@ def _database(config: Config, identity: str, input_fn, output) -> Config:
             elif choice == "6":
                 current = _backups(current, target, input_fn, output)
             else:
-                _screen(output, database.logs(current, target), heading="Logs")
+                with loading(output, f"Loading {identity} logs"):
+                    text = database.logs(current, target)
+                _screen(output, text, heading="Logs")
         except Error as exc:
             _screen(
                 output,
@@ -322,6 +365,7 @@ def _database(config: Config, identity: str, input_fn, output) -> Config:
                 heading=f"{target.identity} error",
                 error=True,
             )
+        observed = None
 
 
 def _add(config: Config, input_fn, output, password_fn) -> Config:
@@ -461,7 +505,8 @@ def _backups(config: Config, target: Database, input_fn, output) -> Config:
             return config
         try:
             if choice == "1":
-                result = backup.create(config, target)
+                with loading(output, f"Creating {target.identity} backup"):
+                    result = backup.create(config, target)
                 _screen(
                     output,
                     f"{target.identity}: backup {result['backup']} completed "
@@ -471,7 +516,8 @@ def _backups(config: Config, target: Database, input_fn, output) -> Config:
                     states=(("completed", "green"),),
                 )
             else:
-                rows = backup.history(config, target)
+                with loading(output, f"Loading {target.identity} backup history"):
+                    rows = backup.history(config, target)
                 _screen(output, backup_history(rows), heading="Backup history")
         except Error as exc:
             _screen(

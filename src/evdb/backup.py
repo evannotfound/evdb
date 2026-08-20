@@ -182,7 +182,12 @@ def create_all(config: Config) -> dict[str, dict[str, Any]]:
     return results
 
 
-def history(config: Config, database: Database) -> list[dict[str, Any]]:
+def history(
+    config: Config,
+    database: Database,
+    *,
+    remote_snapshots: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     if not database.durable:
         raise BackupError(f"backups are disabled for {database.identity}")
     rows = []
@@ -210,7 +215,12 @@ def history(config: Config, database: Database) -> list[dict[str, Any]]:
             )
     by_snapshot = {row["snapshot"]: row for row in rows if row["snapshot"]}
     by_backup = {row["backup"]: row for row in rows}
-    for snapshot in snapshots(config, database):
+    remote = (
+        snapshots(config, database)
+        if remote_snapshots is None
+        else _matching_snapshots(config, database, remote_snapshots)
+    )
+    for snapshot in remote:
         snapshot_id = snapshot.get("id")
         timestamp = snapshot.get("time")
         if not isinstance(snapshot_id, str) or not isinstance(timestamp, str):
@@ -243,6 +253,14 @@ def history(config: Config, database: Database) -> list[dict[str, Any]]:
 
 def snapshots(config: Config, database: Database) -> list[dict[str, Any]]:
     tags = _identity_tags(config, database)
+    return _matching_snapshots(config, database, _snapshot_values(config, tags))
+
+
+def host_snapshots(config: Config) -> list[dict[str, Any]]:
+    return _snapshot_values(config, {f"host:{config.host.id}"})
+
+
+def _snapshot_values(config: Config, tags: set[str]) -> list[dict[str, Any]]:
     args = ["snapshots", "--json", "--tag", ",".join(sorted(tags))]
     with lock(_repository_lock(config), timeout=300):
         result = _restic(config, args, timeout=300)
@@ -252,6 +270,15 @@ def snapshots(config: Config, database: Database) -> list[dict[str, Any]]:
         raise ResticError("invalid Restic snapshots JSON") from exc
     if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
         raise ResticError("invalid Restic snapshots JSON")
+    return values
+
+
+def _matching_snapshots(
+    config: Config,
+    database: Database,
+    values: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    tags = _identity_tags(config, database)
     required = tags | {f"engine:{database.engine}"}
     return [
         item
