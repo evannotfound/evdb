@@ -212,6 +212,8 @@ def _traefik(config: Config) -> None:
                     f"--certificatesresolvers.evdb.acme.dnschallenge.provider={provider}",
                 ],
                 "env_file": [str(config.paths.traefik / "dns.env")],
+                # Disable cname so we can verify through dns even though wildcard is present
+                "environment": {"LEGO_DISABLE_CNAME_SUPPORT": "true"},
                 "ports": ["5432:5432/tcp", "6379:6379/tcp"],
                 "healthcheck": docker.healthcheck(["CMD", "traefik", "healthcheck", "--ping"]),
                 "volumes": [

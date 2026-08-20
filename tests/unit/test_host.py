@@ -135,6 +135,7 @@ def test_database_traefik_publishes_only_native_ports(config, monkeypatch):
         "traefik"
     ]
     assert service["ports"] == ["5432:5432/tcp", "6379:6379/tcp"]
+    assert service["environment"] == {"LEGO_DISABLE_CNAME_SUPPORT": "true"}
     assert not any("entrypoints.https" in item for item in service["command"])
     assert "--providers.file.filename=/config/tls.yml" in service["command"]
     dynamic = yaml.safe_load((config.paths.traefik / "tls.yml").read_text())
