@@ -195,6 +195,10 @@ def _traefik(config: Config) -> None:
         dynamic,
         {
             "tls": {
+                # An explicit ALPN list replaces Traefik's defaults.
+                "options": {
+                    "default": {"alpnProtocols": ["postgresql", "h2", "http/1.1", "acme-tls/1"]}
+                },
                 "stores": {
                     "default": {
                         "defaultGeneratedCert": {
@@ -202,7 +206,7 @@ def _traefik(config: Config) -> None:
                             "domain": {"main": wildcard(config)},
                         }
                     }
-                }
+                },
             }
         },
     )

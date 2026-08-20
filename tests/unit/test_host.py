@@ -140,6 +140,12 @@ def test_database_traefik_publishes_only_native_ports(config, monkeypatch):
     assert not any("entrypoints.https" in item for item in service["command"])
     assert "--providers.file.filename=/config/tls.yml" in service["command"]
     dynamic = yaml.safe_load((config.paths.traefik / "tls.yml").read_text())
+    assert dynamic["tls"]["options"]["default"]["alpnProtocols"] == [
+        "postgresql",
+        "h2",
+        "http/1.1",
+        "acme-tls/1",
+    ]
     generated = dynamic["tls"]["stores"]["default"]["defaultGeneratedCert"]
     assert generated == {
         "resolver": "evdb",
