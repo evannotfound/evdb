@@ -80,11 +80,15 @@ def initialize(
         _dns(config)
         docker.ensure_network(timeout=config.host.timeouts["command"])
         _traefik(config)
-        if output:
-            output(f"Waiting for wildcard certificate {wildcard(config)}")
-        _wait_certificate(config)
-        if output:
-            output(f"Wildcard certificate ready: {wildcard(config)}")
+        if certificate_ready(config):
+            if output:
+                output(f"Wildcard certificate verified: {wildcard(config)}")
+        else:
+            if output:
+                output(f"Waiting for wildcard certificate {wildcard(config)}")
+            _wait_certificate(config)
+            if output:
+                output(f"Wildcard certificate ready: {wildcard(config)}")
         backup.initialize(config)
         _install_units(Path(unit_dir))
         run(["systemctl", "daemon-reload"], timeout=60)

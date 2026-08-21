@@ -24,7 +24,12 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
     monkeypatch.setattr(host, "_require_ports", lambda current: None)
     monkeypatch.setattr(host, "_source_ownership", lambda current: order.append("source ownership"))
     monkeypatch.setattr(host, "_traefik", lambda current: order.append("traefik"))
-    monkeypatch.setattr(host, "_wait_certificate", lambda current: order.append("certificate"))
+    monkeypatch.setattr(host, "certificate_ready", lambda current: True)
+    monkeypatch.setattr(
+        host,
+        "_wait_certificate",
+        lambda current: pytest.fail("stored wildcard must not wait for issuance"),
+    )
     monkeypatch.setattr(host.docker, "ensure_network", lambda **kwargs: order.append("network"))
     monkeypatch.setattr(host.backup, "initialize", lambda current: order.append("repository"))
     monkeypatch.setattr(
@@ -43,12 +48,14 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
         return Result(tuple(args), 0, "", "")
 
     monkeypatch.setattr(host, "run", run)
+    output = []
 
     value = host.initialize(
         config.paths.source,
         {"rclone_config": str(tmp_path / "unused")},
         paths=config.paths,
         unit_dir=tmp_path / "systemd",
+        output=output.append,
     )
 
     assert value["host"]["id"] == config.host.id
@@ -57,10 +64,10 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
         "source ownership",
         "network",
         "traefik",
-        "certificate",
         "repository",
         "timer",
     ]
+    assert output == ["Wildcard certificate verified: *.test-01.storage.example.com"]
     assert ["systemctl", "daemon-reload"] in calls
     assert ["systemctl", "enable", "--now", "evdb-backup.timer"] in calls
     assert not any("evdb-status" in " ".join(call) for call in calls)
@@ -173,17 +180,23 @@ def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_pa
         "collect",
         lambda current: {"healthy": True, "host": {"id": current.host.id, "healthy": True}},
     )
+    output = []
 
     value = host.initialize(
         paths.source,
         values,
         paths=paths,
         unit_dir=tmp_path / "systemd",
+        output=output.append,
     )
 
     assert value["host"]["id"] == "new-test-01"
     assert paths.source.is_file()
     assert paths.secrets.stat().st_mode & 0o777 == 0o600
+    assert output == [
+        "Waiting for wildcard certificate *.new-test-01.storage.example.com",
+        "Wildcard certificate ready: *.new-test-01.storage.example.com",
+    ]
 
 
 def test_database_traefik_publishes_only_native_ports(config, monkeypatch):
