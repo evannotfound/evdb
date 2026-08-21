@@ -248,7 +248,7 @@ def run(
             elif int(choice) == add:
                 current = _add(current, input_fn, output, password_fn)
             else:
-                _host(value, output)
+                _host(current, value, input_fn, output)
         except Error as exc:
             _screen(output, f"evdb: {exc}", heading="Error", error=True)
 
@@ -528,7 +528,7 @@ def _backups(config: Config, target: Database, input_fn, output) -> Config:
             )
 
 
-def _host(value: dict[str, Any], output) -> None:
+def _host(config: Config, value: dict[str, Any], input_fn, output) -> None:
     host = value["host"]
     infrastructure = host["infrastructure"]
     errors = [
@@ -536,14 +536,15 @@ def _host(value: dict[str, Any], output) -> None:
         for item in value["errors"]
         if item["scope"].startswith("host/")
     ]
-    storage_state = (
+    storage = [host["storage"], *host.get("database_storage", [])]
+    states = [
         ("ok", "green")
-        if host["storage"].get("ok")
+        if item.get("ok")
         else ("low", "yellow")
-        if host["storage"].get("available", True)
+        if item.get("available", True)
         else ("unknown", "yellow")
-    )
-    states = [storage_state]
+        for item in storage
+    ]
     states.extend(
         _state_tone(ready, "listening", "missing") for ready in infrastructure["listeners"].values()
     )
@@ -564,12 +565,11 @@ def _host(value: dict[str, Any], output) -> None:
                     "config": host["source"]["config"],
                     "valid": host["source"]["valid"],
                 },
-                "Storage": (
-                    f"{host['storage']['free_gb']} GiB free "
-                    f"({'ok' if host['storage']['ok'] else 'low'})"
-                    if host["storage"].get("available", True)
-                    else "unknown"
-                ),
+                "State storage": _storage(host["storage"]),
+                "Database storage": {
+                    f"Root {index}": _storage(item, assignments=True)
+                    for index, item in enumerate(host.get("database_storage", []), 1)
+                },
                 "Listeners": {
                     port: _state(ready, "listening", "missing")
                     for port, ready in infrastructure["listeners"].items()
@@ -593,6 +593,45 @@ def _host(value: dict[str, Any], output) -> None:
         heading="Host",
         states=tuple(states),
     )
+    _options(output, [("1", "Restart traffic"), ("0", "Back")])
+    choice = _choice(input_fn, output, "Select", {"0", "1"})
+    if choice != "1":
+        return
+    _screen(
+        output,
+        "Active database connections may briefly drop.",
+        heading="Restart traffic",
+    )
+    if not _yes(input_fn, "Restart Traefik traffic? [y/N] "):
+        return
+    from . import host as host_module
+
+    with loading(output, "Restarting Traefik traffic"):
+        host_module.restart_traffic(config)
+    _screen(
+        output,
+        "Traefik traffic restart complete",
+        heading="Restart traffic",
+        states=(("complete", "green"),),
+    )
+
+
+def _storage(value: dict[str, Any], *, assignments: bool = False) -> dict[str, Any] | str:
+    if not value.get("available", True):
+        return {"path": value["path"], "status": "unknown"}
+    result = {
+        "path": value["path"],
+        "mount": value["mount"],
+        "source": value["source"],
+        "filesystem": value["filesystem"],
+        "capacity": (
+            f"{_bytes(value['used_bytes'])} used / {_bytes(value['total_bytes'])} total "
+            f"({_bytes(value['free_bytes'])} free, {'ok' if value['ok'] else 'low'})"
+        ),
+    }
+    if assignments:
+        result["databases"] = ", ".join(value.get("databases", [])) or "none"
+    return result
 
 
 def _state(value: bool | None, ready: str, missing: str) -> str:
@@ -806,6 +845,8 @@ def database_details(value: dict[str, Any], *, include_connection: bool = False)
         ("Sidecars", value.get("sidecar_images")),
         ("Settings", value.get("settings")),
         ("Engine", value.get("engine_info")),
+        ("Storage", _database_storage(value.get("storage"))),
+        ("Data", _data_usage(value.get("data_usage"))),
         ("Backup", value.get("backup")),
         ("Paths", paths),
     ):
@@ -821,6 +862,43 @@ def database_details(value: dict[str, Any], *, include_connection: bool = False)
         lines.append("Connection:")
         lines.extend(_pair_lines(value["connection"], indent=2))
     return clean("\n".join(lines))
+
+
+def _database_storage(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    if not value.get("available", True):
+        return {"path": value["path"], "status": "unknown"}
+    return {
+        "path": value["path"],
+        "allocated": _bytes(value["allocated_bytes"]),
+        "mount": value["mount"],
+        "source": value["source"],
+        "filesystem": value["filesystem"],
+        "capacity": (
+            f"{_bytes(value['used_bytes'])} used / {_bytes(value['total_bytes'])} total "
+            f"({_bytes(value['free_bytes'])} free)"
+        ),
+    }
+
+
+def _data_usage(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    if not value.get("available"):
+        return {"status": "unavailable", "reason": value.get("reason", "assessment failed")}
+    if "logical_bytes" in value:
+        return {"logical size": _bytes(value["logical_bytes"]), "databases": value["databases"]}
+    return {"dataset memory": _bytes(value["dataset_bytes"]), "keys": value["keys"]}
+
+
+def _bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(size) < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    raise AssertionError
 
 
 def connection_details(value: dict[str, Any]) -> str:

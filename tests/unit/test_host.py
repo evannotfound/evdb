@@ -1,5 +1,7 @@
 import json
 import os
+import time
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -85,6 +87,64 @@ def test_prerequisites_require_restic_017_without_python_or_uv(tmp_path, monkeyp
     assert calls == [["docker", "compose", "version"]]
     assert "python" not in host.TOOLS
     assert "uv" not in host.TOOLS
+
+
+def test_storage_reports_backing_mount_and_allocated_bytes(tmp_path):
+    folder = tmp_path / "database"
+    folder.mkdir()
+    payload = folder / "data"
+    payload.write_bytes(b"x" * 4096)
+
+    value = files_module.disk(folder)
+
+    assert value["path"] == str(folder)
+    assert value["mount"]
+    assert value["source"]
+    assert value["filesystem"]
+    assert value["used_bytes"] + value["free_bytes"] <= value["total_bytes"]
+    assert files_module.allocated(folder) >= payload.stat().st_blocks * 512
+
+
+def test_restart_traffic_restarts_only_traefik_and_checks_health(config, monkeypatch):
+    compose = config.paths.traefik / "compose.yaml"
+    compose.parent.mkdir(parents=True)
+    compose.write_text("services: {}\n")
+    calls = []
+    monkeypatch.setattr(host, "operation", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(host, "load", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        host.docker,
+        "restart",
+        lambda path, project, service, **kwargs: calls.append((path, project, service)),
+    )
+    monkeypatch.setattr(
+        host.docker,
+        "state",
+        lambda *args, **kwargs: {"running": True, "healthy": True},
+    )
+
+    host.restart_traffic(config)
+
+    assert calls == [(compose, "evdb-traefik", "traefik")]
+
+
+def test_restart_traffic_fails_when_traefik_stays_unhealthy(config, monkeypatch):
+    compose = config.paths.traefik / "compose.yaml"
+    compose.parent.mkdir(parents=True)
+    compose.write_text("services: {}\n")
+    times = iter([0, config.host.timeouts["health"] + 1])
+    monkeypatch.setattr(time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(host, "operation", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(host, "load", lambda *args, **kwargs: config)
+    monkeypatch.setattr(host.docker, "restart", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        host.docker,
+        "state",
+        lambda *args, **kwargs: {"running": True, "healthy": False},
+    )
+
+    with pytest.raises(host.HostError, match="did not become healthy"):
+        host.restart_traffic(config)
 
 
 def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_path, monkeypatch):

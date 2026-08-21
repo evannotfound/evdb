@@ -64,11 +64,21 @@ Disposable integration tests SHALL run Redis and Dragonfly HTTP sidecars and pro
 - **THEN** each value appears only in its matching KV engine
 
 ### Requirement: Detailed database view
-`evdb database info PROJECT/ROLE` SHALL display configured role and concrete engine, live image version and health, data and Compose paths, latest backup summary, native connection fields, and HTTP fields when enabled. The command SHALL deliberately retrieve credentials from private host files and print them only to the terminal.
+`evdb database info PROJECT/ROLE` SHALL display configured role and concrete engine, live image version
+and health, data and Compose paths, latest backup summary, native connection fields, and HTTP fields when
+enabled. Details SHALL show the data directory's allocated bytes and backing filesystem capacity, mount,
+source, and type. A running PostgreSQL role SHALL show total logical database bytes and connectable
+database count; a running Redis or Dragonfly role SHALL show dataset memory bytes and total key count.
+The command SHALL deliberately retrieve credentials from private host files and print them only to the
+terminal.
+
+#### Scenario: Running database is shown
+- **WHEN** the selected role is running
+- **THEN** info distinguishes allocated directory storage from engine-native data size and count
 
 #### Scenario: Stopped database is shown
 - **WHEN** the selected role is configured but stopped
-- **THEN** info still shows settings, storage and connection details and clearly identifies stopped state
+- **THEN** info still shows settings, storage and connection details, clearly identifies stopped state, and marks live data unavailable
 
 ### Requirement: Complete Postgres connection details
 The Postgres information view SHALL show hostname, port, username, database name, TLS requirement, and a complete percent-encoded `postgresql://` URL containing the current host-owned password. The hostname SHALL be the project hostname `<project>.<host-id>.<base-domain>`.

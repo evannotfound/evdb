@@ -234,7 +234,52 @@ def test_info_reuses_observed_runtime_and_queries_fresh_backup_history(config, m
 
     assert value["status"] == "stopped"
     assert value["error"] == "none"
+    assert value["storage"]["path"] == str(target.data)
+    assert value["storage"]["allocated_bytes"] == 0
+    assert value["data_usage"] == {
+        "available": False,
+        "reason": "database is stopped",
+    }
     assert len(calls) == 1
+
+
+def test_info_separates_role_storage_from_live_data(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    observed = {"running": True, "healthy": True, "health": "healthy"}
+    monkeypatch.setattr(database, "disk", lambda path: {
+        "path": str(path),
+        "mount": "/mnt/database",
+        "source": "/dev/database",
+        "filesystem": "xfs",
+        "total_bytes": 1000,
+        "used_bytes": 400,
+        "free_bytes": 600,
+    })
+    monkeypatch.setattr(database, "allocated", lambda path: 125)
+    monkeypatch.setattr(
+        database,
+        "get",
+        lambda engine: type(
+            "Engine",
+            (),
+            {
+                "info": staticmethod(
+                    lambda selected: {
+                        "version": "7.2",
+                        "data": {"available": True, "dataset_bytes": 80, "keys": 12},
+                    }
+                )
+            },
+        ),
+    )
+    monkeypatch.setattr(backup, "history", lambda *args: [])
+
+    value = database.info(config, target, observed=observed)
+
+    assert value["storage"]["allocated_bytes"] == 125
+    assert value["storage"]["source"] == "/dev/database"
+    assert value["data_usage"] == {"available": True, "dataset_bytes": 80, "keys": 12}
+    assert "data" not in value["engine_info"]
 
 
 def test_add_reloads_under_write_lock_and_preserves_concurrent_source(config, monkeypatch):

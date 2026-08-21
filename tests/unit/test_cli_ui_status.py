@@ -30,7 +30,33 @@ def _value(*, error=None):
                 "image": "traefik:v3.7.8",
                 "healthy": True,
             },
-            "storage": {"path": "/var/lib/evdb", "free_gb": 50.0, "ok": True},
+            "storage": {
+                "path": "/var/lib/evdb",
+                "mount": "/",
+                "source": "/dev/main",
+                "filesystem": "ext4",
+                "total_bytes": 100 * 1024**3,
+                "used_bytes": 50 * 1024**3,
+                "free_bytes": 50 * 1024**3,
+                "free_gb": 50.0,
+                "ok": True,
+                "available": True,
+            },
+            "database_storage": [
+                {
+                    "path": "/mnt/databases",
+                    "mount": "/mnt/databases",
+                    "source": "/dev/database",
+                    "filesystem": "xfs",
+                    "total_bytes": 200 * 1024**3,
+                    "used_bytes": 75 * 1024**3,
+                    "free_bytes": 125 * 1024**3,
+                    "free_gb": 125.0,
+                    "ok": True,
+                    "available": True,
+                    "databases": ["app-test-01/kv"],
+                }
+            ],
             "repository": {"url": "rclone:remote:evdb/test-01", "ready": True},
             "timer": {
                 "unit": "evdb-backup.timer",
@@ -293,7 +319,19 @@ def test_status_json_bypasses_terminal_presenter(config, monkeypatch):
 
 
 def test_status_json_is_credential_free_and_repository_visible(config, monkeypatch):
-    monkeypatch.setattr(status, "free_gb", lambda path: 100.0)
+    monkeypatch.setattr(
+        status,
+        "disk",
+        lambda path: {
+            "path": str(path),
+            "mount": "/",
+            "source": "/dev/test",
+            "filesystem": "ext4",
+            "total_bytes": 200 * 1024**3,
+            "used_bytes": 100 * 1024**3,
+            "free_bytes": 100 * 1024**3,
+        },
+    )
     monkeypatch.setattr(status.backup, "repository_ready", lambda current: True)
     monkeypatch.setattr(status.backup, "host_snapshots", lambda current: [])
     monkeypatch.setattr(status.backup, "history", lambda *args, **kwargs: [])
@@ -323,6 +361,12 @@ def test_status_json_is_credential_free_and_repository_visible(config, monkeypat
     assert "transaction" not in text
     assert "restore" not in text
     assert set(value["host"]["infrastructure"]["listeners"]) == {"5432", "6379"}
+    roots = value["host"]["database_storage"]
+    assert [item["path"] for item in roots] == [str(path) for path in config.host.data_roots]
+    assert roots[0]["databases"] == [
+        "app-test-01/postgres",
+        "app-test-01/kv",
+    ]
 
 
 def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
@@ -367,6 +411,60 @@ def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
     assert {message.removeprefix("Checking ") for message in progress[2:]} == {
         target.identity for target in config.databases
     }
+
+
+def test_host_status_reports_each_root_assignment_and_low_custom_filesystem(
+    config, monkeypatch
+):
+    default, custom = config.paths.databases, config.paths.state.parent / "custom-databases"
+    project = config.projects[0]
+    selected = replace(
+        config,
+        host=replace(
+            config.host,
+            data_roots=(default, custom),
+            backup=replace(config.host.backup, min_free_gb=5),
+        ),
+        projects=(
+            replace(
+                project,
+                postgres=replace(project.postgres, data_root=default),
+                kv=replace(project.kv, data_root=custom),
+            ),
+        ),
+    )
+
+    def storage(path):
+        custom_root = path == custom
+        free = (1 if custom_root else 50) * 1024**3
+        return {
+            "path": str(path),
+            "mount": "/mnt/custom" if custom_root else "/",
+            "source": "/dev/custom" if custom_root else "/dev/main",
+            "filesystem": "xfs" if custom_root else "ext4",
+            "total_bytes": 100 * 1024**3,
+            "used_bytes": 100 * 1024**3 - free,
+            "free_bytes": free,
+        }
+
+    monkeypatch.setattr(status, "disk", storage)
+    monkeypatch.setattr(status, "_infrastructure", lambda current, errors: {"healthy": True})
+    monkeypatch.setattr(status, "_timer", lambda current, errors: {"ok": True})
+    errors = []
+
+    value = status._host(selected, errors, repository={"ready": True})
+
+    roots = value["database_storage"]
+    assert roots[0]["databases"] == ["app-test-01/postgres"]
+    assert roots[1]["databases"] == ["app-test-01/kv"]
+    assert roots[1]["mount"] == "/mnt/custom"
+    assert roots[1]["source"] == "/dev/custom"
+    assert not roots[1]["ok"]
+    assert not value["healthy"]
+    assert any(
+        item["code"] == "disk_low" and item["scope"] == "host/storage/2"
+        for item in errors
+    )
 
 
 @pytest.mark.parametrize("width", [60, 100, 160])
@@ -531,7 +629,7 @@ def test_guided_database_and_host_views_style_structured_states(config, monkeypa
     value["host"]["storage"]["ok"] = False
     value["host"]["infrastructure"]["network"] = False
     value["host"]["infrastructure"]["traefik"] = None
-    ui._host(value, output)
+    ui._host(config, value, lambda prompt: "0", output)
 
     rendered = stream.getvalue()
     assert "\x1b[31mmissing" in rendered
@@ -553,6 +651,18 @@ def test_guided_database_details_errors_and_credentials_stay_in_context(config, 
         "sidecar_images": {"http": target.settings.http.image},
         "data": str(target.data),
         "compose": str(target.compose),
+        "storage": {
+            "path": str(target.data),
+            "mount": "/mnt/databases",
+            "source": "/dev/database",
+            "filesystem": "xfs",
+            "total_bytes": 1024**3,
+            "used_bytes": 512 * 1024**2,
+            "free_bytes": 512 * 1024**2,
+            "allocated_bytes": 64 * 1024**2,
+            "available": True,
+        },
+        "data_usage": {"available": True, "dataset_bytes": 32 * 1024**2, "keys": 42},
         "settings": {"mode": "durable"},
         "engine_info": {},
         "backup": {
@@ -590,6 +700,10 @@ def test_guided_database_details_errors_and_credentials_stay_in_context(config, 
     connection = output[output.index("Connection") + 1]
     assert seen["observed"]["health"] == "stopped"
     assert target.image in details
+    assert "Allocated: 64.0 MiB" in details
+    assert "Source: /dev/database" in details
+    assert "Dataset Memory: 32.0 MiB" in details
+    assert "Keys: 42" in details
     assert "bounded local assessment error" in details
     assert "history-backup" in details and "history-snapshot" in details
     assert "backup-1" not in details and "snapshot-1" not in details
@@ -694,12 +808,16 @@ def test_postgres_settings_display_nested_pool_values(config):
 def test_host_screen_explicitly_shows_network_traefik_acme_and_runtime_fields():
     output = []
 
-    ui._host(_value(), output.append)
+    ui._host(None, _value(), lambda prompt: "0", output.append)
     text = "\n".join(output)
 
     for expected in (
         "Source:",
-        "Storage:",
+        "State Storage:",
+        "Database Storage:",
+        "Mount: /mnt/databases",
+        "Source: /dev/database",
+        "Databases: app-test-01/kv",
         "Listeners:",
         "Network: healthy",
         "Traefik: healthy",
@@ -709,6 +827,30 @@ def test_host_screen_explicitly_shows_network_traefik_acme_and_runtime_fields():
         "Errors: none",
     ):
         assert expected in text
+
+
+def test_host_traffic_restart_requires_confirmation(config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(host, "restart_traffic", lambda current: calls.append(current))
+    answers = iter(["1", "n"])
+    output = []
+
+    ui._host(config, _value(), lambda prompt: next(answers), output.append)
+
+    assert calls == []
+    assert "Active database connections may briefly drop." in output
+
+
+def test_host_traffic_restart_reports_completion_after_action(config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(host, "restart_traffic", lambda current: calls.append(current))
+    answers = iter(["1", "y"])
+    output = []
+
+    ui._host(config, _value(), lambda prompt: next(answers), output.append)
+
+    assert calls == [config]
+    assert "Traefik traffic restart complete" in output
 
 
 def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
@@ -849,11 +991,36 @@ def test_docker_state_only_suppresses_confirmed_missing_objects(monkeypatch, res
         assert docker.state("selected")["running"] is False
 
 
+def test_docker_restart_targets_one_compose_service(config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        docker,
+        "run",
+        lambda args, **kwargs: calls.append(args) or Result(tuple(args), 0, "", ""),
+    )
+    compose = config.paths.traefik / "compose.yaml"
+
+    docker.restart(compose, "evdb-traefik", "traefik", timeout=30)
+
+    assert calls == [
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(compose),
+            "--project-name",
+            "evdb-traefik",
+            "restart",
+            "traefik",
+        ]
+    ]
+
+
 def test_status_json_survives_unavailable_host_and_database_probes(config, monkeypatch):
     def failed(*args, **kwargs):
         raise CommandError("probe unavailable")
 
-    monkeypatch.setattr(status, "free_gb", failed)
+    monkeypatch.setattr(status, "disk", failed)
     monkeypatch.setattr(status, "run", failed)
     monkeypatch.setattr(status.docker, "state", failed)
     monkeypatch.setattr(status.backup, "repository_ready", failed)
@@ -901,7 +1068,7 @@ def test_status_does_not_hide_unexpected_probe_faults(config, monkeypatch):
     monkeypatch.setattr(status.backup, "host_snapshots", lambda current: [])
     monkeypatch.setattr(
         status,
-        "free_gb",
+        "disk",
         lambda *args: (_ for _ in ()).throw(RuntimeError("bug")),
     )
 

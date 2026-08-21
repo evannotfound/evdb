@@ -18,6 +18,11 @@ OBJECT_SQL = (
     "WHERE c.relkind IN ('r','p','v','m','S') "
     "AND n.nspname NOT IN ('pg_catalog','information_schema')"
 )
+DATA_SQL = (
+    "SELECT json_build_object('logical_bytes',coalesce(sum(pg_database_size(datname)),0),"
+    "'databases',count(*))::text FROM pg_database "
+    "WHERE datallowconn AND NOT datistemplate"
+)
 
 
 def validate(settings: Postgres) -> None:
@@ -176,6 +181,15 @@ def info(database: Database) -> dict[str, Any]:
         timeout=10,
     )
     pool = database.settings.pgbouncer
+    data = json.loads(
+        _psql(
+            database.service("primary"),
+            database.settings.database,
+            DATA_SQL,
+            username=database.settings.username,
+            timeout=10,
+        )
+    )
     return {
         "version": version,
         "username": database.settings.username,
@@ -184,6 +198,11 @@ def info(database: Database) -> dict[str, Any]:
         "max_clients": pool.max_clients,
         "pool_size": pool.pool_size,
         "reserve_size": pool.reserve_size,
+        "data": {
+            "available": True,
+            "logical_bytes": int(data["logical_bytes"]),
+            "databases": int(data["databases"]),
+        },
     }
 
 

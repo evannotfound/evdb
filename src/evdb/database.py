@@ -14,7 +14,7 @@ from . import docker
 from .config import add_role, defaults, load, protected, replace_role, validate_image, write
 from .engines import get
 from .errors import DatabaseError, Error
-from .files import managed_dir, private_dir, private_line, write_text
+from .files import allocated, disk, managed_dir, private_dir, private_line, write_text
 from .lock import lock, operation
 from .models import KV, Config, Database, Postgres, RoleSecrets
 from .run import clean, redact
@@ -326,14 +326,38 @@ def info(
         observed = observe(config, database)
     engine = get(database.engine)
     errors = [runtime_error] if runtime_error else []
+    try:
+        storage = disk(database.data)
+        storage.update(allocated_bytes=allocated(database.data), available=True)
+    except OSError as exc:
+        message = clean(redact(str(exc), protected(config)))[:500]
+        storage = {
+            "path": str(database.data),
+            "mount": None,
+            "source": None,
+            "filesystem": None,
+            "total_bytes": None,
+            "used_bytes": None,
+            "free_bytes": None,
+            "allocated_bytes": None,
+            "available": False,
+        }
+        errors.append(message)
     if progress is not None:
         progress("Reading engine details")
     try:
         details = engine.info(database) if observed["running"] else {}
-    except (Error, OSError) as exc:
+    except (Error, OSError, KeyError, TypeError, ValueError) as exc:
         message = clean(str(exc))
         details = {"error": message}
         errors.append(message)
+    if observed["running"]:
+        data_usage = details.pop(
+            "data",
+            {"available": False, "reason": "live data assessment unavailable"},
+        )
+    else:
+        data_usage = {"available": False, "reason": "database is stopped"}
     backup_summary = {
         "state": "disabled" if not database.durable else "missing",
         "availability": None,
@@ -373,6 +397,8 @@ def info(
         "sidecar_images": _sidecar_images(database),
         "data": str(database.data),
         "compose": str(database.compose),
+        "storage": storage,
+        "data_usage": data_usage,
         "settings": _setting_values(database),
         "engine_info": details,
         "backup": backup_summary,

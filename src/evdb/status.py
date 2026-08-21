@@ -10,7 +10,7 @@ from typing import Any
 from . import __version__, backup, docker
 from .config import protected
 from .errors import CommandError, Error
-from .files import free_gb
+from .files import disk
 from .models import Config, Database
 from .run import clean, redact, run
 
@@ -103,24 +103,26 @@ def _host(
     repository: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     paths = config.paths
-    try:
-        storage = _disk(paths.state, config.host.backup.min_free_gb)
-    except (Error, OSError) as exc:
-        storage = {
-            "path": str(paths.state),
-            "free_gb": None,
-            "ok": False,
-            "available": False,
-        }
-        errors.append(_error("disk_assessment_failed", "host/storage", _message(config, exc)))
-    if storage["available"] and not storage["ok"]:
-        errors.append(_error("disk_low", "host/storage", "free space is below policy"))
+    storage = _storage(config, paths.state, errors, "host/storage")
+    database_storage = []
+    for index, root in enumerate(config.host.data_roots, 1):
+        item = _storage(config, root, errors, f"host/storage/{index}")
+        item["databases"] = [
+            database.identity
+            for database in config.databases
+            if database.settings.data_root == root
+        ]
+        database_storage.append(item)
     infrastructure = _infrastructure(config, errors)
     timer = _timer(config, errors)
     repository = repository or _repository(config, errors)
 
     healthy = (
-        storage["ok"] and infrastructure["healthy"] and timer["ok"] and repository["ready"] is True
+        storage["ok"]
+        and all(item["ok"] for item in database_storage)
+        and infrastructure["healthy"]
+        and timer["ok"]
+        and repository["ready"] is True
     )
     return {
         "id": config.host.id,
@@ -129,6 +131,7 @@ def _host(
         "source": {"config": str(paths.source), "valid": True},
         "infrastructure": infrastructure,
         "storage": storage,
+        "database_storage": database_storage,
         "repository": repository,
         "timer": timer,
     }
@@ -364,14 +367,42 @@ def _timer(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
     return value
 
 
+def _storage(
+    config: Config,
+    path: Path,
+    errors: list[dict[str, str]],
+    scope: str,
+) -> dict[str, Any]:
+    try:
+        value = _disk(path, config.host.backup.min_free_gb)
+    except (Error, OSError) as exc:
+        value = {
+            "path": str(path),
+            "mount": None,
+            "source": None,
+            "filesystem": None,
+            "total_bytes": None,
+            "used_bytes": None,
+            "free_bytes": None,
+            "free_gb": None,
+            "ok": False,
+            "available": False,
+        }
+        errors.append(_error("disk_assessment_failed", scope, _message(config, exc)))
+        return value
+    if not value["ok"]:
+        errors.append(
+            _error("disk_low", scope, f"free space is below policy: {path} ({value['mount']})")
+        )
+    return value
+
+
 def _disk(path: Path, minimum: int) -> dict[str, Any]:
-    available = round(free_gb(path), 2)
-    return {
-        "path": str(path),
-        "free_gb": available,
-        "ok": available >= minimum,
-        "available": True,
-    }
+    value = disk(path)
+    value["free_gb"] = round(value["free_bytes"] / (1024**3), 2)
+    value["ok"] = value["free_gb"] >= minimum
+    value["available"] = True
+    return value
 
 
 def _date(value: Any) -> datetime | None:

@@ -140,6 +140,21 @@ def stop(path: Path, project: str, *, timeout: int, secrets: Sequence[str] = ())
     run(compose_command(path, project, "stop"), timeout=timeout, secrets=secrets)
 
 
+def restart(
+    path: Path,
+    project: str,
+    service: str,
+    *,
+    timeout: int,
+    secrets: Sequence[str] = (),
+) -> None:
+    run(
+        compose_command(path, project, "restart", service),
+        timeout=timeout,
+        secrets=secrets,
+    )
+
+
 def logs(path: Path, project: str, lines: int, *, timeout: int, secrets: Sequence[str]) -> str:
     return run(
         compose_command(path, project, "logs", "--no-color", "--tail", str(lines)),

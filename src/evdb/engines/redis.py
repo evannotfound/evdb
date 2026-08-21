@@ -80,6 +80,7 @@ def info(database: Database) -> dict[str, Any]:
         "mode": database.settings.mode,
         "http": database.settings.http.enabled,
         "http_connections": database.settings.http.connections,
+        "data": kv.usage(database.service("primary"), database.credentials.password),
     }
 
 

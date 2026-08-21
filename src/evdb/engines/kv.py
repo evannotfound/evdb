@@ -62,6 +62,23 @@ def facts(container: str, password: str) -> dict:
     }
 
 
+def usage(container: str, password: str) -> dict[str, Any]:
+    memory = info(container, password, "memory")
+    keyspace = info(container, password, "keyspace")
+    dataset = memory.get("used_memory_dataset") or memory.get("used_memory")
+    keys = 0
+    for name, value in keyspace.items():
+        if not name.startswith("db"):
+            continue
+        fields = dict(part.split("=", 1) for part in value.split(",") if "=" in part)
+        keys += int(fields.get("keys", 0))
+    return {
+        "available": dataset is not None,
+        "dataset_bytes": int(dataset) if dataset is not None else None,
+        "keys": keys,
+    }
+
+
 def validate_http(settings: KV) -> None:
     if type(settings.http.enabled) is not bool or settings.http.connections < 1:
         raise ConfigError("HTTP settings are invalid")

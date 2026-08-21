@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from .errors import BackupError
+
+_MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
 
 
 def private_dir(path: str | Path) -> Path:
@@ -143,6 +146,65 @@ def _create_dirs(folder: Path) -> None:
 
 def read_json(path: str | Path) -> Any:
     return json.loads(Path(path).read_text())
+
+
+def disk(path: str | Path) -> dict[str, Any]:
+    requested = Path(path)
+    current = requested
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    usage = shutil.disk_usage(current)
+    mount, source, filesystem = _mount(current)
+    return {
+        "path": str(requested),
+        "mount": str(mount),
+        "source": source,
+        "filesystem": filesystem,
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+    }
+
+
+def allocated(path: str | Path) -> int:
+    folder = Path(path)
+    try:
+        details = folder.lstat()
+    except FileNotFoundError:
+        return 0
+    total = details.st_blocks * 512
+    if not stat.S_ISDIR(details.st_mode):
+        return total
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            try:
+                total += allocated(Path(entry.path))
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def _mount(path: Path) -> tuple[Path, str, str]:
+    resolved = path.resolve(strict=False)
+    matches = []
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+            mount = Path(_mount_value(fields[4]))
+            filesystem = fields[separator + 1]
+            source = _mount_value(fields[separator + 2])
+        except (IndexError, ValueError):
+            continue
+        if mount == resolved or mount in resolved.parents:
+            matches.append((mount, source, filesystem))
+    if not matches:
+        raise OSError(f"backing mount not found: {path}")
+    return max(matches, key=lambda item: len(item[0].parts))
+
+
+def _mount_value(value: str) -> str:
+    return _MOUNT_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), value)
 
 
 def free_gb(path: str | Path) -> float:

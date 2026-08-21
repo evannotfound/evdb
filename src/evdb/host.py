@@ -112,6 +112,32 @@ def prerequisites(config: Config | None = None) -> list[str]:
     return missing
 
 
+def restart_traffic(config: Config) -> None:
+    import time
+
+    timeout = config.host.timeouts["command"]
+    with operation(config, write=True, timeout=timeout):
+        current = load(config.paths.source, paths=config.paths)
+        path = current.paths.traefik / "compose.yaml"
+        if path.is_symlink() or not path.is_file():
+            raise HostError("Traefik generated files are missing; run evdb init")
+        docker.restart(
+            path,
+            docker.TRAEFIK_PROJECT,
+            "traefik",
+            timeout=timeout,
+            secrets=protected(current),
+        )
+        deadline = time.monotonic() + current.host.timeouts["health"]
+        while True:
+            state = docker.state(docker.TRAEFIK_CONTAINER, timeout=10, health=True)
+            if state["running"] and state["healthy"]:
+                return
+            if time.monotonic() >= deadline:
+                raise HostError("Traefik did not become healthy after restart")
+            time.sleep(1)
+
+
 def _initial(values: dict[str, Any], paths: Paths) -> Config:
     required = (
         "host_id",

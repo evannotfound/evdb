@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 import yaml
 
-from evdb.engines import dragonfly, get, postgres, redis
+from evdb.engines import dragonfly, get, kv, postgres, redis
 from evdb.errors import ConfigError
 
 
@@ -89,3 +89,37 @@ def test_redis_rejects_dragonfly_only_settings(config):
     settings = replace(config.select("app-test-01/kv").settings, threads=2)
     with pytest.raises(ConfigError, match="Dragonfly"):
         redis.validate(settings)
+
+
+def test_postgres_info_reports_logical_data_totals(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+
+    def psql(container, database, sql, **kwargs):
+        if sql == postgres.DATA_SQL:
+            return '{"logical_bytes":3145728,"databases":2}'
+        return "16.4"
+
+    monkeypatch.setattr(postgres, "_psql", psql)
+
+    value = postgres.info(target)
+
+    assert value["version"] == "16.4"
+    assert value["data"] == {
+        "available": True,
+        "logical_bytes": 3145728,
+        "databases": 2,
+    }
+
+
+def test_redis_compatible_usage_reports_dataset_memory_and_keys(monkeypatch):
+    values = {
+        "memory": {"used_memory_dataset": "2048", "used_memory": "4096"},
+        "keyspace": {"db0": "keys=4,expires=1", "db2": "keys=3,expires=0"},
+    }
+    monkeypatch.setattr(kv, "info", lambda container, password, section: values[section])
+
+    assert kv.usage("primary", "password") == {
+        "available": True,
+        "dataset_bytes": 2048,
+        "keys": 7,
+    }
