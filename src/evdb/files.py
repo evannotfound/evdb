@@ -194,7 +194,7 @@ def _mount(path: Path) -> tuple[Path, str, str]:
             mount = Path(_mount_value(fields[4]))
             filesystem = fields[separator + 1]
             source = _mount_value(fields[separator + 2])
-        except (IndexError, ValueError):
+        except IndexError, ValueError:
             continue
         if mount == resolved or mount in resolved.parents:
             matches.append((mount, source, filesystem))

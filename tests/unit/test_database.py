@@ -246,15 +246,19 @@ def test_info_reuses_observed_runtime_and_queries_fresh_backup_history(config, m
 def test_info_separates_role_storage_from_live_data(config, monkeypatch):
     target = config.select("app-test-01/kv")
     observed = {"running": True, "healthy": True, "health": "healthy"}
-    monkeypatch.setattr(database, "disk", lambda path: {
-        "path": str(path),
-        "mount": "/mnt/database",
-        "source": "/dev/database",
-        "filesystem": "xfs",
-        "total_bytes": 1000,
-        "used_bytes": 400,
-        "free_bytes": 600,
-    })
+    monkeypatch.setattr(
+        database,
+        "disk",
+        lambda path: {
+            "path": str(path),
+            "mount": "/mnt/database",
+            "source": "/dev/database",
+            "filesystem": "xfs",
+            "total_bytes": 1000,
+            "used_bytes": 400,
+            "free_bytes": 600,
+        },
+    )
     monkeypatch.setattr(database, "allocated", lambda path: 125)
     monkeypatch.setattr(
         database,

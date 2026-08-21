@@ -413,9 +413,7 @@ def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
     }
 
 
-def test_host_status_reports_each_root_assignment_and_low_custom_filesystem(
-    config, monkeypatch
-):
+def test_host_status_reports_each_root_assignment_and_low_custom_filesystem(config, monkeypatch):
     default, custom = config.paths.databases, config.paths.state.parent / "custom-databases"
     project = config.projects[0]
     selected = replace(
@@ -461,10 +459,7 @@ def test_host_status_reports_each_root_assignment_and_low_custom_filesystem(
     assert roots[1]["source"] == "/dev/custom"
     assert not roots[1]["ok"]
     assert not value["healthy"]
-    assert any(
-        item["code"] == "disk_low" and item["scope"] == "host/storage/2"
-        for item in errors
-    )
+    assert any(item["code"] == "disk_low" and item["scope"] == "host/storage/2" for item in errors)
 
 
 @pytest.mark.parametrize("width", [60, 100, 160])
