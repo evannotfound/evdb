@@ -22,14 +22,44 @@ def collect(
     database: Database | None = None,
     *,
     progress: Callable[[str], None] | None = None,
+    preview: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    errors = []
     selected = (database,) if database else config.databases
+    host_errors = []
+    pending_repository = {
+        "url": config.host.backup.repository,
+        "ready": None,
+        "available": False,
+        "pending": True,
+    }
+    _progress(progress, "Checking host")
+    host = _host(config, host_errors, repository=pending_repository)
+    observations = {}
+    assessment_errors = {}
+    databases = {}
+    local_errors = list(host_errors)
+    for target in selected:
+        _progress(progress, f"Checking {target.identity}")
+        observed, item_errors = _observe(config, target)
+        observations[target.identity] = observed
+        assessment_errors[target.identity] = item_errors
+        current_errors = _database_errors(target, observed, item_errors)
+        databases[target.identity] = _database_value(
+            target,
+            observed,
+            _pending_backup(target),
+            current_errors,
+        )
+        local_errors.extend(current_errors)
+    partial = _result(host, databases, local_errors, pending=True)
+    if preview is not None:
+        preview(partial)
+
     remote_snapshots = None
     backup_failure = None
-    repository = None
+    repository_errors = []
+    _progress(progress, "Reading backup repository")
     if any(target.durable for target in selected):
-        _progress(progress, "Reading backup repository")
         try:
             remote_snapshots = backup.host_snapshots(config)
             repository = {
@@ -40,28 +70,55 @@ def collect(
         except (Error, OSError) as exc:
             backup_failure = exc
             remote_snapshots = []
-            repository = _repository_error(config, errors, exc)
-    _progress(progress, "Checking host")
-    host = _host(config, errors, repository=repository)
-    databases = {}
+            repository = _repository_error(config, repository_errors, exc)
+    else:
+        repository = _repository(config, repository_errors)
+
+    final_host = {**host, "repository": repository}
+    final_host["healthy"] = _host_healthy(final_host)
+    final_errors = [*host_errors, *repository_errors]
+    final_databases = {}
     for target in selected:
-        _progress(progress, f"Checking {target.identity}")
-        item, item_errors = _database(
+        backup_state, backup_errors = _backup(
             config,
             target,
             remote_snapshots=remote_snapshots,
             backup_failure=backup_failure,
         )
-        databases[target.identity] = item
-        errors.extend(item_errors)
-    healthy = host["healthy"] and all(item["healthy"] for item in databases.values())
-    return {
+        current_errors = _database_errors(
+            target,
+            observations[target.identity],
+            [*assessment_errors[target.identity], *backup_errors],
+        )
+        final_databases[target.identity] = _database_value(
+            target,
+            observations[target.identity],
+            backup_state,
+            current_errors,
+        )
+        final_errors.extend(current_errors)
+    return _result(final_host, final_databases, final_errors)
+
+
+def _result(
+    host: dict[str, Any],
+    databases: dict[str, dict[str, Any]],
+    errors: list[dict[str, str]],
+    *,
+    pending: bool = False,
+) -> dict[str, Any]:
+    value = {
         "version": VERSION,
-        "healthy": healthy,
+        "healthy": None
+        if pending
+        else host["healthy"] and all(item["healthy"] for item in databases.values()),
         "host": host,
         "databases": databases,
         "errors": errors,
     }
+    if pending:
+        value["pending"] = True
+    return value
 
 
 def dumps(value: dict[str, Any]) -> str:
@@ -79,8 +136,7 @@ def render(value: dict[str, Any], *, width: int | None = None) -> str:
     host = value["host"]
     lines = [
         fit(
-            f"Host {host['id']}  evdb {host['tool_version']}  "
-            f"{'healthy' if host['healthy'] else 'needs attention'}",
+            f"Host {host['id']}  evdb {host['tool_version']}  {host_text(value)}",
             width,
         ),
         f"{'Database':<{identity_width}}  {'Engine':<9}  {'Status':<9}  Backup",
@@ -115,19 +171,21 @@ def _host(
         database_storage.append(item)
     infrastructure = _infrastructure(config, errors)
     timer = _timer(config, errors)
-    repository = repository or _repository(config, errors)
-
-    healthy = (
-        storage["ok"]
-        and all(item["ok"] for item in database_storage)
-        and infrastructure["healthy"]
-        and timer["ok"]
-        and repository["ready"] is True
-    )
+    repository = repository if repository is not None else _repository(config, errors)
     return {
         "id": config.host.id,
         "tool_version": __version__,
-        "healthy": healthy,
+        "healthy": None
+        if repository.get("pending")
+        else _host_healthy(
+            {
+                "storage": storage,
+                "database_storage": database_storage,
+                "infrastructure": infrastructure,
+                "timer": timer,
+                "repository": repository,
+            }
+        ),
         "source": {"config": str(paths.source), "valid": True},
         "infrastructure": infrastructure,
         "storage": storage,
@@ -135,6 +193,16 @@ def _host(
         "repository": repository,
         "timer": timer,
     }
+
+
+def _host_healthy(value: dict[str, Any]) -> bool:
+    return bool(
+        value["storage"]["ok"]
+        and all(item["ok"] for item in value["database_storage"])
+        and value["infrastructure"]["healthy"]
+        and value["timer"]["ok"]
+        and value["repository"]["ready"] is True
+    )
 
 
 def _repository(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
@@ -167,6 +235,18 @@ def _database(
     remote_snapshots: list[dict[str, Any]] | None = None,
     backup_failure: BaseException | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    observed, assessment_errors = _observe(config, target)
+    backup_state, backup_errors = _backup(
+        config,
+        target,
+        remote_snapshots=remote_snapshots,
+        backup_failure=backup_failure,
+    )
+    errors = _database_errors(target, observed, [*assessment_errors, *backup_errors])
+    return _database_value(target, observed, backup_state, errors), errors
+
+
+def _observe(config: Config, target: Database) -> tuple[dict[str, Any], list[dict[str, str]]]:
     errors = []
     try:
         from .database import observe
@@ -175,6 +255,17 @@ def _database(
     except (Error, OSError) as exc:
         observed = {"running": None, "healthy": False, "health": "unknown"}
         errors.append(_error("assessment_failed", target.identity, _message(config, exc)))
+    return observed, errors
+
+
+def _backup(
+    config: Config,
+    target: Database,
+    *,
+    remote_snapshots: list[dict[str, Any]] | None = None,
+    backup_failure: BaseException | None = None,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    errors = []
     latest = None
     if target.durable:
         if backup_failure is not None:
@@ -222,16 +313,51 @@ def _database(
             "remote": latest.get("remote", False) if latest else False,
         }
     else:
-        backup_state = {
-            "state": "disabled",
-            "time": None,
-            "backup": None,
-            "snapshot": None,
-            "local": False,
-            "remote": False,
-        }
+        backup_state = _disabled_backup()
+    return backup_state, errors
+
+
+def _pending_backup(target: Database) -> dict[str, Any]:
+    if not target.durable:
+        return _disabled_backup()
+    return {
+        "state": "loading",
+        "time": None,
+        "backup": None,
+        "snapshot": None,
+        "local": False,
+        "remote": False,
+    }
+
+
+def _disabled_backup() -> dict[str, Any]:
+    return {
+        "state": "disabled",
+        "time": None,
+        "backup": None,
+        "snapshot": None,
+        "local": False,
+        "remote": False,
+    }
+
+
+def _database_errors(
+    target: Database,
+    observed: dict[str, Any],
+    errors: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    values = list(errors)
     if not observed["healthy"]:
-        errors.append(_error("database_unhealthy", target.identity, observed["health"]))
+        values.append(_error("database_unhealthy", target.identity, observed["health"]))
+    return values
+
+
+def _database_value(
+    target: Database,
+    observed: dict[str, Any],
+    backup_state: dict[str, Any],
+    errors: list[dict[str, str]],
+) -> dict[str, Any]:
     current_error = next(
         (
             item["message"]
@@ -240,20 +366,17 @@ def _database(
         ),
         next((item["message"] for item in reversed(errors)), None),
     )
-    return (
-        {
-            "project": target.project,
-            "role": target.role,
-            "engine": target.engine,
-            "running": observed["running"],
-            "health": observed["health"],
-            "healthy": observed["healthy"] and not errors,
-            "image": target.image,
-            "latest_backup": backup_state,
-            "error": current_error[:500] if current_error else None,
-        },
-        errors,
-    )
+    return {
+        "project": target.project,
+        "role": target.role,
+        "engine": target.engine,
+        "running": observed["running"],
+        "health": observed["health"],
+        "healthy": observed["healthy"] and not errors,
+        "image": target.image,
+        "latest_backup": backup_state,
+        "error": current_error[:500] if current_error else None,
+    }
 
 
 def _infrastructure(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
@@ -416,12 +539,20 @@ def _date(value: Any) -> datetime | None:
 
 
 def backup_text(value: dict[str, Any]) -> str:
+    if value["state"] == "loading":
+        return "loading"
     if value["state"] == "disabled":
         return "disabled"
     if value["state"] == "stale":
         return "stale/missing"
     date = _date(value.get("time"))
     return date.strftime("%m-%d %H:%M") if date else "current"
+
+
+def host_text(value: dict[str, Any]) -> str:
+    if value.get("pending"):
+        return "checking backups"
+    return "healthy" if value["host"]["healthy"] else "needs attention"
 
 
 def fit(value: str, width: int) -> str:

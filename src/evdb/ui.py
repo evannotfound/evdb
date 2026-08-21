@@ -7,7 +7,10 @@ from contextlib import contextmanager
 from getpass import getpass
 from typing import IO, Any
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
+from rich.spinner import Spinner
+from rich.table import Table
 from rich.text import Text
 
 from .errors import Error
@@ -53,6 +56,17 @@ class Terminal:
             Text(message), spinner_style="cyan", refresh_per_second=8
         ) as status:
             yield lambda value: status.update(status=Text(value))
+
+    @contextmanager
+    def live(self, renderable):
+        with Live(
+            renderable,
+            console=self.console,
+            refresh_per_second=8,
+            redirect_stdout=False,
+            redirect_stderr=False,
+        ) as live:
+            yield lambda value: live.update(value, refresh=True)
 
     def error(self, value: Any) -> None:
         text = Text(clean(str(value)))
@@ -133,13 +147,15 @@ def _state_style(value: str) -> str | None:
         return "yellow"
     if value in {"unhealthy", "failed", "missing", "missing or unsafe"}:
         return "red"
+    if value in {"checking backups", "loading"}:
+        return "cyan"
     return None
 
 
 def _overview_states(value: dict[str, Any]) -> tuple[tuple[str, str], ...]:
     from . import status
 
-    host_state = "healthy" if value["host"]["healthy"] else "needs attention"
+    host_state = status.host_text(value)
     states = [(host_state, _state_style(host_state))]
     for item in value["databases"].values():
         health = item["health"]
@@ -189,7 +205,7 @@ def overview(value: dict[str, Any], *, width: int | None = None) -> str:
 
     width = width or shutil.get_terminal_size((100, 24)).columns
     identity_width = max(12, min(36, width - 41))
-    host_state = "healthy" if value["host"]["healthy"] else "needs attention"
+    host_state = status.host_text(value)
     lines = [
         status.fit(f"Host {value['host']['id']}  {host_state}", width),
         "",
@@ -206,6 +222,104 @@ def overview(value: dict[str, Any], *, width: int | None = None) -> str:
     return "\n".join(lines)
 
 
+def check_status(
+    output,
+    config: Config,
+    database: Database | None = None,
+    *,
+    guided: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    from . import status
+
+    message = "Checking host and databases" if guided else "Checking status"
+    if _live_enabled(output):
+        if guided:
+            output("")
+        initial = (
+            Group(Text("Databases", style="bold"), Spinner("dots", text=message))
+            if guided
+            else Spinner("dots", text=message)
+        )
+        with output.live(initial) as update:
+            value = status.collect(
+                config,
+                database,
+                preview=lambda current: update(
+                    _status_table(current, guided=guided, width=output.console.width)
+                ),
+            )
+            update(_status_table(value, guided=guided, width=output.console.width))
+        return value, True
+    with loading(output, message) as update:
+        return status.collect(config, database, progress=update), False
+
+
+def _live_enabled(output) -> bool:
+    return (
+        isinstance(output, Terminal) and output.console.is_terminal and os.getenv("TERM") != "dumb"
+    )
+
+
+def _status_table(value: dict[str, Any], *, guided: bool, width: int):
+    from . import status
+
+    identity_width = max(12, min(36, width - (41 if guided else 37)))
+    state = status.host_text(value)
+    host = value["host"]
+    summary = Text(f"Host {host['id']}")
+    if not guided:
+        summary.append(f"  evdb {host['tool_version']}")
+    summary.append("  ")
+    summary.append(state, style=_state_style(state))
+    table = Table(
+        box=None,
+        collapse_padding=True,
+        expand=False,
+        pad_edge=False,
+        padding=(0, 2),
+    )
+    if guided:
+        table.add_column("#", justify="right", no_wrap=True)
+    table.add_column("Database", width=identity_width, no_wrap=True)
+    table.add_column("Engine", width=9, no_wrap=True)
+    table.add_column("Status", width=9, no_wrap=True)
+    table.add_column("Backup", no_wrap=True)
+    for number, (identity, item) in enumerate(value["databases"].items(), 1):
+        health = item["health"]
+        backup_state = item["latest_backup"]
+        backup_text = status.backup_text(backup_state)
+        backup_style = (
+            "green"
+            if backup_state["state"] == "current"
+            else "yellow"
+            if backup_state["state"] == "stale"
+            else _state_style(backup_text)
+        )
+        backup_value = (
+            Spinner("dots", text="loading", style="cyan")
+            if backup_state["state"] == "loading"
+            else Text(backup_text, style=backup_style)
+        )
+        row = [
+            status.fit(identity, identity_width),
+            status.fit(item["engine"], 9),
+            Text(status.fit(health, 9), style=_state_style(health)),
+            backup_value,
+        ]
+        if guided:
+            row.insert(0, str(number))
+        table.add_row(*row)
+    if not value["databases"]:
+        row = ["No databases configured", "", "", ""]
+        if guided:
+            row.insert(0, "")
+        table.add_row(*row)
+    renderables = [summary, Text(""), table]
+    if guided:
+        renderables.insert(0, Text("Databases", style="bold"))
+    return Group(*renderables)
+
+
 def run(
     config: Config,
     *,
@@ -213,20 +327,18 @@ def run(
     output=print,
     password_fn=read_secret,
 ) -> int:
-    from . import status
-
     current = config
     while True:
-        with loading(output, "Checking host and databases") as update:
-            value = status.collect(current, progress=update)
-        width = output.console.width if isinstance(output, Terminal) else None
-        _screen(
-            output,
-            overview(value, width=width),
-            heading="Databases",
-            states=_overview_states(value),
-            bold_lines=(0, 2),
-        )
+        value, rendered = check_status(output, current, guided=True)
+        if not rendered:
+            width = output.console.width if isinstance(output, Terminal) else None
+            _screen(
+                output,
+                overview(value, width=width),
+                heading="Databases",
+                states=_overview_states(value),
+                bold_lines=(0, 2),
+            )
         rows = {str(index) for index, _identity in enumerate(value["databases"], 1)}
         add = len(rows) + 1
         host = add + 1

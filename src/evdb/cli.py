@@ -183,9 +183,9 @@ def main(
                 value = status.collect(config, target)
                 plain_output(status.dumps(value))
             else:
-                with ui.loading(output, "Checking status") as update:
-                    value = status.collect(config, target, progress=update)
-                ui.show_status(output, value)
+                value, rendered = ui.check_status(output, config, target)
+                if not rendered:
+                    ui.show_status(output, value)
             return 0 if value["healthy"] else 1
         if args.command == "database":
             return _database(config, args, output, terminal=terminal)

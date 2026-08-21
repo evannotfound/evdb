@@ -39,8 +39,9 @@ layout. In a color-capable terminal, headings and questions SHALL be emphasized,
 SHALL be visually distinct from alternatives, and healthy, warning, and failure states SHALL use distinct
 styles. Color SHALL supplement explicit wording rather than replace any state label. The presenter SHALL
 separate screens, results, errors, and prompts with blank lines, preserve numbered input, and avoid
-cursor-addressed navigation except for replacing one transient loading-status line. Plain or injected
-output SHALL contain no terminal control sequences or Rich markup.
+cursor-addressed navigation except for replacing one transient loading-status line or updating the
+database overview while backup status loads. Plain or injected output SHALL contain no terminal control
+sequences or Rich markup.
 
 #### Scenario: Guided flow advances between screens
 - **WHEN** the operator selects a database and then a backup action
@@ -63,7 +64,11 @@ output SHALL contain no terminal control sequences or Rich markup.
 - **THEN** labels and wording preserve every state distinction and interaction default without requiring color
 
 #### Scenario: Interactive assessment takes noticeable time
-- **WHEN** the guided root, Details, backup, or log view waits for synchronous external work
+- **WHEN** local host and database checks finish before backup repository assessment
+- **THEN** interactive `evdb` and human `evdb status` show the complete overview with loading durable Backup cells, update those cells in place, and do not prompt for a guided choice until backup assessment finishes
+
+#### Scenario: Other interactive work takes noticeable time
+- **WHEN** Details, backup, log, or another synchronous view waits for external work
 - **THEN** one transient terminal status line identifies the current phase and is removed before the completed screen or error is appended
 
 ### Requirement: Context-aware database menu

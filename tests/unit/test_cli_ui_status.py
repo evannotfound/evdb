@@ -237,6 +237,71 @@ def test_terminal_loading_updates_one_transient_line():
     assert "Reading backup repository" in rendered
 
 
+def test_terminal_status_updates_loading_backup_cells_in_place(config, monkeypatch):
+    output, stream = _terminal()
+    final = _value()
+    partial = json.loads(json.dumps(final))
+    partial["pending"] = True
+    partial["healthy"] = None
+    partial["host"]["healthy"] = None
+    partial["databases"]["app-test-01/kv"]["latest_backup"] = {
+        "state": "loading",
+        "time": None,
+        "backup": None,
+        "snapshot": None,
+        "local": False,
+        "remote": False,
+    }
+
+    def collect(*args, preview=None, **kwargs):
+        preview(partial)
+        return final
+
+    monkeypatch.setattr(status, "collect", collect)
+
+    value, rendered = ui.check_status(output, config, guided=True)
+
+    text = clean(stream.getvalue())
+    assert value is final and rendered
+    assert "Databases" in text and "app-test-01/kv" in text
+    assert "loading" in text
+    assert status.backup_text(final["databases"]["app-test-01/kv"]["latest_backup"]) in text
+
+    stream.seek(0)
+    stream.truncate()
+    value, rendered = ui.check_status(output, config)
+
+    text = clean(stream.getvalue())
+    assert value is final and rendered
+    assert "loading" in text and "app-test-01/kv" in text
+    assert "Databases" not in text
+
+
+def test_guided_choice_starts_after_live_backup_update(config, monkeypatch):
+    output, _stream = _terminal()
+    final = _value()
+    partial = json.loads(json.dumps(final))
+    partial["pending"] = True
+    partial["healthy"] = None
+    partial["host"]["healthy"] = None
+    partial["databases"]["app-test-01/kv"]["latest_backup"]["state"] = "loading"
+    complete = False
+
+    def collect(*args, preview=None, **kwargs):
+        nonlocal complete
+        preview(partial)
+        complete = True
+        return final
+
+    def input_fn(prompt):
+        assert complete
+        return "0"
+
+    monkeypatch.setattr(status, "collect", collect)
+
+    assert ui.run(config, input_fn=input_fn, output=output) == 0
+
+
 def test_explicit_lifecycle_executes_without_confirmation(config, monkeypatch):
     calls = []
     monkeypatch.setattr(cli, "load", lambda path: config)
@@ -360,6 +425,7 @@ def test_status_json_is_credential_free_and_repository_visible(config, monkeypat
     assert "machine_state" not in text
     assert "transaction" not in text
     assert "restore" not in text
+    assert "loading" not in text and "pending" not in text
     assert set(value["host"]["infrastructure"]["listeners"]) == {"5432", "6379"}
     roots = value["host"]["database_storage"]
     assert [item["path"] for item in roots] == [str(path) for path in config.host.data_roots]
@@ -369,21 +435,37 @@ def test_status_json_is_credential_free_and_repository_visible(config, monkeypat
     ]
 
 
+def test_pending_backup_is_disabled_for_cache_database(config):
+    target = config.select("app-test-01/kv")
+    cache = replace(target, settings=replace(target.settings, mode="cache"))
+
+    assert status._pending_backup(target)["state"] == "loading"
+    assert status._pending_backup(cache)["state"] == "disabled"
+
+
 def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
     snapshots = [{"id": "shared"}]
     calls = []
     repository_calls = []
     progress = []
+    previews = []
 
     def history(current, target, *, remote_snapshots=None):
         calls.append((target.identity, remote_snapshots))
         return []
 
-    monkeypatch.setattr(
-        status.backup,
-        "host_snapshots",
-        lambda current: repository_calls.append(current) or snapshots,
-    )
+    def host_snapshots(current):
+        assert previews
+        assert previews[0]["pending"]
+        assert previews[0]["healthy"] is None
+        assert all(
+            item["latest_backup"]["state"] == "loading"
+            for item in previews[0]["databases"].values()
+        )
+        repository_calls.append(current)
+        return snapshots
+
+    monkeypatch.setattr(status.backup, "host_snapshots", host_snapshots)
     monkeypatch.setattr(
         status.backup,
         "repository_ready",
@@ -398,19 +480,28 @@ def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
     monkeypatch.setattr(
         status,
         "_host",
-        lambda current, errors, *, repository=None: {"healthy": repository["ready"]},
+        lambda current, errors, *, repository=None: {
+            "healthy": None,
+            "storage": {"ok": True},
+            "database_storage": [],
+            "infrastructure": {"healthy": True},
+            "timer": {"ok": True},
+            "repository": repository,
+        },
     )
 
-    status.collect(config, progress=progress.append)
+    value = status.collect(config, progress=progress.append, preview=previews.append)
 
     durable = {target.identity for target in config.databases if target.durable}
     assert repository_calls == [config]
+    assert "pending" not in value
     assert {identity for identity, _snapshots in calls} == durable
     assert all(remote is snapshots for _identity, remote in calls)
-    assert progress[:2] == ["Reading backup repository", "Checking host"]
-    assert {message.removeprefix("Checking ") for message in progress[2:]} == {
+    assert progress[0] == "Checking host"
+    assert {message.removeprefix("Checking ") for message in progress[1:-1]} == {
         target.identity for target in config.databases
     }
+    assert progress[-1] == "Reading backup repository"
 
 
 def test_host_status_reports_each_root_assignment_and_low_custom_filesystem(config, monkeypatch):
@@ -484,6 +575,16 @@ def test_compact_overview_preserves_identity_and_progressive_details(width):
     assert "..." not in text
     assert "long-" in text or "postgres" in text
     assert max(map(len, text.splitlines())) <= width
+
+
+def test_live_overview_fits_narrow_terminal():
+    output, stream = _terminal(width=60)
+
+    output.console.print(ui._status_table(_value(), guided=True, width=60))
+
+    text = clean(stream.getvalue())
+    assert max(map(len, text.splitlines())) <= 60
+    assert "app-test-01/kv" in text
 
 
 @pytest.mark.parametrize("width", [60, 100, 160])
