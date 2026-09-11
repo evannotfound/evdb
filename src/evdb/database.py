@@ -172,6 +172,14 @@ def add(
             ):
                 raise DatabaseError("changing database data root is outside this operation")
             with lock(current.paths.role_lock(project, role), timeout=timeout):
+                render(current, existing)
+                _prepare(existing, timeout)
+                docker.up(
+                    existing.compose,
+                    existing.compose_project,
+                    timeout=timeout,
+                    secrets=protected(current),
+                )
                 health(current, existing)
             return current
         selected_root = _data_root(current, data_root)
@@ -208,6 +216,7 @@ def add(
         with lock(updated.paths.role_lock(project, role), timeout=timeout):
             write(updated)
             render(updated, target)
+            _prepare(target, timeout)
             docker.up(
                 target.compose,
                 target.compose_project,
@@ -253,6 +262,7 @@ def configure(
         with lock(updated.paths.role_lock(target.project, target.role), timeout=timeout):
             write(updated, secrets=False)
             render(updated, target)
+            _prepare(target, timeout)
             docker.up(
                 target.compose,
                 target.compose_project,
@@ -335,6 +345,7 @@ def _upgrade(config: Config, database: Database, settings: Postgres) -> Config:
             write(updated, secrets=False)
             final = updated.select(source.identity)
             render(updated, final)
+            _prepare(final, timeout)
             docker.up(
                 final.compose,
                 final.compose_project,
@@ -447,6 +458,7 @@ def _converge(config: Config, database: Database) -> None:
         current = load(config.paths.source, paths=config.paths)
         target = current.select(database.identity)
         render(current, target)
+        _prepare(target, current.host.timeouts["command"])
         docker.up(
             target.compose,
             target.compose_project,
@@ -454,6 +466,13 @@ def _converge(config: Config, database: Database) -> None:
             secrets=protected(current),
         )
         health(current, target)
+
+
+def _prepare(database: Database, timeout: int) -> None:
+    if database.role == "postgres":
+        from .engines import postgres
+
+        postgres.prepare_data(database, timeout=timeout)
 
 
 def logs(config: Config, database: Database, *, lines: int = 200) -> str:

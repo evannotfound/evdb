@@ -243,6 +243,38 @@ def test_postgres_logical_major_upgrade_from_16_to_18(config, tmp_path, monkeypa
             _clean(cleanup, postgres.data_target(cleanup.image))
 
 
+def test_fresh_postgres_18_prepares_parent_mount(config, tmp_path, monkeypatch):
+    _require_docker()
+    project = _project("postgres18")
+    data_root = tmp_path / "database-volume"
+    base = replace(
+        config,
+        host=replace(config.host, data_roots=(data_root,)),
+        paths=replace(config.paths, state=tmp_path / "state"),
+        projects=(),
+        secrets=replace(config.secrets, projects=()),
+    )
+    data_root.parent.mkdir(parents=True, exist_ok=True)
+    write(base)
+
+    with _network(monkeypatch):
+        created = None
+        try:
+            created = database.add(base, project, "postgres", postgres_version=18)
+            target = created.select(f"{project}/postgres")
+            database.health(created, target, timeout=120)
+            version = docker.exec(
+                target.service("primary"),
+                ["cat", "/var/lib/postgresql/18/docker/PG_VERSION"],
+                timeout=30,
+            )
+            assert version.out.strip() == "18"
+        finally:
+            if created is not None:
+                target = created.select(f"{project}/postgres")
+                _clean(target, postgres.data_target(target.image))
+
+
 def _config(base, tmp_path, projects, secrets) -> Config:
     selected = replace(
         base,

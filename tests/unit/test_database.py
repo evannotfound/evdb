@@ -8,6 +8,7 @@ from evdb import backup, database
 from evdb.config import load, remove_role, write
 from evdb.engines import postgres
 from evdb.errors import CommandError, ConfigError, DatabaseError
+from evdb.run import Result
 
 
 def _runtime(monkeypatch):
@@ -248,6 +249,48 @@ def test_postgres_mount_changes_for_version(image, target, config):
     assert volume == f"{database_value.data}:{target}"
 
 
+def test_prepare_empty_postgres_18_data_with_image_owner(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    target = replace(target, settings=replace(target.settings, image="postgres:18"))
+    target.data.mkdir(parents=True)
+    removed = []
+    commands = []
+    monkeypatch.setattr(postgres.docker, "remove", lambda name, **kwargs: removed.append(name))
+    monkeypatch.setattr(
+        "evdb.run.run",
+        lambda args, **kwargs: commands.append(args) or Result(tuple(args), 0, "", ""),
+    )
+
+    postgres.prepare_data(target, timeout=60)
+
+    assert target.service("primary") in removed and target.service("pgbouncer") in removed
+    assert commands[0][-3:] == ["postgres:18", "postgres:postgres", "/var/lib/postgresql"]
+
+
+def test_prepare_initialized_postgres_18_data_is_unchanged(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    target = replace(target, settings=replace(target.settings, image="postgres:18"))
+    marker = target.data / "18/docker/PG_VERSION"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("18\n")
+    monkeypatch.setattr(
+        "evdb.run.run",
+        lambda *args, **kwargs: pytest.fail("initialized data must not be prepared again"),
+    )
+
+    postgres.prepare_data(target, timeout=60)
+
+
+def test_prepare_postgres_18_rejects_unknown_nonempty_layout(config):
+    target = config.select("app-test-01/postgres")
+    target = replace(target, settings=replace(target.settings, image="postgres:18"))
+    target.data.mkdir(parents=True)
+    (target.data / "PG_VERSION").write_text("16\n")
+
+    with pytest.raises(ConfigError, match="nonempty but uninitialized"):
+        postgres.prepare_data(target, timeout=60)
+
+
 def test_configure_dispatches_postgres_major_upgrade(config, monkeypatch):
     target = config.select("app-test-01/postgres")
     seen = []
@@ -300,6 +343,7 @@ def test_postgres_major_upgrade_quiesces_backs_up_restores_and_switches(config, 
     monkeypatch.setattr(database.docker, "remove", lambda *args, **kwargs: None)
     monkeypatch.setattr(database.docker, "up", lambda *args, **kwargs: events.append("up"))
     monkeypatch.setattr(database, "render", lambda *args: events.append("render"))
+    monkeypatch.setattr(database, "_prepare", lambda *args: None)
     monkeypatch.setattr(database, "health", lambda *args: events.append("health"))
 
     updated = database.configure(config, target, {"postgres_version": 18})
@@ -563,12 +607,15 @@ def test_lifecycle_reloads_and_reselects_current_source_under_locks(config, monk
 
 def test_existing_role_add_checks_health_and_omitted_engine_is_idempotent(config, monkeypatch):
     calls = []
+    monkeypatch.setattr(database, "render", lambda *args: calls.append("render"))
+    monkeypatch.setattr(database, "_prepare", lambda *args: calls.append("prepare"))
+    monkeypatch.setattr(database.docker, "up", lambda *args, **kwargs: calls.append("up"))
     monkeypatch.setattr(database, "health", lambda current, target: calls.append(target.engine))
 
     updated = database.add(config, "app-test-01", "kv")
 
     assert updated.select("app-test-01/kv").engine == "redis"
-    assert calls == ["redis"]
+    assert calls == ["render", "prepare", "up", "redis"]
 
 
 def test_existing_role_add_rejects_conflicting_explicit_engine(config, monkeypatch):
@@ -584,6 +631,9 @@ def test_existing_or_unchanged_role_does_not_succeed_when_unhealthy(config, monk
         raise DatabaseError("database is unhealthy")
 
     monkeypatch.setattr(database, "health", unhealthy)
+    monkeypatch.setattr(database, "render", lambda *args: None)
+    monkeypatch.setattr(database, "_prepare", lambda *args: None)
+    monkeypatch.setattr(database.docker, "up", lambda *args, **kwargs: None)
 
     with pytest.raises(DatabaseError, match="unhealthy"):
         database.add(config, "app-test-01", "kv")

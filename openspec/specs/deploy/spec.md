@@ -94,6 +94,14 @@ inspection and retry rather than running candidate rollback.
 - **WHEN** new services cannot become healthy
 - **THEN** evdb reports the concrete failure without deleting the configured role, generated files, or data
 
+#### Scenario: Fresh PostgreSQL 18 role is created
+- **WHEN** an empty host data directory is used for an official PostgreSQL 18 or newer role
+- **THEN** evdb prepares the parent mount for the image's postgres account before Compose starts and the image initializes `<major>/docker`
+
+#### Scenario: Interrupted PostgreSQL 18 creation is retried
+- **WHEN** a matching configured role has an empty uninitialized data directory from a failed start
+- **THEN** rerunning Add or Start rerenders, prepares, starts, and health-checks the same role without replacing its credentials
+
 ### Requirement: Routine lifecycle commands
 The CLI SHALL provide `database start`, `stop`, `restart`, and `logs` for one project/role. Start and
 restart SHALL rerender role files from current source before invoking Compose and SHALL wait for

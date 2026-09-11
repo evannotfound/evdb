@@ -39,6 +39,64 @@ def data_target(image: str) -> str:
     return "/var/lib/postgresql" if major(image) >= 18 else "/var/lib/postgresql/data"
 
 
+def prepare_data(database: Database, *, timeout: int) -> None:
+    version = major(database.settings.image)
+    if version < 18:
+        return
+    expected = database.data / str(version) / "docker/PG_VERSION"
+    try:
+        if expected.is_file():
+            return
+        nonempty = next(database.data.iterdir(), None) is not None
+    except PermissionError:
+        from ..run import run
+
+        result = run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--volume",
+                f"{database.data}:/var/lib/postgresql",
+                "--entrypoint",
+                "test",
+                database.settings.image,
+                "-f",
+                f"/var/lib/postgresql/{version}/docker/PG_VERSION",
+            ],
+            timeout=timeout,
+            check=False,
+        )
+        if result.code == 0:
+            return
+        raise ConfigError(f"Postgres {version} data layout is unreadable or incomplete") from None
+    if nonempty:
+        raise ConfigError(f"Postgres {version} data directory is nonempty but uninitialized")
+    for name in services(database):
+        docker.remove(name, timeout=timeout)
+    from ..run import run
+
+    run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--volume",
+            f"{database.data}:/var/lib/postgresql",
+            "--entrypoint",
+            "chown",
+            database.settings.image,
+            "postgres:postgres",
+            "/var/lib/postgresql",
+        ],
+        timeout=timeout,
+    )
+
+
 def image_user(image: str) -> tuple[int, int]:
     from ..run import run
 
