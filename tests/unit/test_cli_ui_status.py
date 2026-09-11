@@ -308,7 +308,8 @@ def test_guided_choice_starts_before_live_backup_update(config, monkeypatch):
     monkeypatch.setattr(status, "collect", collect)
 
     assert ui.run(config, input_fn=input_fn, output=output) == 0
-    assert prompts == ["Select: "]
+    assert prompts == [""]
+    assert "Select:" in clean(stream.getvalue())
     assert "loading" in clean(stream.getvalue())
     assert status.backup_text(final["databases"]["app-test-01/kv"]["latest_backup"]) in clean(
         stream.getvalue()

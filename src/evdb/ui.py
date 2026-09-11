@@ -478,11 +478,14 @@ def _status_table(value: dict[str, Any], *, guided: bool, width: int):
 
 
 def _root_view(value: dict[str, Any], options: list[tuple[str, str]], *, width: int):
+    prompt = _prompt("Select: ")
+    prompt.end = ""
     return Group(
         _status_table(value, guided=True, width=width),
         Text(""),
         Text("\n".join(f"{key}. {label}" for key, label in options)),
         Text(""),
+        prompt,
     )
 
 
@@ -515,7 +518,7 @@ def run(
                     )
                     session.start()
                     output.console.show_cursor(True)
-                    choice = _choice(input_fn, output, "Select", allowed)
+                    choice = _choice(input_fn, output, None, allowed)
                     session.subscribe(None)
                 value = session.value
             else:
@@ -1068,10 +1071,10 @@ def _options(output, options: list[tuple[str, str]]) -> None:
     output("")
 
 
-def _choice(input_fn, output, prompt: str, allowed: set[str]) -> str | None:
+def _choice(input_fn, output, prompt: str | None, allowed: set[str]) -> str | None:
     while True:
         try:
-            value = input_fn(f"{prompt}: ").strip()
+            value = input_fn(f"{prompt}: " if prompt else "").strip()
         except EOFError:
             return None
         if value in allowed:
