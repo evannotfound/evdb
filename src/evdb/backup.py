@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import stat
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -95,6 +96,7 @@ def create(
     database: Database,
     *,
     purpose: str = "manual",
+    lock_held: bool = False,
 ) -> dict[str, Any]:
     if not database.durable:
         raise BackupError(f"backups are disabled for cache database {database.identity}")
@@ -107,7 +109,12 @@ def create(
     require_space(root, config.host.backup.min_free_gb)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     partial = root / f"{run_id}.partial"
-    with operation(config, database, timeout=config.host.timeouts["backup"]):
+    context = (
+        nullcontext()
+        if lock_held
+        else operation(config, database, timeout=config.host.timeouts["backup"])
+    )
+    with context:
         private_dir(partial)
         folder = None
         started = datetime.now(UTC).isoformat()

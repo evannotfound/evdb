@@ -78,6 +78,7 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("--engine", choices=("dragonfly", "redis"))
     add.add_argument("--username", help="initial Postgres username (creation only)")
     add.add_argument("--database-name", help="initial Postgres database name (creation only)")
+    add.add_argument("--postgres-version", type=int, default=16)
     add.add_argument("--data-root", metavar="PATH", help="configured database data root")
     add.add_argument(
         "--password-file", metavar="PATH", help="private initial Postgres password file"
@@ -87,6 +88,7 @@ def parser() -> argparse.ArgumentParser:
     configure = database_commands.add_parser("configure")
     configure.add_argument("database")
     configure.add_argument("--image")
+    configure.add_argument("--postgres-version", type=int)
     configure.add_argument("--pgbouncer", action=argparse.BooleanOptionalAction)
     configure.add_argument("--pgbouncer-image")
     configure.add_argument("--max-clients", type=int)
@@ -223,6 +225,7 @@ def _database(config, args, output, *, terminal: bool) -> int:
             username=args.username,
             database_name=args.database_name,
             data_root=args.data_root,
+            postgres_version=args.postgres_version,
         )
         ui.success(output, f"{args.project}/{args.role} is healthy")
         return 0
@@ -236,6 +239,7 @@ def _database(config, args, output, *, terminal: bool) -> int:
             name: getattr(args, name)
             for name in (
                 "image",
+                "postgres_version",
                 "pgbouncer",
                 "pgbouncer_image",
                 "max_clients",

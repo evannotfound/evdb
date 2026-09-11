@@ -11,8 +11,8 @@ from dataclasses import replace
 import pytest
 
 from evdb import backup, database, docker
-from evdb.config import defaults, require_valid
-from evdb.engines import dragonfly, kv
+from evdb.config import defaults, require_valid, write
+from evdb.engines import dragonfly, kv, postgres
 from evdb.models import Config, Project, ProjectSecrets, RoleSecrets, http_port
 from evdb.run import run
 
@@ -147,6 +147,102 @@ def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_pat
                 _clean(target, "/data")
 
 
+def test_postgres_logical_major_upgrade_from_16_to_18(config, tmp_path, monkeypatch):
+    _require_docker()
+    monkeypatch.setattr(backup, "_upload", lambda *args: "integration-snapshot")
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
+    project = _project("upgrade")
+    data_root = tmp_path / "database-volume"
+    base = replace(config, host=replace(config.host, data_roots=(data_root,)))
+    selected = _config(
+        base,
+        tmp_path,
+        (Project(project, postgres=defaults("postgres", data_root)),),
+        (ProjectSecrets(project, postgres=RoleSecrets("upgrade-password")),),
+    )
+    write(selected)
+    target = selected.select(f"{project}/postgres")
+
+    with _network(monkeypatch):
+        final = None
+        try:
+            database.render(selected, target)
+            docker.up(
+                target.compose, target.compose_project, timeout=600, secrets=("upgrade-password",)
+            )
+            database.health(selected, target, timeout=120)
+            docker.exec(
+                target.service("primary"),
+                [
+                    "psql",
+                    "-X",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-U",
+                    "default",
+                    "-d",
+                    "postgres",
+                    "-c",
+                    "CREATE TABLE preserved(value text); INSERT INTO preserved VALUES ('yes'); "
+                    "ALTER DATABASE postgres SET statement_timeout TO '7s'",
+                ],
+                timeout=60,
+            )
+            docker.exec(
+                target.service("primary"),
+                ["chmod", "-R", "a+rwX", "/var/lib/postgresql/data"],
+                timeout=30,
+            )
+
+            final = database.configure(selected, target, {"postgres_version": 18})
+            upgraded = final.select(target.identity)
+            database.health(final, upgraded, timeout=120)
+            result = docker.exec(
+                upgraded.service("primary"),
+                [
+                    "psql",
+                    "-X",
+                    "-A",
+                    "-t",
+                    "-U",
+                    "default",
+                    "-d",
+                    "postgres",
+                    "-c",
+                    "SELECT value FROM preserved",
+                ],
+                timeout=60,
+            )
+            assert upgraded.image == "postgres:18"
+            assert result.out.strip() == "yes"
+            setting = docker.exec(
+                upgraded.service("primary"),
+                [
+                    "psql",
+                    "-X",
+                    "-A",
+                    "-t",
+                    "-U",
+                    "default",
+                    "-d",
+                    "postgres",
+                    "-c",
+                    "SHOW statement_timeout",
+                ],
+                timeout=30,
+            )
+            assert setting.out.strip() == "7s"
+            version = docker.exec(
+                upgraded.service("primary"),
+                ["cat", "/var/lib/postgresql/18/docker/PG_VERSION"],
+                timeout=30,
+            )
+            assert version.out.strip() == "18"
+        finally:
+            cleanup = (final or selected).select(target.identity)
+            _clean(cleanup, postgres.data_target(cleanup.image))
+
+
 def _config(base, tmp_path, projects, secrets) -> Config:
     selected = replace(
         base,
@@ -154,6 +250,8 @@ def _config(base, tmp_path, projects, secrets) -> Config:
         projects=projects,
         secrets=replace(base.secrets, projects=secrets),
     )
+    for root in selected.host.data_roots:
+        root.parent.mkdir(parents=True, exist_ok=True)
     require_valid(selected)
     return selected
 

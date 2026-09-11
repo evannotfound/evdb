@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import secrets as random
+import shutil
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,16 @@ from urllib.parse import quote
 import yaml
 
 from . import docker
-from .config import add_role, defaults, load, protected, replace_role, validate_image, write
+from .config import (
+    add_role,
+    defaults,
+    load,
+    protected,
+    remove_role,
+    replace_role,
+    validate_image,
+    write,
+)
 from .engines import get
 from .errors import DatabaseError, Error
 from .files import allocated, disk, managed_dir, private_dir, private_line, write_text
@@ -57,7 +68,12 @@ def _require_stable_data_bind(database: Database, desired: dict[str, Any]) -> No
         service = database.service("primary")
         desired_service = desired["services"][service]
         target = _data_target(desired_service, database.data)
-        current_source = _bind_source(current["services"][service], target)
+        targets = (
+            {target, "/var/lib/postgresql/data", "/var/lib/postgresql"}
+            if database.role == "postgres"
+            else {target}
+        )
+        current_source = _bind_source(current["services"][service], targets)
     except (KeyError, TypeError, OSError, yaml.YAMLError) as exc:
         raise DatabaseError(f"generated Compose data bind is missing or unsafe: {compose}") from exc
     if current_source != database.data:
@@ -79,12 +95,11 @@ def _data_target(service: dict[str, Any], source: Path) -> str:
     return matches[0]
 
 
-def _bind_source(service: dict[str, Any], target: str) -> Path:
-    suffix = f":{target}"
+def _bind_source(service: dict[str, Any], targets: set[str]) -> Path:
     matches = [
-        Path(volume.removesuffix(suffix))
+        Path(volume.split(":", 1)[0])
         for volume in service["volumes"]
-        if isinstance(volume, str) and volume.endswith(suffix)
+        if isinstance(volume, str) and ":" in volume and volume.split(":", 2)[1] in targets
     ]
     if len(matches) != 1:
         raise KeyError("data bind")
@@ -118,6 +133,12 @@ def add(
     username: str | None = None,
     database_name: str | None = None,
     data_root: str | Path | None = None,
+    postgres_version: str | int = 16,
+    pgbouncer: bool | None = None,
+    pgbouncer_image: str | None = None,
+    max_clients: int | None = None,
+    pool_size: int | None = None,
+    reserve_size: int | None = None,
 ) -> Config:
     identity = f"{project}/{role}"
     if role == "postgres" and engine is not None:
@@ -156,15 +177,26 @@ def add(
         selected_root = _data_root(current, data_root)
         settings = defaults(role, selected_root, engine or "dragonfly")
         if role == "postgres":
-            from .config import validate_postgres_name
+            from .config import postgres_image, validate_postgres_name
 
+            pool = settings.pgbouncer
             settings = replace(
                 settings,
+                image=postgres_image(postgres_version),
                 username=validate_postgres_name(username or settings.username, "username"),
                 database=validate_postgres_name(
                     database_name or settings.database, "database name"
                 ),
+                pgbouncer=replace(
+                    pool,
+                    enabled=pool.enabled if pgbouncer is None else pgbouncer,
+                    image=pgbouncer_image or pool.image,
+                    max_clients=pool.max_clients if max_clients is None else max_clients,
+                    pool_size=pool.pool_size if pool_size is None else pool_size,
+                    reserve_size=pool.reserve_size if reserve_size is None else reserve_size,
+                ),
             )
+            get("postgres").validate(settings)
         credential = (
             _password(password) if password is not None else _password(random.token_urlsafe(32))
         )
@@ -193,6 +225,17 @@ def configure(
     *,
     reset: tuple[str, ...] = (),
 ) -> Config:
+    selected = load(config.paths.source, paths=config.paths).select(database.identity)
+    candidate = _settings(selected, values, reset)
+    if selected.role == "postgres" and candidate.image != selected.image:
+        from .engines import postgres
+
+        source_major = postgres.major(selected.image)
+        target_major = postgres.major(candidate.image)
+        if target_major < source_major:
+            raise DatabaseError("Postgres major-version downgrade is not supported")
+        if target_major > source_major:
+            return _upgrade(config, selected, candidate)
     timeout = config.host.timeouts["command"]
     with operation(config, write=True, timeout=timeout):
         current = load(config.paths.source, paths=config.paths)
@@ -220,6 +263,112 @@ def configure(
         return updated
 
 
+def _upgrade(config: Config, database: Database, settings: Postgres) -> Config:
+    from . import backup
+    from .engines import postgres
+
+    timeout = config.host.timeouts["command"]
+    with operation(config, write=True, timeout=timeout):
+        current = load(config.paths.source, paths=config.paths)
+        source = current.select(database.identity)
+        if source.settings != database.settings:
+            raise DatabaseError("Postgres settings changed while preparing upgrade; retry")
+        source_major = (
+            int(
+                postgres._psql(
+                    source.service("primary"),
+                    source.settings.database,
+                    "SHOW server_version_num",
+                    username=source.settings.username,
+                    timeout=30,
+                )
+            )
+            // 10000
+        )
+        target_major = postgres.major(settings.image)
+        if target_major <= source_major:
+            raise DatabaseError("Postgres target must be newer than the running server")
+        required = allocated(source.data) * 2 + current.host.backup.min_free_gb * 1024**3
+        if disk(source.data)["free_bytes"] < required:
+            raise DatabaseError("insufficient free space for Postgres major upgrade")
+        token = random.token_hex(6)
+        candidate = source.data.with_name(f".data-upgrade-{token}")
+        old = source.data.with_name(f".data-old-{token}")
+        if candidate.exists() or old.exists():
+            raise DatabaseError("Postgres upgrade staging path already exists")
+        owner = postgres.image_user(settings.image)
+        create_role = postgres._psql(
+            source.service("primary"),
+            source.settings.database,
+            "SELECT format('CREATE ROLE %I;', current_user)",
+            username=source.settings.username,
+            timeout=30,
+        )
+        old_moved = False
+        failed = None
+        try:
+            if source.settings.pgbouncer.enabled:
+                docker.remove(source.service("pgbouncer"), timeout=timeout)
+            docker.disconnect(docker.NETWORK, source.service("primary"), timeout=timeout)
+            safety = backup.create(current, source, lock_held=True)
+            docker.stop(
+                source.compose,
+                source.compose_project,
+                timeout=timeout,
+                secrets=protected(current),
+            )
+            postgres.restore(
+                source,
+                Path(safety["folder"]),
+                settings.image,
+                candidate,
+                f"{source.service('primary')}-upgrade",
+                create_role,
+                owner,
+            )
+            for name in get(source.engine).services(source):
+                docker.remove(name, timeout=timeout)
+            source.data.rename(old)
+            old_moved = True
+            candidate.rename(source.data)
+            updated = replace_role(current, source.identity, settings)
+            write(updated, secrets=False)
+            final = updated.select(source.identity)
+            render(updated, final)
+            docker.up(
+                final.compose,
+                final.compose_project,
+                timeout=timeout,
+                secrets=protected(updated),
+            )
+            health(updated, final)
+        except BaseException as exc:
+            failed = exc
+            for name in get(source.engine).services(source):
+                docker.remove(name, timeout=timeout)
+            if old_moved:
+                failed_target = source.data.with_name(f".data-failed-{token}")
+                if source.data.exists():
+                    source.data.rename(failed_target)
+                old.rename(source.data)
+                shutil.rmtree(failed_target, ignore_errors=True)
+                write(current, secrets=False)
+                render(current, source)
+            docker.up(
+                source.compose,
+                source.compose_project,
+                timeout=timeout,
+                secrets=protected(current),
+            )
+            health(current, source)
+            raise
+        finally:
+            if candidate.exists():
+                shutil.rmtree(candidate, ignore_errors=failed is not None)
+        shutil.rmtree(old)
+        return updated
+
+
 def start(config: Config, database: Database) -> None:
     _converge(config, database)
 
@@ -237,6 +386,60 @@ def stop(config: Config, database: Database) -> None:
 
 def restart(config: Config, database: Database) -> None:
     _converge(config, database)
+
+
+def delete(config: Config, database: Database) -> Config:
+    timeout = config.host.timeouts["command"]
+    with operation(config, write=True, timeout=timeout):
+        current = load(config.paths.source, paths=config.paths)
+        target = current.select(database.identity)
+        updated = remove_role(current, target.identity)
+        paths = (target.generated, target.data)
+        if target.data.is_symlink():
+            raise DatabaseError(f"database deletion path is unsafe: {target.data}")
+        for path, root in (
+            (target.generated, current.paths.projects),
+            (target.data, target.settings.data_root),
+        ):
+            _require_delete_path(path, root)
+            if path.is_symlink() or path.exists() and not path.is_dir():
+                raise DatabaseError(f"database deletion path is unsafe: {path}")
+        with lock(current.paths.role_lock(target.project, target.role), timeout=timeout):
+            for name in get(target.engine).services(target):
+                docker.remove(name, timeout=timeout)
+            source_text = current.paths.source.read_bytes()
+            secret_text = current.paths.secrets.read_bytes()
+            try:
+                write(updated)
+            except BaseException:
+                from .files import write_bytes
+
+                write_bytes(current.paths.source, source_text, mode=0o600)
+                write_bytes(current.paths.secrets, secret_text, mode=0o600)
+                raise
+            for path in paths:
+                try:
+                    shutil.rmtree(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise DatabaseError(f"database removed; cleanup failed: {path}: {exc}") from exc
+        for path in (target.generated.parent, target.data.parent, target.data.parent.parent):
+            with suppress(OSError):
+                path.rmdir()
+        return updated
+
+
+def _require_delete_path(path: Path, root: Path) -> None:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise DatabaseError(f"database deletion path is outside its managed root: {path}") from exc
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise DatabaseError(f"database deletion path is unsafe: {current}")
 
 
 def _converge(config: Config, database: Database) -> None:
@@ -434,7 +637,15 @@ def connection(database: Database) -> dict[str, Any]:
 
 def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]):
     allowed = (
-        {"image", "pgbouncer", "pgbouncer_image", "max_clients", "pool_size", "reserve_size"}
+        {
+            "image",
+            "postgres_version",
+            "pgbouncer",
+            "pgbouncer_image",
+            "max_clients",
+            "pool_size",
+            "reserve_size",
+        }
         if database.role == "postgres"
         else {"image", "mode", "http", "http_image", "http_connections", "memory", "threads"}
     )
@@ -445,6 +656,10 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
         raise DatabaseError("memory and threads are only valid for Dragonfly")
     base = defaults(database.role, database.settings.data_root, database.engine)
     updates = dict(values)
+    if "postgres_version" in updates:
+        from .config import postgres_image
+
+        updates["image"] = postgres_image(updates.pop("postgres_version"))
     for name in reset:
         updates[name] = _current(base, name)
     settings = database.settings
@@ -483,6 +698,10 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
 
 
 def _current(settings: Postgres | KV, name: str):
+    if name == "postgres_version":
+        from .engines import postgres
+
+        return postgres.major(settings.image)
     if name in {"pgbouncer", "pgbouncer_image", "max_clients", "pool_size", "reserve_size"}:
         attribute = {"pgbouncer": "enabled", "pgbouncer_image": "image"}.get(name, name)
         return getattr(settings.pgbouncer, attribute)
@@ -495,7 +714,14 @@ def _current(settings: Postgres | KV, name: str):
 
 def _setting_values(database: Database) -> dict[str, Any]:
     names = (
-        ("image", "pgbouncer", "pgbouncer_image", "max_clients", "pool_size", "reserve_size")
+        (
+            "postgres_version",
+            "pgbouncer",
+            "pgbouncer_image",
+            "max_clients",
+            "pool_size",
+            "reserve_size",
+        )
         if database.role == "postgres"
         else (
             ("image", "mode", "http", "http_image", "http_connections", "memory", "threads")

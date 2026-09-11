@@ -1,11 +1,13 @@
+import os
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from evdb import backup, database
-from evdb.config import load, write
-from evdb.errors import CommandError, DatabaseError
+from evdb.config import load, remove_role, write
+from evdb.engines import postgres
+from evdb.errors import CommandError, ConfigError, DatabaseError
 
 
 def _runtime(monkeypatch):
@@ -157,6 +159,194 @@ def test_configure_writes_and_invokes_compose_once(config, monkeypatch):
     assert changed.settings.http.connections == 40
     assert changed.settings.mode == "cache"
     assert len(calls) == 1
+
+
+def test_remove_role_removes_matching_secret_and_empty_project(config):
+    updated = remove_role(config, "app-test-01/postgres")
+
+    assert updated.select("app-test-01/kv")
+    with pytest.raises(ConfigError, match="unknown database"):
+        updated.select("app-test-01/postgres")
+    assert updated.secrets.select("app-test-01", "kv")
+
+
+def test_delete_removes_live_role_and_retains_backups(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    target.generated.mkdir(parents=True)
+    target.compose.write_text("services: {}\n")
+    target.data.mkdir(parents=True)
+    (target.data / "PG_VERSION").write_text("16\n")
+    sibling = target.data.parent / "keep.txt"
+    sibling.write_text("keep")
+    retained = config.paths.role_backups(target.project, target.role)
+    retained.mkdir(parents=True)
+    (retained / "kept").write_text("backup")
+    removed = []
+    monkeypatch.setattr(
+        database.docker,
+        "remove",
+        lambda name, **kwargs: removed.append(name),
+    )
+
+    updated = database.delete(config, target)
+    loaded = load(config.paths.source, paths=config.paths)
+
+    assert updated == loaded
+    assert target.service("primary") in removed and target.service("pgbouncer") in removed
+    assert not target.generated.exists() and not target.data.exists()
+    assert sibling.read_text() == "keep"
+    assert (retained / "kept").read_text() == "backup"
+    assert loaded.select("app-test-01/kv")
+
+
+def test_delete_rejects_symlinked_live_path_before_container_removal(config, tmp_path, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    target.data.parent.mkdir(parents=True)
+    target.data.symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(
+        database.docker,
+        "remove",
+        lambda *args, **kwargs: pytest.fail("unsafe deletion reached Docker"),
+    )
+
+    with pytest.raises(DatabaseError, match="unsafe"):
+        database.delete(config, target)
+
+
+def test_delete_restores_source_when_paired_write_fails(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    target.generated.mkdir(parents=True)
+    target.data.mkdir(parents=True)
+    original_source = config.paths.source.read_bytes()
+    original_secrets = config.paths.secrets.read_bytes()
+    monkeypatch.setattr(database.docker, "remove", lambda *args, **kwargs: None)
+
+    def fail(updated):
+        updated.paths.source.write_text("partial")
+        raise OSError("secret write failed")
+
+    monkeypatch.setattr(database, "write", fail)
+
+    with pytest.raises(OSError, match="secret write failed"):
+        database.delete(config, target)
+
+    assert config.paths.source.read_bytes() == original_source
+    assert config.paths.secrets.read_bytes() == original_secrets
+    assert target.data.exists() and target.generated.exists()
+
+
+@pytest.mark.parametrize(
+    ("image", "target"),
+    [("postgres:16", "/var/lib/postgresql/data"), ("postgres:18", "/var/lib/postgresql")],
+)
+def test_postgres_mount_changes_for_version(image, target, config):
+    database_value = config.select("app-test-01/postgres")
+    database_value = replace(database_value, settings=replace(database_value.settings, image=image))
+
+    volume = postgres.services(database_value)[database_value.service("primary")]["volumes"][0]
+
+    assert volume == f"{database_value.data}:{target}"
+
+
+def test_configure_dispatches_postgres_major_upgrade(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    seen = []
+    monkeypatch.setattr(
+        database,
+        "_upgrade",
+        lambda current, selected, settings: seen.append(settings.image) or current,
+    )
+
+    database.configure(config, target, {"postgres_version": 18})
+
+    assert seen == ["postgres:18"]
+
+
+def test_postgres_major_upgrade_quiesces_backs_up_restores_and_switches(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    target.generated.mkdir(parents=True)
+    target.compose.write_text("services: {}\n")
+    target.data.mkdir(parents=True)
+    (target.data / "old").write_text("old")
+    events = []
+    monkeypatch.setattr(database, "allocated", lambda path: 1)
+    monkeypatch.setattr(database, "disk", lambda path: {"free_bytes": 10 * 1024**3})
+    monkeypatch.setattr(
+        postgres,
+        "_psql",
+        lambda *args, **kwargs: (
+            "160000" if "server_version_num" in args[2] else "CREATE ROLE default;"
+        ),
+    )
+    monkeypatch.setattr(postgres, "image_user", lambda image: (os.getuid(), os.getgid()))
+
+    def restore(_target, _folder, _image, candidate, *_args):
+        events.append("restore")
+        candidate.mkdir()
+        (candidate / "new").write_text("new")
+
+    monkeypatch.setattr(postgres, "restore", restore)
+    monkeypatch.setattr(
+        backup,
+        "create",
+        lambda *args, **kwargs: (
+            events.append(("backup", kwargs["lock_held"])) or {"folder": str(config.paths.backups)}
+        ),
+    )
+    monkeypatch.setattr(
+        database.docker, "disconnect", lambda *args, **kwargs: events.append("disconnect")
+    )
+    monkeypatch.setattr(database.docker, "stop", lambda *args, **kwargs: events.append("stop"))
+    monkeypatch.setattr(database.docker, "remove", lambda *args, **kwargs: None)
+    monkeypatch.setattr(database.docker, "up", lambda *args, **kwargs: events.append("up"))
+    monkeypatch.setattr(database, "render", lambda *args: events.append("render"))
+    monkeypatch.setattr(database, "health", lambda *args: events.append("health"))
+
+    updated = database.configure(config, target, {"postgres_version": 18})
+
+    assert updated.select(target.identity).image == "postgres:18"
+    assert (target.data / "new").read_text() == "new"
+    assert events.index("disconnect") < events.index(("backup", True)) < events.index("stop")
+    assert events[-3:] == ["render", "up", "health"]
+
+
+def test_postgres_major_upgrade_restores_old_service_when_restore_fails(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    target.generated.mkdir(parents=True)
+    target.compose.write_text("services: {}\n")
+    target.data.mkdir(parents=True)
+    (target.data / "old").write_text("old")
+    restarted = []
+    monkeypatch.setattr(database, "allocated", lambda path: 1)
+    monkeypatch.setattr(database, "disk", lambda path: {"free_bytes": 10 * 1024**3})
+    monkeypatch.setattr(
+        postgres,
+        "_psql",
+        lambda *args, **kwargs: (
+            "160000" if "server_version_num" in args[2] else "CREATE ROLE default;"
+        ),
+    )
+    monkeypatch.setattr(postgres, "image_user", lambda image: (os.getuid(), os.getgid()))
+    monkeypatch.setattr(
+        backup, "create", lambda *args, **kwargs: {"folder": str(config.paths.backups)}
+    )
+    monkeypatch.setattr(
+        postgres, "restore", lambda *args: (_ for _ in ()).throw(DatabaseError("restore failed"))
+    )
+    monkeypatch.setattr(database.docker, "disconnect", lambda *args, **kwargs: None)
+    monkeypatch.setattr(database.docker, "stop", lambda *args, **kwargs: None)
+    monkeypatch.setattr(database.docker, "remove", lambda *args, **kwargs: None)
+    monkeypatch.setattr(database.docker, "up", lambda *args, **kwargs: restarted.append("up"))
+    monkeypatch.setattr(database, "health", lambda *args: restarted.append("health"))
+
+    with pytest.raises(DatabaseError, match="restore failed"):
+        database.configure(config, target, {"postgres_version": 18})
+
+    assert (target.data / "old").read_text() == "old"
+    assert (
+        load(config.paths.source, paths=config.paths).select(target.identity).image == "postgres:16"
+    )
+    assert restarted == ["up", "health"]
 
 
 def test_postgres_pool_settings_reset_to_defaults(config):

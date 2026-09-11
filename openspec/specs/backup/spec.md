@@ -130,6 +130,15 @@ role failed.
 - **WHEN** the scheduled command runs on a host with no durable database
 - **THEN** it exits successfully after reporting that no backup was due
 
+### Requirement: Major-upgrade safety backup
+A PostgreSQL major upgrade SHALL isolate external traffic before creating the normal checked database
+backup and SHALL require successful remote upload before stopping the source primary and restoring the
+target cluster. The resulting local folder and remote snapshot SHALL remain normal backup history.
+
+#### Scenario: Upgrade backup upload fails
+- **WHEN** the fresh checked backup cannot be uploaded after traffic is isolated
+- **THEN** evdb restarts the original service and does not create, switch, or configure the target cluster
+
 ### Requirement: Backup history
 `evdb backup list PROJECT/ROLE` SHALL merge valid completed local folders and matching tagged Restic
 snapshots in reverse chronological order. Each item SHALL show human time, purpose, local and remote

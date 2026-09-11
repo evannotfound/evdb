@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+import select
 import shutil
+import sys
+import termios
 import time
+import tty
 from contextlib import contextmanager
 from getpass import getpass
 from threading import Condition, Event, Thread
@@ -36,6 +40,7 @@ class _StatusSession:
         self._thread: Thread | None = None
         self._cancel: Event | None = None
         self._generation = 0
+        self._revision = 0
         self._callback = None
         self._error: BaseException | None = None
 
@@ -43,6 +48,10 @@ class _StatusSession:
     def value(self) -> dict[str, Any]:
         with self._condition:
             return self._value
+
+    def snapshot(self) -> tuple[int, dict[str, Any]]:
+        with self._condition:
+            return self._revision, self._value
 
     def subscribe(self, callback) -> None:
         with self._condition:
@@ -104,6 +113,7 @@ class _StatusSession:
             if config is not None:
                 self.config = config
             self._value = status.pending(self.config)
+            self._revision += 1
             self._finished = None
             self._error = None
 
@@ -158,6 +168,7 @@ class _StatusSession:
             if generation != self._generation:
                 return
             self._value = value
+            self._revision += 1
             if finished:
                 self._finished = self._clock()
             callback = self._callback
@@ -477,16 +488,82 @@ def _status_table(value: dict[str, Any], *, guided: bool, width: int):
     return Group(*renderables)
 
 
-def _root_view(value: dict[str, Any], options: list[tuple[str, str]], *, width: int):
+def _root_view(
+    value: dict[str, Any],
+    options: list[tuple[str, str]],
+    *,
+    width: int,
+    answer: str = "",
+    error: str | None = None,
+):
     prompt = _prompt("Select: ")
+    prompt.append(answer)
     prompt.end = ""
-    return Group(
+    values = [
         _status_table(value, guided=True, width=width),
         Text(""),
         Text("\n".join(f"{key}. {label}" for key, label in options)),
         Text(""),
-        prompt,
+    ]
+    if error:
+        values.extend((Text(error, style="red"), Text("")))
+    values.append(prompt)
+    return Group(*values)
+
+
+def _live_input(input_fn, output) -> bool:
+    return (
+        isinstance(output, Terminal)
+        and getattr(input_fn, "__self__", None) is output
+        and sys.stdin.isatty()
     )
+
+
+def _live_choice(
+    output: Terminal,
+    session: _StatusSession,
+    options: list[tuple[str, str]],
+    allowed: set[str],
+) -> str | None:
+    descriptor = sys.stdin.fileno()
+    previous = termios.tcgetattr(descriptor)
+    answer = ""
+    error = None
+    revision = -1
+    width = output.console.width
+    try:
+        tty.setcbreak(descriptor)
+        with output.live(_root_view(session.value, options, width=width)) as update:
+            session.start()
+            output.console.show_cursor(True)
+            while True:
+                current_revision, value = session.snapshot()
+                if current_revision != revision:
+                    revision = current_revision
+                    update(_root_view(value, options, width=width, answer=answer, error=error))
+                ready, _write, _error = select.select([descriptor], [], [], 0.05)
+                if not ready:
+                    continue
+                text = os.read(descriptor, 64).decode(errors="ignore")
+                for character in text:
+                    if character == "\x03":
+                        raise KeyboardInterrupt
+                    if character == "\x04" and not answer:
+                        return None
+                    if character in "\r\n":
+                        if answer in allowed:
+                            return answer
+                        error = _invalid_choice(allowed)
+                        answer = ""
+                    elif character in {"\x08", "\x7f"}:
+                        answer = answer[:-1]
+                        error = None
+                    elif character.isdigit():
+                        answer += character
+                        error = None
+                update(_root_view(value, options, width=width, answer=answer, error=error))
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
 
 
 def run(
@@ -508,7 +585,10 @@ def run(
             options = [(str(add), "Add database"), (str(host), "Host"), ("0", "Exit")]
             allowed = rows | {key for key, _label in options}
             live = _live_enabled(output)
-            if live:
+            if live and _live_input(input_fn, output):
+                choice = _live_choice(output, session, options, allowed)
+                value = session.value
+            elif live:
                 width = output.console.width
                 with output.live(_root_view(session.value, options, width=width)) as update:
                     session.subscribe(
@@ -635,6 +715,7 @@ def _database(
             ("5", "Restart"),
             ("6", "Backups"),
             ("7", "Logs"),
+            ("8", "Delete"),
             ("0", "Back"),
         ]
         _options(output, options)
@@ -667,7 +748,8 @@ def _database(
                 if values is not None:
                     if session is not None:
                         session.invalidate(current)
-                    current = database.configure(current, target, values)
+                    with loading(output, f"Applying {identity} settings"):
+                        current = database.configure(current, target, values)
                     if session is not None:
                         session.invalidate(current)
                     _screen(
@@ -700,10 +782,14 @@ def _database(
                 )
             elif choice == "6":
                 current = _backups(current, target, input_fn, output, session=session)
-            else:
+            elif choice == "7":
                 with loading(output, f"Loading {identity} logs"):
                     text = database.logs(current, target)
                 _screen(output, text, heading="Logs")
+            else:
+                deleted = _delete(current, target, input_fn, output, session)
+                if deleted is not None:
+                    return deleted
         except Error as exc:
             _screen(
                 output,
@@ -734,6 +820,71 @@ def _runtime(
         return database.observe(config, target)
 
 
+def _delete(
+    config: Config,
+    target: Database,
+    input_fn,
+    output,
+    session: _StatusSession | None,
+) -> Config | None:
+    from . import database, status
+    from .files import allocated
+
+    if session is not None:
+        session.cancel()
+    with loading(output, f"Checking {target.identity} backups"):
+        backup_state, backup_errors = status._backup(config, target)
+    try:
+        size = _bytes(allocated(target.data))
+    except OSError:
+        size = "unknown"
+    current_backup = backup_state["state"] == "current"
+    phrase = "DELETE" if current_backup else "DELETE WITHOUT BACKUP"
+    backup_text = f"current at {backup_state['time']}" if current_backup else backup_state["state"]
+    if backup_errors:
+        backup_text += f" ({backup_errors[0]['message']})"
+    _screen(
+        output,
+        pairs(
+            {
+                "Database": target.identity,
+                "Engine": target.engine,
+                "Live data": f"{target.data} ({size})",
+                "Generated": str(target.generated),
+                "Remote backup": backup_text,
+                "Local backups retained": str(
+                    config.paths.role_backups(target.project, target.role)
+                ),
+                "Remote backups retained": config.host.backup.repository,
+            }
+        ),
+        heading="Delete database",
+        error=True,
+    )
+    if not confirm(input_fn, "Delete this database?"):
+        return None
+    identity = ask_text(input_fn, output, f"Type {target.identity} to continue")
+    if identity != target.identity:
+        _screen(output, "Database identity did not match", heading="Delete cancelled")
+        return None
+    confirmation = ask_text(input_fn, output, f"Type {phrase} to permanently delete live data")
+    if confirmation != phrase:
+        _screen(output, "Confirmation phrase did not match", heading="Delete cancelled")
+        return None
+    if session is not None:
+        session.invalidate(config)
+    with loading(output, f"Deleting {target.identity}"):
+        updated = database.delete(config, target)
+    if session is not None:
+        session.invalidate(updated)
+    _screen(
+        output,
+        "Live data removed; local and remote backups retained",
+        heading=f"Deleted {target.identity}",
+    )
+    return updated
+
+
 def _add(
     config: Config,
     input_fn,
@@ -757,14 +908,33 @@ def _add(
     password = None
     username = None
     database_name = None
+    postgres_version = 16
+    pgbouncer = None
+    pgbouncer_image = None
+    max_clients = None
+    pool_size = None
+    reserve_size = None
     if role == "kv":
         _screen(output, "1. Dragonfly\n2. Redis\n0. Cancel", heading="KV engine")
         selected = _choice(input_fn, output, "Engine", {"0", "1", "2"})
         if selected in {None, "0"}:
             return config
         engine = "dragonfly" if selected == "1" else "redis"
-    elif confirm(input_fn, "Advanced Postgres identity?"):
-        from .config import validate_postgres_name
+    else:
+        from .config import postgres_image, validate_postgres_name
+
+        selected_version = ask_text(
+            input_fn,
+            output,
+            "Postgres version",
+            default="16",
+            validate=lambda value: int(postgres_image(value).removeprefix("postgres:")),
+        )
+        if selected_version is None:
+            return config
+        postgres_version = selected_version
+    if role == "postgres" and confirm(input_fn, "Advanced Postgres configuration?"):
+        from .config import validate_image, validate_postgres_name
 
         username = ask_text(
             input_fn,
@@ -787,7 +957,31 @@ def _add(
             required=True,
             confirm=True,
         )
-        if username is None or database_name is None or password is None:
+        pgbouncer = confirm(input_fn, "Enable PgBouncer?", default=True)
+        if pgbouncer:
+            pgbouncer_image = ask_text(
+                input_fn,
+                output,
+                "PgBouncer image",
+                default="edoburu/pgbouncer:v1.25.1-p0",
+                validate=lambda value: _image(value, validate_image, "PgBouncer image"),
+            )
+            max_clients = ask_text(
+                input_fn, output, "PgBouncer max clients", default="100", validate=_positive
+            )
+            pool_size = ask_text(
+                input_fn, output, "PgBouncer pool size", default="20", validate=_positive
+            )
+            reserve_size = ask_text(
+                input_fn, output, "PgBouncer reserve size", default="5", validate=_positive
+            )
+        if (
+            username is None
+            or database_name is None
+            or password is None
+            or pgbouncer
+            and None in {pgbouncer_image, max_clients, pool_size, reserve_size}
+        ):
             return config
     if len(config.host.data_roots) > 1:
         selected = choose(
@@ -806,9 +1000,11 @@ def _add(
     }
     if role == "postgres":
         summary.update(
+            Version=postgres_version,
             Username=username or "default",
             Database=database_name or "postgres",
             Password="provided" if password else "generated",
+            PgBouncer=True if pgbouncer is None else pgbouncer,
         )
     _screen(
         output,
@@ -828,6 +1024,12 @@ def _add(
         username=username,
         database_name=database_name,
         data_root=data_root,
+        postgres_version=postgres_version,
+        pgbouncer=pgbouncer,
+        pgbouncer_image=pgbouncer_image,
+        max_clients=max_clients,
+        pool_size=pool_size,
+        reserve_size=reserve_size,
     )
     if session is not None:
         session.invalidate(updated)
@@ -1207,6 +1409,21 @@ def _parse(value: str, current: Any) -> Any:
             return int(value)
         except ValueError as exc:
             raise Error("integer value required") from exc
+    return value
+
+
+def _positive(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise Error("positive integer required") from exc
+    if result < 1:
+        raise Error("positive integer required")
+    return result
+
+
+def _image(value: str, validate, name: str) -> str:
+    validate(value, name)
     return value
 
 

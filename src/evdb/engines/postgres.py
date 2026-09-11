@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -23,6 +25,218 @@ DATA_SQL = (
     "'databases',count(*))::text FROM pg_database "
     "WHERE datallowconn AND NOT datistemplate"
 )
+_OFFICIAL = re.compile(r"postgres:([0-9]+)(?:$|[-.])")
+
+
+def major(image: str) -> int:
+    match = _OFFICIAL.match(image)
+    if match is None:
+        raise ConfigError("automatic Postgres versions require an official postgres:MAJOR image")
+    return int(match.group(1))
+
+
+def data_target(image: str) -> str:
+    return "/var/lib/postgresql" if major(image) >= 18 else "/var/lib/postgresql/data"
+
+
+def image_user(image: str) -> tuple[int, int]:
+    from ..run import run
+
+    values = []
+    for flag in ("-u", "-g"):
+        result = run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--entrypoint",
+                "id",
+                image,
+                flag,
+                "postgres",
+            ],
+            timeout=600,
+        )
+        try:
+            values.append(int(result.out.strip()))
+        except ValueError as exc:
+            raise ConfigError(f"cannot determine postgres user for {image}") from exc
+    return values[0], values[1]
+
+
+def restore(
+    database: Database,
+    folder: Path,
+    image: str,
+    candidate: Path,
+    container: str,
+    create_role: str,
+    owner: tuple[int, int] | None = None,
+) -> None:
+    from .. import backup
+
+    record = backup.manifest_check(folder)
+    facts = record["facts"]
+    names = facts.get("databases")
+    owners = facts.get("owners")
+    objects = facts.get("objects")
+    if (
+        not isinstance(names, list)
+        or not names
+        or len(names) != len(set(names))
+        or not isinstance(owners, dict)
+        or not isinstance(objects, dict)
+        or set(names) != set(owners)
+        or set(names) != set(objects)
+        or not all(isinstance(value, int) and value >= 0 for value in objects.values())
+    ):
+        raise BackupError("Postgres backup facts are invalid for upgrade")
+    uid, gid = owner or image_user(image)
+    candidate.mkdir(mode=0o700)
+    from ..run import run
+
+    run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--volume",
+            f"{candidate}:/candidate",
+            "--entrypoint",
+            "chown",
+            image,
+            f"{uid}:{gid}",
+            "/candidate",
+        ],
+        timeout=600,
+    )
+    globals_source = folder / "globals.sql"
+    globals_copy = candidate.parent / f".{candidate.name}.globals.sql"
+    lines = globals_source.read_text().splitlines(keepends=True)
+    filtered = [line for line in lines if line.strip() != create_role]
+    if len(filtered) != len(lines) - 1:
+        raise BackupError("Postgres globals do not contain exactly one managed role creation")
+    globals_copy.write_text("".join(filtered))
+    globals_copy.chmod(0o600)
+    environment = {
+        "POSTGRES_USER": database.settings.username,
+        "POSTGRES_DB": database.settings.database,
+        "POSTGRES_PASSWORD_FILE": "/run/secrets/postgres-password",
+    }
+    try:
+        docker.start(
+            image,
+            container,
+            mounts=(
+                (candidate, data_target(image), False),
+                (database.generated / "postgres-password", "/run/secrets/postgres-password", True),
+            ),
+            memory="2g",
+            timeout=600,
+            env=environment,
+            secrets=(database.credentials.password,),
+        )
+        _wait(container, database.settings.username)
+        docker.copy(globals_copy, f"{container}:/tmp/globals.sql", timeout=60)
+        _exec(
+            container,
+            database.settings.username,
+            database.settings.database,
+            ["psql", "-f", "/tmp/globals.sql"],
+        )
+        for name in names:
+            docker.exec(
+                container,
+                [
+                    "dropdb",
+                    "--no-password",
+                    "-U",
+                    database.settings.username,
+                    "--maintenance-db=template1",
+                    "--if-exists",
+                    "--force",
+                    "--",
+                    name,
+                ],
+                timeout=120,
+            )
+            archive = folder / f"databases/{quote(name, safe='')}.dump"
+            docker.copy(archive, f"{container}:/tmp/database.dump", timeout=600)
+            docker.exec(
+                container,
+                [
+                    "pg_restore",
+                    "--exit-on-error",
+                    "--create",
+                    "--no-password",
+                    "-U",
+                    database.settings.username,
+                    "-d",
+                    "template1",
+                    "/tmp/database.dump",
+                ],
+                timeout=7200,
+            )
+        actual = [
+            json.loads(line)
+            for line in _psql(
+                container,
+                database.settings.database,
+                DATABASE_SQL,
+                username=database.settings.username,
+                timeout=120,
+            ).splitlines()
+        ]
+        if actual != [{"name": name, "owner": owners[name]} for name in names]:
+            raise BackupError("restored Postgres database names or owners do not match backup")
+        for name in names:
+            count = int(
+                _psql(container, name, OBJECT_SQL, username=database.settings.username, timeout=120)
+            )
+            if count != objects[name]:
+                raise BackupError(f"restored Postgres objects do not match backup: {name}")
+        version = int(
+            _psql(
+                container,
+                database.settings.database,
+                "SHOW server_version_num",
+                username=database.settings.username,
+                timeout=120,
+            )
+        )
+        if version // 10000 != major(image):
+            raise BackupError("restored Postgres server major does not match target image")
+    finally:
+        docker.remove(container, timeout=120)
+        globals_copy.unlink(missing_ok=True)
+
+
+def _wait(container: str, username: str, timeout: int = 120) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        result = docker.exec(
+            container,
+            ["pg_isready", "-U", username],
+            timeout=10,
+            check=False,
+        )
+        if result.code == 0:
+            return
+        if time.monotonic() >= deadline:
+            raise CommandError("upgrade Postgres did not become ready")
+        time.sleep(1)
+
+
+def _exec(container: str, username: str, database: str, args: list[str]) -> None:
+    docker.exec(
+        container,
+        [*args, "-X", "-v", "ON_ERROR_STOP=1", "-U", username, "-d", database],
+        timeout=1800,
+    )
 
 
 def validate(settings: Postgres) -> None:
@@ -81,7 +295,7 @@ def services(database: Database) -> dict[str, Any]:
             "POSTGRES_PASSWORD_FILE": "/run/secrets/postgres-password",
         },
         "volumes": [
-            f"{database.data}:/var/lib/postgresql/data",
+            f"{database.data}:{data_target(database.settings.image)}",
             f"{generated / 'postgres-password'}:/run/secrets/postgres-password:ro",
         ],
         "networks": {docker.NETWORK: {"aliases": [primary]}},
@@ -231,6 +445,7 @@ def backup(database: Database, folder: Path, _run_id: str) -> dict[str, Any]:
                 [
                     "pg_dump",
                     "-Fc",
+                    "--create",
                     "--no-password",
                     "-U",
                     database.settings.username,

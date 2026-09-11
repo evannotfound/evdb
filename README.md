@@ -92,8 +92,9 @@ TLS router, initializes the Restic repository, and enables automatic daily backu
 
 ## Create your first database
 
-Project names must end in `-dev-N`, `-test-N`, or `-prod-N`. Create Postgres with a generated managed
-login and retrieve its TLS-secured connection URL:
+Project names must end in `-dev-N`, `-test-N`, or `-prod-N`. Guided Postgres creation asks for an official
+major version (default 16) before optional advanced identity and PgBouncer settings. Create Postgres with
+a generated managed login and retrieve its TLS-secured connection URL:
 
 ```sh
 sudo evdb database add notes-prod-01 postgres
@@ -134,6 +135,7 @@ sudo evdb database add cache-prod-01 kv
 sudo evdb database add cache-prod-02 kv --engine redis
 sudo evdb database info cache-prod-01/kv
 sudo evdb database configure notes-prod-01/postgres --max-clients 200
+sudo evdb database configure notes-prod-01/postgres --postgres-version 18
 sudo evdb database start notes-prod-01/postgres
 sudo evdb database stop notes-prod-01/postgres
 sudo evdb database restart notes-prod-01/postgres
@@ -143,6 +145,14 @@ sudo evdb backup create notes-prod-01/postgres
 sudo evdb backup create --all
 sudo evdb backup list notes-prod-01/postgres
 ```
+
+Changing `--postgres-version` to a newer official major creates and uploads a fresh backup, logically
+restores and verifies an isolated target cluster, and rolls back to the old image and data if final health
+fails. Major downgrades and custom-image major migrations are rejected.
+
+The guided database menu can permanently delete a managed role after layered typed confirmation. Deletion
+removes containers, source credentials, generated files, and live data but retains local and remote
+backups.
 
 Rerun the installer to update evdb. On a configured host it also refreshes the managed router and
 backup timer without restarting healthy databases.

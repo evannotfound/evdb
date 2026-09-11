@@ -112,6 +112,37 @@ history. Logs SHALL be bounded and redact exact credential values while preservi
 - **WHEN** the operator requests bounded logs
 - **THEN** evdb prints the selected Compose project's original log text except for exact managed credential values
 
+### Requirement: PostgreSQL major upgrade
+Changing a managed Postgres role to a newer official `postgres:MAJOR` image SHALL perform a logical major
+upgrade rather than starting the new binary on old physical data. The operation SHALL isolate client
+traffic, create and upload a fresh checked backup, restore and verify an isolated target cluster, switch
+data only after verification, and restore the prior source, data, and healthy service on failure.
+
+#### Scenario: PostgreSQL 16 upgrades to 18
+- **WHEN** settings changes a healthy official PostgreSQL 16 role to version 18
+- **THEN** databases, owners, managed credentials, and recorded objects are restored under the PostgreSQL 18 parent-mount layout before traffic resumes
+
+#### Scenario: Upgrade restore fails
+- **WHEN** globals, an archive, ownership, object counts, target major, or final health cannot be verified
+- **THEN** evdb returns to the old data and image, verifies old health, and retains the fresh backup
+
+#### Scenario: PostgreSQL version is downgraded
+- **WHEN** settings selects an older major than the running server
+- **THEN** evdb rejects the change before modifying source, containers, or data
+
+### Requirement: Guided database deletion
+Guided deletion SHALL remove only the selected role's containers, source settings, credentials, generated
+files, and live data after layered confirmation. It SHALL preserve all local backup folders and matching
+remote Restic snapshots and SHALL remove an empty project from source.
+
+#### Scenario: One role of a two-role project is deleted
+- **WHEN** the operator deletes the Postgres role from a project that also has KV
+- **THEN** the KV role and credentials remain configured and operable
+
+#### Scenario: Container removal fails
+- **WHEN** any selected role container cannot be removed
+- **THEN** source and live data remain configured for a retry
+
 ### Requirement: Unambiguous selectors
 Database commands SHALL use `<project>/postgres` or `<project>/kv`. Guided flows MAY select the same identity from a numbered project list. A project name alone SHALL be accepted only when exactly one role exists and no credential-bearing output can be disclosed ambiguously.
 

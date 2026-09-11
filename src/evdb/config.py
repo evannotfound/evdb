@@ -310,6 +310,13 @@ def defaults(role: str, data_root: Path, engine: str = "dragonfly") -> Postgres 
     )
 
 
+def postgres_image(version: str | int) -> str:
+    text = str(version)
+    if not text.isdigit() or not 9 <= int(text) <= 99:
+        raise ConfigError("Postgres version must be an official numeric major; example: 16")
+    return f"postgres:{int(text)}"
+
+
 def add_role(
     config: Config,
     project_id: str,
@@ -361,6 +368,33 @@ def replace_role(config: Config, selector: str, settings: Postgres | KV) -> Conf
     updated = replace(config, projects=projects)
     require_valid(updated)
     return updated
+
+
+def remove_role(config: Config, selector: str) -> Config:
+    target = config.select(selector)
+    projects = []
+    for project in config.projects:
+        if project.id != target.project:
+            projects.append(project)
+            continue
+        updated = replace(project, **{target.role: None})
+        if updated.postgres is not None or updated.kv is not None:
+            projects.append(updated)
+    secret_projects = []
+    for project in config.secrets.projects:
+        if project.id != target.project:
+            secret_projects.append(project)
+            continue
+        updated = replace(project, **{target.role: None})
+        if updated.postgres is not None or updated.kv is not None:
+            secret_projects.append(updated)
+    result = replace(
+        config,
+        projects=tuple(projects),
+        secrets=replace(config.secrets, projects=tuple(secret_projects)),
+    )
+    require_valid(result)
+    return result
 
 
 def validate_image(value: Any, name: str = "image") -> None:

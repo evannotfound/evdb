@@ -66,6 +66,10 @@ status loads. Plain or injected output SHALL contain no terminal control sequenc
 - **WHEN** the operator starts guided `evdb` while runtime or repository assessment is incomplete
 - **THEN** evdb immediately shows stable numbered choices and accepts input while pending cells update in the active overview
 
+#### Scenario: Operator types while status updates
+- **WHEN** background status redraws the root while a numeric choice is partially entered
+- **THEN** the prompt and complete entered buffer remain visible until Enter submits the choice
+
 #### Scenario: Other interactive work takes noticeable time
 - **WHEN** Details, backup, log, or another synchronous view waits for external work
 - **THEN** one transient terminal status line identifies the current phase and is removed before the completed screen or error is appended
@@ -73,7 +77,7 @@ status loads. Plain or injected output SHALL contain no terminal control sequenc
 ### Requirement: Context-aware database menu
 The guided root SHALL use a table only for the database overview. Selecting a role SHALL immediately open
 a key/value summary and numbered actions for Details, Connection, Settings, Start or Stop, Restart,
-Backups, Logs, and Back. A role whose runtime assessment is pending SHALL show `checking`, offer a neutral
+Backups, Logs, Delete, and Back. A role whose runtime assessment is pending SHALL show `checking`, offer a neutral
 Start/Stop action, and wait only when the selected action requires live runtime state. Full image
 references, credentials, generated paths, backup records, and error details SHALL appear only in their
 relevant submenu.
@@ -94,6 +98,14 @@ relevant submenu.
 - **WHEN** the operator opens Settings for Redis-backed KV
 - **THEN** the menu omits Dragonfly-only memory and thread settings
 
+#### Scenario: Operator deletes a database
+- **WHEN** the operator confirms deletion, types the exact database identity, and types the required deletion phrase
+- **THEN** evdb removes local runtime, source, credentials, generated files, and live data while retaining local and remote backups
+
+#### Scenario: Remote backup is not current before deletion
+- **WHEN** the selected role has no current confirmed remote backup
+- **THEN** deletion requires the exact phrase `DELETE WITHOUT BACKUP` rather than `DELETE`
+
 #### Scenario: Narrow terminal displays the root
 - **WHEN** terminal width is 60 columns
 - **THEN** the root does not print image digests and the database identity remains readable without being replaced by an ellipsis-only value
@@ -111,6 +123,14 @@ deployment transactions, or service contract hashes.
 #### Scenario: Settings are discarded
 - **WHEN** the operator leaves without confirming Save
 - **THEN** source, generated files, and containers remain unchanged
+
+#### Scenario: Guided Postgres creation selects a version
+- **WHEN** the operator creates Postgres and accepts the version default
+- **THEN** version 16 is selected before Advanced configuration and persisted as official image `postgres:16`
+
+#### Scenario: Advanced Postgres creation disables PgBouncer
+- **WHEN** the operator enters Advanced configuration and disables PgBouncer
+- **THEN** creation omits the PgBouncer service and does not ask for its image or sizing values
 
 ### Requirement: Grouped command interface
 The non-menu interface SHALL provide top-level `init` and `status`, group retained operations under

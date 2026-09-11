@@ -316,6 +316,41 @@ def test_guided_choice_starts_before_live_backup_update(config, monkeypatch):
     )
 
 
+def test_live_numeric_choice_preserves_typed_buffer(config, monkeypatch):
+    output, stream = _terminal()
+    chunks = iter((b"1", b"\n"))
+
+    class Input:
+        def fileno(self):
+            return 0
+
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(ui.sys, "stdin", Input())
+    monkeypatch.setattr(ui.termios, "tcgetattr", lambda descriptor: [])
+    monkeypatch.setattr(ui.termios, "tcsetattr", lambda *args: None)
+    monkeypatch.setattr(ui.tty, "setcbreak", lambda descriptor: None)
+    monkeypatch.setattr(ui.select, "select", lambda *args: ([0], [], []))
+    monkeypatch.setattr(ui.os, "read", lambda *args: next(chunks))
+
+    class Session:
+        value = status.pending(config)
+
+        def start(self):
+            pass
+
+        def snapshot(self):
+            return 0, self.value
+
+    session = Session()
+
+    value = ui._live_choice(output, session, [("0", "Exit")], {"1"})
+
+    assert value == "1"
+    assert "Select: 1" in clean(stream.getvalue())
+
+
 def test_guided_status_session_does_not_overlap_and_reuses_ttl(config):
     final = _value()
     calls = []
@@ -1223,7 +1258,7 @@ def test_append_only_text_prompt_retries_locally_without_control_sequences():
 
 
 def test_guided_postgres_advanced_identity_is_redacted(config, monkeypatch):
-    answers = iter(["custom-prod-01", "1", "y", "app_user", "app_db", "y"])
+    answers = iter(["custom-prod-01", "1", "", "y", "app_user", "app_db", "y", "", "", "", "", "y"])
     passwords = iter(["private password", "private password"])
     seen = {}
     output = []
@@ -1244,13 +1279,76 @@ def test_guided_postgres_advanced_identity_is_redacted(config, monkeypatch):
     assert "Password: provided" in "\n".join(output)
 
 
+def test_guided_postgres_creation_selects_version_and_disables_pgbouncer(config, monkeypatch):
+    answers = iter(["versioned-prod-01", "1", "18", "y", "app_user", "app_db", "n", "y"])
+    passwords = iter(["private password", "private password"])
+    seen = {}
+
+    def add(current, project, role, **values):
+        seen.update(project=project, role=role, **values)
+        return current
+
+    monkeypatch.setattr(database, "add", add)
+
+    ui._add(
+        config,
+        lambda prompt: next(answers),
+        lambda value: None,
+        lambda prompt: next(passwords),
+    )
+
+    assert seen["postgres_version"] == 18
+    assert seen["pgbouncer"] is False
+
+
+def test_guided_delete_requires_identity_and_backup_sensitive_phrase(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    monkeypatch.setattr(status, "_backup", lambda *args: ({"state": "current", "time": "now"}, []))
+    monkeypatch.setattr("evdb.files.allocated", lambda path: 10)
+    monkeypatch.setattr(database, "delete", lambda current, selected: current)
+    answers = iter(["y", target.identity, "DELETE"])
+
+    result = ui._delete(
+        config,
+        target,
+        lambda prompt: next(answers),
+        lambda value: None,
+        None,
+    )
+
+    assert result is config
+
+
+def test_guided_delete_rejects_ordinary_phrase_without_current_backup(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    monkeypatch.setattr(status, "_backup", lambda *args: ({"state": "stale", "time": None}, []))
+    monkeypatch.setattr("evdb.files.allocated", lambda path: 10)
+    monkeypatch.setattr(
+        database,
+        "delete",
+        lambda *args: pytest.fail("weak confirmation reached deletion"),
+    )
+    answers = iter(["y", target.identity, "DELETE"])
+
+    assert (
+        ui._delete(
+            config,
+            target,
+            lambda prompt: next(answers),
+            lambda value: None,
+            None,
+        )
+        is None
+    )
+
+
 def test_guided_database_creation_selects_from_multiple_data_roots(config, tmp_path, monkeypatch):
     root = tmp_path / "database-volume"
     selected = replace(
         config,
         host=replace(config.host, data_roots=(config.host.data_roots[0], root)),
     )
-    answers = iter(["placed-prod-01", "1", "n", "2", "y"])
+    answers = iter(["placed-prod-01", "1", "", "n", "2", "y"])
     seen = {}
 
     def add(current, project, role, **values):

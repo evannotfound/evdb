@@ -80,6 +80,8 @@ def start(
     mounts: Sequence[tuple[Path, str, bool]] = (),
     memory: str = "1g",
     timeout: int = 300,
+    env: Mapping[str, str] | None = None,
+    secrets: Sequence[str] = (),
 ) -> str:
     command = [
         "docker",
@@ -96,14 +98,27 @@ def start(
     ]
     for source, target, read_only in mounts:
         command.extend(["--volume", f"{source}:{target}{':ro' if read_only else ''}"])
+    for key in env or {}:
+        command.extend(["--env", key])
     command.extend([image, *args])
-    return run(command, timeout=timeout).out.strip()
+    return run(command, timeout=timeout, env=env, secrets=secrets).out.strip()
 
 
 def remove(name: str, *, timeout: int = 60) -> None:
     result = run(["docker", "rm", "--force", "--volumes", name], timeout=timeout, check=False)
     if result.code != 0 and "no such" not in result.err.lower():
         raise CommandError(result.err.strip() or f"failed to remove container {name}")
+
+
+def disconnect(network: str, name: str, *, timeout: int = 60) -> None:
+    result = run(
+        ["docker", "network", "disconnect", network, name],
+        timeout=timeout,
+        check=False,
+    )
+    detail = result.err.strip() or result.out.strip()
+    if result.code and "is not connected" not in detail.lower():
+        raise CommandError(detail or f"failed to disconnect {name} from {network}")
 
 
 def compose_command(path: str | Path, project: str, *args: str) -> list[str]:

@@ -39,6 +39,10 @@ written directly into generated Compose without separate resolution or image mac
 - **WHEN** an operator restarts a role whose configured image value is unchanged
 - **THEN** evdb uses the same configured image and does not perform an implicit image pull or update
 
+#### Scenario: Postgres version is selected
+- **WHEN** creation or settings selects official PostgreSQL major `N`
+- **THEN** source records `postgres:N` and evdb derives major-version migration and storage behavior from that image
+
 ### Requirement: Canonical host paths
 Non-secret source SHALL live at `/etc/evdb/config.yml`, secret source at
 `/etc/evdb/secrets.yml`, and `host.backup.rclone_config` SHALL reference a private native rclone file
@@ -49,6 +53,10 @@ dedicated Traefik assets under `/var/lib/evdb/traefik`, mutable local backups an
 #### Scenario: Postgres paths are derived
 - **WHEN** project `example-prod-01` has a Postgres role
 - **THEN** its Compose path is `/var/lib/evdb/projects/example-prod-01/postgres/compose.yaml` and its data path is `/var/lib/evdb/databases/example-prod-01/postgres/data`
+
+#### Scenario: PostgreSQL 18 or newer is rendered
+- **WHEN** an official PostgreSQL image has major 18 or newer
+- **THEN** the stable host data path mounts at `/var/lib/postgresql` and the image stores its cluster under `<major>/docker`
 
 #### Scenario: Operator locates host inputs
 - **WHEN** an operator reviews `/etc/evdb` and `/var/lib/evdb`
