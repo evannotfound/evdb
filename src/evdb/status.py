@@ -25,6 +25,9 @@ def collect(
     preview: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     selected = (database,) if database else config.databases
+    current = pending(config, database)
+    if preview is not None:
+        preview(current)
     host_errors = []
     pending_repository = {
         "url": config.host.backup.repository,
@@ -36,8 +39,10 @@ def collect(
     host = _host(config, host_errors, repository=pending_repository)
     observations = {}
     assessment_errors = {}
-    databases = {}
+    databases = dict(current["databases"])
     local_errors = list(host_errors)
+    if preview is not None:
+        preview(_result(host, databases, local_errors, pending=True))
     for target in selected:
         _progress(progress, f"Checking {target.identity}")
         observed, item_errors = _observe(config, target)
@@ -51,9 +56,8 @@ def collect(
             current_errors,
         )
         local_errors.extend(current_errors)
-    partial = _result(host, databases, local_errors, pending=True)
-    if preview is not None:
-        preview(partial)
+        if preview is not None:
+            preview(_result(host, databases, local_errors, pending=True))
 
     remote_snapshots = None
     backup_failure = None
@@ -100,6 +104,32 @@ def collect(
     return _result(final_host, final_databases, final_errors)
 
 
+def pending(config: Config, database: Database | None = None) -> dict[str, Any]:
+    selected = (database,) if database else config.databases
+    repository = {
+        "url": config.host.backup.repository,
+        "ready": None,
+        "available": False,
+        "pending": True,
+    }
+    host = {
+        "id": config.host.id,
+        "tool_version": __version__,
+        "healthy": None,
+        "repository": repository,
+    }
+    databases = {
+        target.identity: _database_value(
+            target,
+            {"running": None, "healthy": False, "health": "checking"},
+            _pending_backup(target),
+            [],
+        )
+        for target in selected
+    }
+    return _result(host, databases, [], pending=True)
+
+
 def _result(
     host: dict[str, Any],
     databases: dict[str, dict[str, Any]],
@@ -113,8 +143,8 @@ def _result(
         if pending
         else host["healthy"] and all(item["healthy"] for item in databases.values()),
         "host": host,
-        "databases": databases,
-        "errors": errors,
+        "databases": dict(databases),
+        "errors": list(errors),
     }
     if pending:
         value["pending"] = True
@@ -347,7 +377,7 @@ def _database_errors(
     errors: list[dict[str, str]],
 ) -> list[dict[str, str]]:
     values = list(errors)
-    if not observed["healthy"]:
+    if observed["health"] != "checking" and not observed["healthy"]:
         values.append(_error("database_unhealthy", target.identity, observed["health"]))
     return values
 
@@ -551,7 +581,7 @@ def backup_text(value: dict[str, Any]) -> str:
 
 def host_text(value: dict[str, Any]) -> str:
     if value.get("pending"):
-        return "checking backups"
+        return "checking"
     return "healthy" if value["host"]["healthy"] else "needs attention"
 
 

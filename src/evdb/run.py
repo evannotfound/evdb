@@ -4,10 +4,13 @@ import os
 import re
 import signal
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import IO
 
 from .errors import CommandError
@@ -17,6 +20,11 @@ _ANSI = re.compile(
     r"|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)"
     r"|\x1b[@-_]"
 )
+_CANCEL: ContextVar[Event | None] = ContextVar("evdb_run_cancel", default=None)
+
+
+class Cancelled(BaseException):
+    pass
 
 
 @dataclass(frozen=True)
@@ -43,6 +51,15 @@ def clean(text: str) -> str:
     )
 
 
+@contextmanager
+def cancellable(event: Event):
+    token = _CANCEL.set(event)
+    try:
+        yield
+    finally:
+        _CANCEL.reset(token)
+
+
 def run(
     args: Sequence[str],
     *,
@@ -62,6 +79,9 @@ def run(
     command = tuple(str(item) for item in args)
     if not command:
         raise CommandError("empty command")
+    cancel = _CANCEL.get()
+    if cancel is not None and cancel.is_set():
+        raise Cancelled
     command_env = {} if replace_env else os.environ.copy()
     if env:
         command_env.update({str(key): str(value) for key, value in env.items()})
@@ -88,7 +108,7 @@ def run(
         raise CommandError(f"command failed to start: {safe}: {exc}") from exc
 
     try:
-        out_data, err_data = process.communicate(input_data, timeout=timeout)
+        out_data, err_data = _communicate(process, input_data, timeout, cancel)
     except subprocess.TimeoutExpired as exc:
         _kill(process)
         process.communicate()
@@ -107,6 +127,28 @@ def run(
         detail = result.err.strip() or result.out.strip() or "no output"
         raise CommandError(f"command failed ({result.code}): {safe}: {detail}")
     return result
+
+
+def _communicate(
+    process: subprocess.Popen,
+    input_data: bytes | None,
+    timeout: int,
+    cancel: Event | None,
+):
+    if cancel is None:
+        return process.communicate(input_data, timeout=timeout)
+    deadline = time.monotonic() + timeout
+    pending_input = input_data
+    while True:
+        if cancel.is_set():
+            raise Cancelled
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        try:
+            return process.communicate(pending_input, timeout=min(0.1, remaining))
+        except subprocess.TimeoutExpired:
+            pending_input = None
 
 
 def _kill(process: subprocess.Popen) -> None:

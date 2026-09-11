@@ -1,13 +1,16 @@
 import json
+import sys
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import StringIO
+from threading import Event
 from urllib.parse import quote
 
 import pytest
 from rich.console import Console
 
-from evdb import cli, database, docker, host, status, ui
+from evdb import backup, cli, database, docker, host, status, ui
 from evdb.errors import BackupError, CommandError, DatabaseError
 from evdb.run import Result, clean
 
@@ -277,29 +280,124 @@ def test_terminal_status_updates_loading_backup_cells_in_place(config, monkeypat
     assert "Databases" not in text
 
 
-def test_guided_choice_starts_after_live_backup_update(config, monkeypatch):
-    output, _stream = _terminal()
+def test_guided_choice_starts_before_live_backup_update(config, monkeypatch):
+    output, stream = _terminal()
     final = _value()
-    partial = json.loads(json.dumps(final))
-    partial["pending"] = True
-    partial["healthy"] = None
-    partial["host"]["healthy"] = None
-    partial["databases"]["app-test-01/kv"]["latest_backup"]["state"] = "loading"
-    complete = False
+    partial = status.pending(config)
+    started = Event()
+    release = Event()
+    updated = Event()
+    prompts = []
 
     def collect(*args, preview=None, **kwargs):
-        nonlocal complete
         preview(partial)
-        complete = True
+        started.set()
+        assert release.wait(2)
+        preview(final)
+        updated.set()
         return final
 
     def input_fn(prompt):
-        assert complete
+        prompts.append(prompt)
+        assert started.wait(1)
+        assert not release.is_set()
+        release.set()
+        assert updated.wait(1)
         return "0"
 
     monkeypatch.setattr(status, "collect", collect)
 
     assert ui.run(config, input_fn=input_fn, output=output) == 0
+    assert prompts == ["Select: "]
+    assert "loading" in clean(stream.getvalue())
+    assert status.backup_text(final["databases"]["app-test-01/kv"]["latest_backup"]) in clean(
+        stream.getvalue()
+    )
+
+
+def test_guided_status_session_does_not_overlap_and_reuses_ttl(config):
+    final = _value()
+    calls = []
+    release = Event()
+    clock = [100.0]
+
+    def collect(*args, preview=None, **kwargs):
+        calls.append(len(calls) + 1)
+        preview(status.pending(config))
+        if len(calls) == 1:
+            assert release.wait(2)
+        return final
+
+    session = ui._StatusSession(config, collector=collect, clock=lambda: clock[0])
+    session.start()
+    session.start()
+    assert calls == [1]
+    release.set()
+    assert session.wait_database("app-test-01/kv")["health"] == "stopped"
+
+    session.start()
+    assert calls == [1]
+    updates = []
+    session.subscribe(updates.append)
+    clock[0] += 61
+    session.start()
+    deadline = time.monotonic() + 1
+    while len(calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    session.close()
+
+    assert calls == [1, 2]
+    assert all(value["databases"]["app-test-01/kv"]["health"] == "stopped" for value in updates)
+
+
+def test_guided_status_invalidation_forces_refresh(config):
+    calls = []
+
+    def collect(*args, preview=None, **kwargs):
+        calls.append(1)
+        return _value()
+
+    session = ui._StatusSession(config, collector=collect)
+    session.start()
+    assert session.wait_database("app-test-01/kv")["health"] == "stopped"
+    session.invalidate(config)
+    assert session.database("app-test-01/kv")["health"] == "checking"
+    session.start()
+    deadline = time.monotonic() + 1
+    while len(calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    session.close()
+
+    assert len(calls) == 2
+
+
+def test_guided_status_cancel_stops_active_command(config):
+    started = Event()
+
+    def collect(*args, **kwargs):
+        started.set()
+        from evdb.run import run
+
+        run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=30)
+
+    session = ui._StatusSession(config, collector=collect)
+    session.start()
+    assert started.wait(1)
+    before = time.monotonic()
+    session.cancel()
+
+    assert time.monotonic() - before < 2
+
+
+def test_guided_status_surfaces_unexpected_worker_failure(config):
+    session = ui._StatusSession(
+        config,
+        collector=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("worker bug")),
+    )
+
+    with pytest.raises(RuntimeError, match="worker bug"):
+        session.wait_host()
+    session.close()
 
 
 def test_explicit_lifecycle_executes_without_confirmation(config, monkeypatch):
@@ -441,6 +539,20 @@ def test_pending_backup_is_disabled_for_cache_database(config):
 
     assert status._pending_backup(target)["state"] == "loading"
     assert status._pending_backup(cache)["state"] == "disabled"
+
+
+def test_pending_status_uses_configured_order_without_probes(config, monkeypatch):
+    monkeypatch.setattr(
+        database,
+        "observe",
+        lambda *args: pytest.fail("pending status must not probe runtime"),
+    )
+
+    value = status.pending(config)
+
+    assert tuple(value["databases"]) == tuple(target.identity for target in config.databases)
+    assert value["healthy"] is None and value["pending"]
+    assert all(item["health"] == "checking" for item in value["databases"].values())
 
 
 def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
@@ -616,6 +728,45 @@ def test_backup_all_returns_nonzero_after_reporting_every_failure(config, monkey
     assert code == 1
     assert len(output) == 2
     assert "postgres" in output[0] and "kv" in output[1]
+
+
+def test_guided_backup_creation_restarts_background_refresh(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    events = []
+
+    class Session:
+        def cancel(self):
+            events.append("cancel")
+
+        def invalidate(self, current):
+            assert current is config
+            events.append("invalidate")
+
+        def start(self):
+            events.append("start")
+
+    monkeypatch.setattr(
+        backup,
+        "create",
+        lambda *args: {
+            "backup": "backup-1",
+            "finished": "2026-08-21T12:00:00Z",
+            "snapshot": "snapshot-1",
+            "repository": config.host.backup.repository,
+        },
+    )
+    answers = iter(["1", "0"])
+
+    result = ui._backups(
+        config,
+        target,
+        lambda prompt: next(answers),
+        lambda value: None,
+        session=Session(),
+    )
+
+    assert result is config
+    assert events == ["invalidate", "start"]
 
 
 def test_status_uses_newest_confirmed_remote_snapshot(config, monkeypatch):
@@ -827,6 +978,53 @@ def test_guided_connection_does_not_collect_database_info(config, monkeypatch):
     connection = output[output.index("Connection") + 1]
     assert target.credentials.password in connection
     assert target.credentials.http_token in connection
+
+
+def test_pending_database_opens_connection_without_waiting(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    session = ui._StatusSession(
+        config,
+        collector=lambda *args, **kwargs: pytest.fail("connection must not wait for status"),
+    )
+    choices = iter(["2", "0"])
+    output = []
+
+    result = ui._database(
+        config,
+        target.identity,
+        lambda prompt: next(choices),
+        output.append,
+        initial=session.database(target.identity),
+        session=session,
+    )
+    session.close()
+
+    assert result is config
+    text = "\n".join(output)
+    assert "Status: checking" in text
+    assert "4. Start/Stop" in text
+    assert target.credentials.password in text
+
+
+def test_pending_lifecycle_waits_for_selected_runtime(config, monkeypatch):
+    target = config.select("app-test-01/kv")
+    final = _value()
+    calls = []
+    monkeypatch.setattr(database, "start", lambda *args: calls.append("start"))
+    session = ui._StatusSession(config, collector=lambda *args, **kwargs: final)
+    choices = iter(["4", "0"])
+
+    ui._database(
+        config,
+        target.identity,
+        lambda prompt: next(choices),
+        lambda value: None,
+        initial=session.database(target.identity),
+        session=session,
+    )
+    session.close()
+
+    assert calls == ["start"]
 
 
 def test_direct_terminal_info_includes_backup_summary(config, monkeypatch):

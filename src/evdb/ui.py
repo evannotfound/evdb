@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 from contextlib import contextmanager
 from getpass import getpass
+from threading import Condition, Event, Thread
 from typing import IO, Any
 
 from rich.console import Console, Group
@@ -15,9 +17,164 @@ from rich.text import Text
 
 from .errors import Error
 from .models import Config, Database
-from .run import clean
+from .run import Cancelled, cancellable, clean
 
 _PROMPT_DEFAULT = re.compile(r"\[([^]]+)](?=\s*:?[ ]*$)")
+_STATUS_TTL = 60
+
+
+class _StatusSession:
+    def __init__(self, config: Config, *, collector=None, clock=time.monotonic):
+        from . import status
+
+        self.config = config
+        self._collector = collector or status.collect
+        self._clock = clock
+        self._condition = Condition()
+        self._value = status.pending(config)
+        self._finished: float | None = None
+        self._thread: Thread | None = None
+        self._cancel: Event | None = None
+        self._generation = 0
+        self._callback = None
+        self._error: BaseException | None = None
+
+    @property
+    def value(self) -> dict[str, Any]:
+        with self._condition:
+            return self._value
+
+    def subscribe(self, callback) -> None:
+        with self._condition:
+            self._callback = callback
+            value = self._value
+        if callback is not None:
+            callback(value)
+
+    def start(self) -> None:
+        with self._condition:
+            if self._thread is not None:
+                return
+            if self._finished is not None and self._clock() - self._finished < _STATUS_TTL:
+                return
+            self._generation += 1
+            generation = self._generation
+            cancel = Event()
+            self._cancel = cancel
+            self._error = None
+            thread = Thread(
+                target=self._refresh,
+                args=(generation, cancel),
+                name="evdb-status",
+            )
+            self._thread = thread
+            thread.start()
+
+    def database(self, identity: str) -> dict[str, Any]:
+        with self._condition:
+            return self._value["databases"][identity]
+
+    def wait_database(self, identity: str) -> dict[str, Any] | None:
+        self.start()
+        with self._condition:
+            while self._value["databases"][identity]["health"] == "checking":
+                self._raise_error()
+                if self._thread is None:
+                    return None
+                self._condition.wait()
+            self._raise_error()
+            return self._value["databases"][identity]
+
+    def wait_host(self) -> dict[str, Any] | None:
+        self.start()
+        with self._condition:
+            while "infrastructure" not in self._value["host"]:
+                self._raise_error()
+                if self._thread is None:
+                    return None
+                self._condition.wait()
+            self._raise_error()
+            return self._value
+
+    def invalidate(self, config: Config | None = None) -> None:
+        from . import status
+
+        self.cancel()
+        with self._condition:
+            if config is not None:
+                self.config = config
+            self._value = status.pending(self.config)
+            self._finished = None
+            self._error = None
+
+    def cancel(self) -> None:
+        with self._condition:
+            thread = self._thread
+            cancel = self._cancel
+            if thread is None:
+                return
+            self._generation += 1
+        if cancel is not None:
+            cancel.set()
+        thread.join()
+        with self._condition:
+            if self._thread is thread:
+                self._thread = None
+                self._cancel = None
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        self.subscribe(None)
+        self.cancel()
+
+    def raise_error(self) -> None:
+        with self._condition:
+            self._raise_error()
+
+    def _refresh(self, generation: int, cancel: Event) -> None:
+        try:
+            with cancellable(cancel):
+                value = self._collector(
+                    self.config,
+                    preview=lambda current: self._preview(generation, current),
+                )
+            self._publish(generation, value, finished=True)
+        except Cancelled:
+            pass
+        except BaseException as exc:
+            with self._condition:
+                if generation == self._generation:
+                    self._error = exc
+                    self._condition.notify_all()
+        finally:
+            with self._condition:
+                if generation == self._generation:
+                    self._thread = None
+                    self._cancel = None
+                    self._condition.notify_all()
+
+    def _publish(self, generation: int, value: dict[str, Any], *, finished=False) -> None:
+        with self._condition:
+            if generation != self._generation:
+                return
+            self._value = value
+            if finished:
+                self._finished = self._clock()
+            callback = self._callback
+            self._condition.notify_all()
+        if callback is not None:
+            callback(value)
+
+    def _preview(self, generation: int, value: dict[str, Any]) -> None:
+        with self._condition:
+            complete = not self._value.get("pending", False)
+        if complete and value.get("pending") and "infrastructure" not in value["host"]:
+            return
+        self._publish(generation, value)
+
+    def _raise_error(self) -> None:
+        if self._error is not None:
+            raise self._error
 
 
 class Terminal:
@@ -147,7 +304,7 @@ def _state_style(value: str) -> str | None:
         return "yellow"
     if value in {"unhealthy", "failed", "missing", "missing or unsafe"}:
         return "red"
-    if value in {"checking backups", "loading"}:
+    if value in {"checking", "loading"}:
         return "cyan"
     return None
 
@@ -320,6 +477,15 @@ def _status_table(value: dict[str, Any], *, guided: bool, width: int):
     return Group(*renderables)
 
 
+def _root_view(value: dict[str, Any], options: list[tuple[str, str]], *, width: int):
+    return Group(
+        _status_table(value, guided=True, width=width),
+        Text(""),
+        Text("\n".join(f"{key}. {label}" for key, label in options)),
+        Text(""),
+    )
+
+
 def run(
     config: Config,
     *,
@@ -328,41 +494,82 @@ def run(
     password_fn=read_secret,
 ) -> int:
     current = config
-    while True:
-        value, rendered = check_status(output, current, guided=True)
-        if not rendered:
-            width = output.console.width if isinstance(output, Terminal) else None
-            _screen(
-                output,
-                overview(value, width=width),
-                heading="Databases",
-                states=_overview_states(value),
-                bold_lines=(0, 2),
-            )
-        rows = {str(index) for index, _identity in enumerate(value["databases"], 1)}
-        add = len(rows) + 1
-        host = add + 1
-        options = [(str(add), "Add database"), (str(host), "Host"), ("0", "Exit")]
-        _options(output, options)
-        choice = _choice(input_fn, output, "Select", rows | {key for key, _label in options})
-        if choice in {None, "0"}:
-            return 0
-        try:
-            if int(choice) <= len(value["databases"]):
-                identity = tuple(value["databases"])[int(choice) - 1]
-                current = _database(
-                    current,
-                    identity,
-                    input_fn,
-                    output,
-                    initial=value["databases"][identity],
-                )
-            elif int(choice) == add:
-                current = _add(current, input_fn, output, password_fn)
+    session = _StatusSession(config)
+    try:
+        while True:
+            if current != session.config:
+                session.invalidate(current)
+            rows = {str(index) for index, _target in enumerate(current.databases, 1)}
+            add = len(rows) + 1
+            host = add + 1
+            options = [(str(add), "Add database"), (str(host), "Host"), ("0", "Exit")]
+            allowed = rows | {key for key, _label in options}
+            live = _live_enabled(output)
+            if live:
+                width = output.console.width
+                with output.live(_root_view(session.value, options, width=width)) as update:
+                    session.subscribe(
+                        lambda value, options=options, width=width: update(
+                            _root_view(value, options, width=width)
+                        )
+                    )
+                    session.start()
+                    output.console.show_cursor(True)
+                    choice = _choice(input_fn, output, "Select", allowed)
+                    session.subscribe(None)
+                value = session.value
             else:
-                _host(current, value, input_fn, output)
-        except Error as exc:
-            _screen(output, f"evdb: {exc}", heading="Error", error=True)
+                value, rendered = check_status(output, current, guided=True)
+                if not rendered:
+                    _screen(
+                        output,
+                        overview(value),
+                        heading="Databases",
+                        states=_overview_states(value),
+                        bold_lines=(0, 2),
+                    )
+                _options(output, options)
+                choice = _choice(input_fn, output, "Select", allowed)
+            session.raise_error()
+            if choice in {None, "0"}:
+                return 0
+            try:
+                if int(choice) <= len(current.databases):
+                    identity = current.databases[int(choice) - 1].identity
+                    current = _database(
+                        current,
+                        identity,
+                        input_fn,
+                        output,
+                        initial=value["databases"][identity],
+                        session=session if live else None,
+                    )
+                elif int(choice) == add:
+                    current = _add(
+                        current,
+                        input_fn,
+                        output,
+                        password_fn,
+                        session=session if live else None,
+                    )
+                else:
+                    if live:
+                        with loading(output, "Checking host"):
+                            host_value = session.wait_host()
+                    else:
+                        host_value = value
+                    if host_value is not None:
+                        _host(
+                            current,
+                            host_value,
+                            input_fn,
+                            output,
+                            session=session if live else None,
+                        )
+            except Error as exc:
+                _screen(output, f"evdb: {exc}", heading="Error", error=True)
+    finally:
+        session.close()
 
 
 def _database(
@@ -372,6 +579,7 @@ def _database(
     output,
     *,
     initial: dict[str, Any] | None = None,
+    session: _StatusSession | None = None,
 ) -> Config:
     from . import database
 
@@ -380,15 +588,19 @@ def _database(
     initial_error = initial.get("error") if initial and initial.get("running") is None else None
     while True:
         target = current.select(identity)
-        local_error = initial_error
+        local_error = initial_error or (
+            observed.get("error") if observed and observed.get("running") is None else None
+        )
         initial_error = None
         if observed is None:
-            try:
-                with loading(output, f"Checking {identity}"):
-                    observed = database.observe(current, target)
-            except Error as exc:
-                observed = {"running": False, "healthy": False, "health": "unknown"}
-                local_error = clean(str(exc))
+            observed = session.database(identity) if session is not None else None
+            if observed is None:
+                try:
+                    with loading(output, f"Checking {identity}"):
+                        observed = database.observe(current, target)
+                except Error as exc:
+                    observed = {"running": False, "healthy": False, "health": "unknown"}
+                    local_error = clean(str(exc))
         summary = {
             "Database": target.identity,
             "Engine": target.engine,
@@ -405,7 +617,13 @@ def _database(
             if _state_style(observed["health"])
             else (),
         )
-        state_action = "Stop" if observed["running"] else "Start"
+        state_action = (
+            "Start/Stop"
+            if observed["health"] == "checking"
+            else "Stop"
+            if observed["running"]
+            else "Start"
+        )
         options = [
             ("1", "Details"),
             ("2", "Connection"),
@@ -422,6 +640,9 @@ def _database(
             return current
         try:
             if choice == "1":
+                observed = _runtime(current, target, observed, output, session)
+                if session is not None:
+                    session.cancel()
                 with loading(output, f"Loading {identity} details") as update:
                     value = database.info(
                         current,
@@ -441,7 +662,11 @@ def _database(
             elif choice == "3":
                 values = _settings(target, input_fn, output)
                 if values is not None:
+                    if session is not None:
+                        session.invalidate(current)
                     current = database.configure(current, target, values)
+                    if session is not None:
+                        session.invalidate(current)
                     _screen(
                         output,
                         f"{identity} settings saved and healthy",
@@ -449,14 +674,20 @@ def _database(
                         states=(("healthy", "green"),),
                     )
             elif choice == "4":
+                observed = _runtime(current, target, observed, output, session)
+                action = "Stop" if observed["running"] else "Start"
+                if session is not None:
+                    session.invalidate(current)
                 (database.stop if observed["running"] else database.start)(current, target)
                 _screen(
                     output,
-                    f"{identity}: {state_action.lower()} complete",
-                    heading=state_action,
+                    f"{identity}: {action.lower()} complete",
+                    heading=action,
                     states=(("complete", "green"),),
                 )
             elif choice == "5":
+                if session is not None:
+                    session.invalidate(current)
                 database.restart(current, target)
                 _screen(
                     output,
@@ -465,7 +696,7 @@ def _database(
                     states=(("complete", "green"),),
                 )
             elif choice == "6":
-                current = _backups(current, target, input_fn, output)
+                current = _backups(current, target, input_fn, output, session=session)
             else:
                 with loading(output, f"Loading {identity} logs"):
                     text = database.logs(current, target)
@@ -477,10 +708,37 @@ def _database(
                 heading=f"{target.identity} error",
                 error=True,
             )
-        observed = None
+        observed = session.database(identity) if session is not None else None
 
 
-def _add(config: Config, input_fn, output, password_fn) -> Config:
+def _runtime(
+    config: Config,
+    target: Database,
+    observed: dict[str, Any],
+    output,
+    session: _StatusSession | None,
+) -> dict[str, Any]:
+    if observed["health"] != "checking":
+        return observed
+    if session is not None:
+        with loading(output, f"Checking {target.identity}"):
+            value = session.wait_database(target.identity)
+        if value is not None:
+            return value
+    from . import database
+
+    with loading(output, f"Checking {target.identity}"):
+        return database.observe(config, target)
+
+
+def _add(
+    config: Config,
+    input_fn,
+    output,
+    password_fn,
+    *,
+    session: _StatusSession | None = None,
+) -> Config:
     from . import database
 
     project = _text(input_fn, "Project")
@@ -556,6 +814,8 @@ def _add(config: Config, input_fn, output, password_fn) -> Config:
     )
     if not _yes(input_fn, "Create? [y/N] "):
         return config
+    if session is not None:
+        session.invalidate(config)
     updated = database.add(
         config,
         project,
@@ -566,6 +826,8 @@ def _add(config: Config, input_fn, output, password_fn) -> Config:
         database_name=database_name,
         data_root=data_root,
     )
+    if session is not None:
+        session.invalidate(updated)
     _screen(
         output,
         f"{project}/{role} is healthy",
@@ -604,7 +866,14 @@ def _settings(target: Database, input_fn, output) -> dict[str, Any] | None:
     return values if _yes(input_fn, "Save? [y/N] ") else None
 
 
-def _backups(config: Config, target: Database, input_fn, output) -> Config:
+def _backups(
+    config: Config,
+    target: Database,
+    input_fn,
+    output,
+    *,
+    session: _StatusSession | None = None,
+) -> Config:
     from . import backup
 
     if not target.durable:
@@ -617,8 +886,12 @@ def _backups(config: Config, target: Database, input_fn, output) -> Config:
             return config
         try:
             if choice == "1":
+                if session is not None:
+                    session.invalidate(config)
                 with loading(output, f"Creating {target.identity} backup"):
                     result = backup.create(config, target)
+                if session is not None:
+                    session.start()
                 _screen(
                     output,
                     f"{target.identity}: backup {result['backup']} completed "
@@ -628,6 +901,8 @@ def _backups(config: Config, target: Database, input_fn, output) -> Config:
                     states=(("completed", "green"),),
                 )
             else:
+                if session is not None:
+                    session.cancel()
                 with loading(output, f"Loading {target.identity} backup history"):
                     rows = backup.history(config, target)
                 _screen(output, backup_history(rows), heading="Backup history")
@@ -640,7 +915,14 @@ def _backups(config: Config, target: Database, input_fn, output) -> Config:
             )
 
 
-def _host(config: Config, value: dict[str, Any], input_fn, output) -> None:
+def _host(
+    config: Config,
+    value: dict[str, Any],
+    input_fn,
+    output,
+    *,
+    session: _StatusSession | None = None,
+) -> None:
     host = value["host"]
     infrastructure = host["infrastructure"]
     errors = [
@@ -718,6 +1000,8 @@ def _host(config: Config, value: dict[str, Any], input_fn, output) -> None:
         return
     from . import host as host_module
 
+    if session is not None:
+        session.invalidate(config)
     with loading(output, "Restarting Traefik traffic"):
         host_module.restart_traffic(config)
     _screen(

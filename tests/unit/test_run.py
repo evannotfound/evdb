@@ -1,11 +1,14 @@
 import os
 import sys
+import time
+from pathlib import Path
+from threading import Event, Thread
 from urllib.parse import quote
 
 import pytest
 
 from evdb.errors import CommandError
-from evdb.run import clean, redact, run
+from evdb.run import Cancelled, cancellable, clean, redact, run
 
 
 def test_run_uses_argument_arrays_and_captures_output():
@@ -101,3 +104,35 @@ def test_run_forwards_numeric_identity_and_groups(monkeypatch):
     assert seen["kwargs"]["user"] == 1001
     assert seen["kwargs"]["group"] == 1002
     assert seen["kwargs"]["extra_groups"] == (1003, 1004)
+
+
+def test_cancellable_run_kills_process_group(tmp_path):
+    child = tmp_path / "child.pid"
+    cancel = Event()
+    trigger = Thread(target=lambda: (time.sleep(0.2), cancel.set()))
+    trigger.start()
+    started = time.monotonic()
+
+    with pytest.raises(Cancelled), cancellable(cancel):
+        run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib,subprocess,sys,time; "
+                    "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+                    "time.sleep(30)"
+                ),
+                str(child),
+            ],
+            timeout=30,
+        )
+    trigger.join()
+
+    assert time.monotonic() - started < 2
+    child_pid = int(child.read_text())
+    deadline = time.monotonic() + 2
+    while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not Path(f"/proc/{child_pid}").exists()
