@@ -17,9 +17,13 @@ TRAEFIK_PROJECT = "evdb-traefik"
 TRAEFIK_CONTAINER = "evdb-traefik"
 
 
-def state(name: str, *, timeout: int = 30, health: bool = False) -> dict[str, Any]:
+def state(
+    name: str, *, timeout: int = 30, health: bool = False, ports: bool = False
+) -> dict[str, Any]:
     result = run(["docker", "inspect", name], timeout=timeout, check=False)
     value = {"running": False, "healthy": False if health else None, "image": None}
+    if ports:
+        value["ports"] = {}
     if result.code != 0:
         detail = result.err.strip() or result.out.strip() or "no output"
         lowered = detail.lower()
@@ -43,9 +47,25 @@ def state(name: str, *, timeout: int = 30, health: bool = False) -> dict[str, An
             value["healthy"] = (
                 value["running"] and current.get("Health", {}).get("Status") == "healthy"
             )
-    except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
+        if ports:
+            value["ports"] = published_ports(item)
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError, ValueError) as exc:
         raise CommandError(f"invalid Docker inspection for {name}") from exc
     return value
+
+
+def published_ports(item: dict[str, Any]) -> dict[int, str]:
+    if (item["Config"].get("Labels") or {}).get("com.docker.compose.project") != TRAEFIK_PROJECT:
+        raise ConfigError(f"existing {TRAEFIK_CONTAINER} is not an evdb Traefik container")
+    if not item["State"]["Running"]:
+        return {}
+    return {
+        int(binding["HostPort"]): target
+        for target, bindings in item["NetworkSettings"]["Ports"].items()
+        if target.endswith("/tcp")
+        for binding in bindings or []
+        if binding["HostIp"] in {"0.0.0.0", ""}
+    }
 
 
 def exec(

@@ -410,6 +410,11 @@ def _database_value(
 
 
 def _infrastructure(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
+    routing = config.host.routing
+    ports = {
+        **dict.fromkeys(routing.postgres_ports, "5432/tcp"),
+        **dict.fromkeys(routing.kv_ports, "6379/tcp"),
+    }
     network_ok = None
     try:
         network = run(["docker", "network", "inspect", docker.NETWORK], timeout=10, check=False)
@@ -428,15 +433,19 @@ def _infrastructure(config: Config, errors: list[dict[str, str]]) -> dict[str, A
         errors.append(_error("network_assessment_failed", "host/network", _message(config, exc)))
     proxy = {"running": None, "healthy": None, "image": None}
     try:
-        proxy = docker.state(docker.TRAEFIK_CONTAINER, timeout=10, health=True)
-        traefik_ok = bool(proxy["running"] and proxy["healthy"])
+        proxy = docker.state(docker.TRAEFIK_CONTAINER, timeout=10, health=True, ports=True)
+        traefik_ok = bool(
+            proxy["running"]
+            and proxy["healthy"]
+            and all(proxy["ports"].get(port) == target for port, target in ports.items())
+        )
     except (Error, OSError) as exc:
         traefik_ok = None
         errors.append(_error("traefik_assessment_failed", "host/traefik", _message(config, exc)))
     try:
-        listeners = _listeners()
+        listeners = _listeners(tuple(ports))
     except (Error, OSError) as exc:
-        listeners = {"5432": None, "6379": None}
+        listeners = {str(port): None for port in ports}
         errors.append(_error("listener_assessment_failed", "host/listeners", _message(config, exc)))
     try:
         from .host import certificate_ready
@@ -469,13 +478,13 @@ def _infrastructure(config: Config, errors: list[dict[str, str]]) -> dict[str, A
     return values
 
 
-def _listeners() -> dict[str, bool]:
+def _listeners(ports: tuple[int, ...]) -> dict[str, bool]:
     result = run(["ss", "-H", "-ltn"], timeout=10, check=False)
     if result.code:
         detail = result.err.strip() or result.out.strip() or "no output"
         raise CommandError(f"listener inspection failed ({result.code}): {detail}")
     text = result.out
-    return {str(port): f":{port} " in text or f":{port}\n" in text for port in (5432, 6379)}
+    return {str(port): f":{port} " in text or f":{port}\n" in text for port in ports}
 
 
 def _timer(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:

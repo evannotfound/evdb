@@ -50,6 +50,18 @@ def parser() -> argparse.ArgumentParser:
         help="allowed database data root; repeat to configure more than one",
     )
     init.add_argument("--acme-email", metavar="EMAIL", help="ACME account email")
+    for protocol in ("postgres", "kv"):
+        init.add_argument(
+            f"--{protocol}-port",
+            dest=f"{protocol}_ports",
+            metavar="PORT",
+            action="append",
+            type=int,
+            help=(
+                "complete native port list; repeat in preferred order; "
+                "omission uses defaults or preserves configured ports"
+            ),
+        )
     init.add_argument("--dns-provider", metavar="PROVIDER", help="cataloged lego provider code")
     init.add_argument(
         "--repository", metavar="REPOSITORY", help="rclone:REMOTE:PATH or absolute local path"
@@ -157,6 +169,8 @@ def main(
                     "host_id",
                     "domain",
                     "data_roots",
+                    "postgres_ports",
+                    "kv_ports",
                     "acme_email",
                     "dns_provider",
                     "repository",
@@ -424,6 +438,16 @@ def _init_host(result: dict, input_fn, output) -> None:
             raise KeyboardInterrupt
         result[name] = value
     _init_data_roots(result, input_fn, output)
+    for name, label, default in (
+        ("postgres_ports", "Postgres ports", (5432,)),
+        ("kv_ports", "KV ports", (6379,)),
+    ):
+        if name in result:
+            continue
+        ports = ui.ask_ports(input_fn, output, label, default)
+        if ports is None:
+            raise KeyboardInterrupt
+        result[name] = list(ports)
 
 
 def _init_data_roots(result: dict, input_fn, output) -> None:
@@ -616,6 +640,7 @@ def _init_review(result: dict) -> str:
             "Host": result["host_id"],
             "Base domain": result["domain"],
             "Database data roots": "\n".join(result["data_roots"]),
+            **ui.port_summary(result["postgres_ports"], result["kv_ports"]),
             "Wildcard": f"*.{result['host_id']}.{result['domain']}",
             "ACME email": result["acme_email"],
             "DNS provider": result["dns_provider"],
@@ -640,6 +665,7 @@ def _edit_init(result: dict, input_fn, output) -> None:
         ("5", "DNS provider and credentials", ("dns_provider", "dns", "dns_file")),
         ("6", "Backup repository", ("repository", "rclone_config")),
         ("7", "Restic password", ("restic_password", "restic_password_file")),
+        ("8", "Native ports", ("postgres_ports", "kv_ports")),
     )
     selected = ui.choose(
         input_fn,

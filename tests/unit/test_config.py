@@ -55,6 +55,41 @@ def test_postgres_identity_is_required_without_compatibility_defaults(config):
         load(config.paths.source, paths=config.paths)
 
 
+def test_native_ports_default_without_rewriting_source(config):
+    before = config.paths.source.read_bytes()
+    loaded = load(config.paths.source, paths=config.paths)
+    assert loaded.host.routing.postgres_ports == (5432,)
+    assert loaded.host.routing.kv_ports == (6379,)
+    assert config.paths.source.read_bytes() == before
+
+
+def test_native_ports_preserve_order_and_preferred_port(config):
+    routing = replace(config.host.routing, postgres_ports=(15432, 5432), kv_ports=(16379, 6379))
+    updated = replace(config, host=replace(config.host, routing=routing))
+    write(updated, secrets=False)
+    loaded = load(config.paths.source, paths=config.paths)
+    assert loaded.host.routing == routing
+    assert loaded.select("app-test-01/postgres").port == 15432
+    assert loaded.select("app-test-01/kv").port == 16379
+
+
+@pytest.mark.parametrize(
+    "ports", [[], [True], ["5432"], [0], [65536], [80], [443], [5432, 5432], 5432]
+)
+def test_invalid_native_port_lists(config, ports):
+    data = as_dict(config)
+    data["host"]["routing"]["postgres_ports"] = ports
+    config.paths.source.write_text(yaml.safe_dump(data))
+    with pytest.raises(ConfigError, match="host.routing.postgres_ports"):
+        load(config.paths.source, paths=config.paths)
+
+
+def test_native_ports_cannot_overlap_protocols(config):
+    routing = replace(config.host.routing, postgres_ports=(6379,))
+    with pytest.raises(ConfigError, match="must not overlap"):
+        require_valid(replace(config, host=replace(config.host, routing=routing)))
+
+
 def test_data_roots_are_required_without_compatibility_default(config):
     text = config.paths.source.read_text().replace(
         f"  data_roots:\n  - {config.paths.databases}\n", ""

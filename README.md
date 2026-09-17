@@ -18,7 +18,9 @@ It manages the infrastructure around them:
 ## Before you install
 
 evdb requires a Linux server with systemd and root access. Ubuntu is the tested path. Native database
-connections use ports `5432` and `6379`, which must be free on the host and reachable by your clients.
+connections default to ports `5432` and `6379`. You can select alternate or multiple ports during setup
+or later through **Host → Native ports**. Selected ports must be free (or already owned by evdb) and
+reachable by your clients; evdb does not configure firewalls.
 
 Install these prerequisites using their official instructions:
 
@@ -89,6 +91,69 @@ the Restic repository before enabling automatic backups.
 
 Initialization stores configuration under `/etc/evdb`, managed data under `/var/lib/evdb`, starts the
 TLS router, initializes the Restic repository, and enables automatic daily backups.
+
+## Run alongside an existing database stack
+
+Start guided setup on free alternate ports while the existing router keeps `5432` and `6379`:
+
+```sh
+sudo evdb init --postgres-port 15432 --kv-port 16379
+```
+
+Non-interactive initialization also requires the other host setup arguments. On a configured host,
+each repeated port flag supplies the **complete replacement list** for its protocol, in preferred
+order. Omitted flags preserve that protocol's current ports; `init --yes` without port flags preserves
+both lists. The first port appears in connection URLs. Guided setup and **Host → Native ports** accept
+comma-separated lists instead. All ports in a protocol's list reach the same database selected by its
+evdb hostname; internal database ports remain unchanged.
+
+Prepare the evdb databases and transfer data separately. Keep separate data directories while both
+stacks run. For each database, pause writers, perform and verify the final transfer, then switch all
+its native and HTTP clients before resuming writes. Port coexistence does not synchronize databases.
+Use the evdb hostname `<project>.<host-id>.<base-domain>` and the temporary port reported by
+`database info`; this feature does not preserve legacy native hostnames.
+
+Once all native clients have left the old router, stop it to release the standard ports. Add them to
+evdb while keeping temporary ports available:
+
+```sh
+sudo evdb init --postgres-port 15432 --postgres-port 5432 --kv-port 16379 --kv-port 6379
+```
+
+Prefer standard ports in new connection details, then move existing clients back gradually:
+
+```sh
+sudo evdb init --postgres-port 5432 --postgres-port 15432 --kv-port 6379 --kv-port 16379
+```
+
+After all clients use the standard ports, remove the temporary bindings:
+
+```sh
+sudo evdb init --postgres-port 5432 --kv-port 6379
+```
+
+Adding or removing bindings recreates the Traefik container and briefly drops native connections;
+clients must reconnect. Database and HTTP gateway containers keep running. Reordering an unchanged
+port set only changes the preferred connection port and does not itself recreate the router.
+An occupied requested port is rejected before the configuration is saved.
+
+## Redis HTTP with an external reverse proxy
+
+KV creation enables `hiett/serverless-redis-http` by default for both Redis and Dragonfly. Run
+`sudo evdb database info PROJECT/kv` to obtain its intended HTTPS URL, localhost gateway address, and
+HTTP token. Configure your external reverse proxy to forward the public hostname to the reported
+`http://127.0.0.1:<port>` address. A containerized proxy must be able to reach the host's loopback
+interface, as with a host-networked Nginx Proxy Manager deployment.
+
+Nginx Proxy Manager can keep owning ports **80 and 443**, the public HTTP hostname, and its certificate.
+evdb's Traefik only handles native database traffic and obtains its certificates through DNS-01.
+The optional KV `http.domain` configuration records the intended public hostname; it does not configure
+the reverse proxy automatically.
+
+At a KV data cutover, update the existing proxy host's upstream to the new gateway address. Existing
+HTTP clients can keep their public URL, but their token must also be handled: evdb generates a new HTTP
+token by default, so preserving the old token or updating clients is a separate migration step.
+Changes to native Postgres/KV port lists do not change HTTP URLs, loopback ports, or tokens.
 
 ## Create your first database
 

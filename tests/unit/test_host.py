@@ -164,6 +164,8 @@ def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_pa
         "dns_provider": "cloudflare",
         "repository": str(tmp_path / "repository"),
         "dns_file": str(dns),
+        "postgres_ports": [15432],
+        "kv_ports": [16379],
     }
     monkeypatch.setattr(host, "prerequisites", lambda current=None: [])
     monkeypatch.setattr(host, "_require_ports", lambda current: None)
@@ -192,6 +194,8 @@ def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_pa
 
     assert value["host"]["id"] == "new-test-01"
     assert paths.source.is_file()
+    assert host.load(paths.source, paths=paths).host.routing.postgres_ports == (15432,)
+    assert host.load(paths.source, paths=paths).host.routing.kv_ports == (16379,)
     assert paths.secrets.stat().st_mode & 0o777 == 0o600
     assert output == [
         "Waiting for wildcard certificate *.new-test-01.storage.example.com",
@@ -648,6 +652,12 @@ def test_ports_accept_running_owned_traefik_without_socket_probe(config, monkeyp
             {
                 "Config": {"Labels": {"com.docker.compose.project": "evdb-traefik"}},
                 "State": {"Running": True},
+                "NetworkSettings": {
+                    "Ports": {
+                        "5432/tcp": [{"HostIp": "0.0.0.0", "HostPort": "5432"}],
+                        "6379/tcp": [{"HostIp": "0.0.0.0", "HostPort": "6379"}],
+                    }
+                },
             }
         ]
     )
@@ -756,3 +766,131 @@ def test_first_init_dns_file_rejects_duplicate_keys(tmp_path):
 
     with pytest.raises(host.HostError, match="duplicate key: TOKEN"):
         host._env_file(source)
+
+
+def test_dual_port_rendering_is_stable_on_reorder_and_removes_old_ports(config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(host.docker, "validate_compose", lambda *a, **kw: None)
+    monkeypatch.setattr(host.docker, "up", lambda path, project, **kw: calls.append(project))
+    routing = replace(config.host.routing, postgres_ports=(15432, 5432), kv_ports=(16379, 6379))
+    config = replace(config, host=replace(config.host, routing=routing))
+    host._traefik(config)
+    compose = config.paths.traefik / "compose.yaml"
+    before = compose.read_bytes()
+    service = yaml.safe_load(before)["services"]["traefik"]
+    assert service["ports"] == [
+        "5432:5432/tcp",
+        "15432:5432/tcp",
+        "6379:6379/tcp",
+        "16379:6379/tcp",
+    ]
+    assert "--entrypoints.postgres.address=:5432" in service["command"]
+    assert "--entrypoints.kv.address=:6379" in service["command"]
+
+    routing = replace(routing, postgres_ports=(5432, 15432), kv_ports=(6379, 16379))
+    host._traefik(replace(config, host=replace(config.host, routing=routing)))
+    assert compose.read_bytes() == before
+
+    routing = replace(routing, postgres_ports=(5432,), kv_ports=(6379,))
+    host._traefik(replace(config, host=replace(config.host, routing=routing)))
+    assert yaml.safe_load(compose.read_text())["services"]["traefik"]["ports"] == [
+        "5432:5432/tcp",
+        "6379:6379/tcp",
+    ]
+    assert calls == ["evdb-traefik"] * 3
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_alternate_ports_coexist_and_new_occupied_port_is_checked(config, monkeypatch, running):
+    routing = replace(config.host.routing, postgres_ports=(15432,), kv_ports=(16379,))
+    config = replace(config, host=replace(config.host, routing=routing))
+    inspected = [
+        {
+            "Config": {"Labels": {"com.docker.compose.project": "evdb-traefik"}},
+            "State": {"Running": running},
+            "NetworkSettings": {
+                "Ports": {
+                    "5432/tcp": [{"HostIp": "0.0.0.0", "HostPort": "15432"}],
+                    "6379/tcp": [{"HostIp": "0.0.0.0", "HostPort": "16379"}],
+                }
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        host, "run", lambda args, **kw: Result(tuple(args), 0, json.dumps(inspected), "")
+    )
+    binds = []
+
+    class Socket:
+        def bind(self, address):
+            binds.append(address[1])
+            if address[1] in {5432, 6379}:
+                raise OSError("address in use")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(host.socket, "socket", Socket)
+    host._require_ports(config)
+    assert binds == ([] if running else [15432, 16379])
+    routing = replace(routing, postgres_ports=(15432, 5432))
+    with pytest.raises(host.HostError, match="port 5432 is occupied"):
+        host._require_ports(replace(config, host=replace(config.host, routing=routing)))
+
+
+def test_port_refresh_preserves_projects_secrets_and_omitted_lists(config, tmp_path, monkeypatch):
+    from evdb.config import load, write
+
+    routing = replace(config.host.routing, postgres_ports=(15432,), kv_ports=(16379,))
+    config = replace(config, host=replace(config.host, routing=routing))
+    write(config)
+    secret_bytes = config.paths.secrets.read_bytes()
+    calls = []
+    monkeypatch.setattr(host, "prerequisites", lambda current: [])
+    monkeypatch.setattr(host, "_require_ports", lambda current: calls.append(current.host.routing))
+    monkeypatch.setattr(host, "_source_ownership", lambda current: None)
+    monkeypatch.setattr(host, "_traefik", lambda current: calls.append("router"))
+    monkeypatch.setattr(host, "certificate_ready", lambda current: True)
+    monkeypatch.setattr(host.docker, "ensure_network", lambda **kw: None)
+    monkeypatch.setattr(host.docker, "up", lambda *a, **kw: pytest.fail("database must not start"))
+    monkeypatch.setattr(host.backup, "initialize", lambda current: None)
+    monkeypatch.setattr(host, "_install_units", lambda target: None)
+    monkeypatch.setattr(host, "run", lambda args, **kw: Result(tuple(args), 0, "", ""))
+    monkeypatch.setattr(host, "_wait_status", lambda current: {"healthy": True})
+    output = []
+    kwargs = {"paths": config.paths, "unit_dir": tmp_path / "systemd", "output": output.append}
+
+    host.initialize(config.paths.source, {"postgres_ports": [15432, 5432]}, **kwargs)
+    current = load(config.paths.source, paths=config.paths)
+    assert current.host.routing.postgres_ports == (15432, 5432)
+    assert current.host.routing.kv_ports == (16379,)
+    assert current.projects == config.projects
+    assert config.paths.secrets.read_bytes() == secret_bytes
+    assert calls == [current.host.routing, "router"]
+    assert "briefly drop" in output[0]
+
+    before = config.paths.source.read_bytes()
+    output.clear()
+    host.initialize(config.paths.source, **kwargs)
+    assert config.paths.source.read_bytes() == before
+    assert not any("briefly drop" in line for line in output)
+
+
+def test_port_conflict_leaves_source_and_runtime_unchanged(config, tmp_path, monkeypatch):
+    before = config.paths.source.read_bytes()
+    monkeypatch.setattr(host, "prerequisites", lambda current: [])
+
+    def occupied(current):
+        assert current.host.routing.postgres_ports == (15432,)
+        raise host.HostError("port 15432 is occupied by another service")
+
+    monkeypatch.setattr(host, "_require_ports", occupied)
+    monkeypatch.setattr(host, "_directories", lambda current: pytest.fail("must not converge"))
+    with pytest.raises(host.HostError, match="port 15432 is occupied"):
+        host.initialize(
+            config.paths.source,
+            {"postgres_ports": [15432]},
+            paths=config.paths,
+            unit_dir=tmp_path / "systemd",
+        )
+    assert config.paths.source.read_bytes() == before

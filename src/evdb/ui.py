@@ -642,7 +642,7 @@ def run(
                     else:
                         host_value = value
                     if host_value is not None:
-                        _host(
+                        current = _host(
                             current,
                             host_value,
                             input_fn,
@@ -1127,7 +1127,7 @@ def _host(
     output,
     *,
     session: _StatusSession | None = None,
-) -> None:
+) -> Config:
     host = value["host"]
     infrastructure = host["infrastructure"]
     errors = [
@@ -1173,6 +1173,7 @@ def _host(
                     port: _state(ready, "listening", "missing")
                     for port, ready in infrastructure["listeners"].items()
                 },
+                **port_summary(config.host.routing.postgres_ports, config.host.routing.kv_ports),
                 "Network": _state(infrastructure["network"], "healthy", "missing"),
                 "Traefik": _state(infrastructure["traefik"], "healthy", "unhealthy"),
                 "ACME": _state(infrastructure["acme"], "ready", "missing or unsafe"),
@@ -1192,17 +1193,57 @@ def _host(
         heading="Host",
         states=tuple(states),
     )
-    _options(output, [("1", "Restart traffic"), ("0", "Back")])
-    choice = _choice(input_fn, output, "Select", {"0", "1"})
+    _options(output, [("1", "Restart traffic"), ("2", "Native ports"), ("0", "Back")])
+    choice = _choice(input_fn, output, "Select", {"0", "1", "2"})
+    if choice == "2":
+        from dataclasses import replace
+
+        from . import host as host_module
+        from .config import load, require_valid
+
+        routing = config.host.routing
+        postgres_ports = ask_ports(input_fn, output, "Postgres ports", routing.postgres_ports)
+        if postgres_ports is None:
+            return config
+        kv_ports = ask_ports(input_fn, output, "KV ports", routing.kv_ports)
+        if kv_ports is None:
+            return config
+        candidate = replace(routing, postgres_ports=postgres_ports, kv_ports=kv_ports)
+        require_valid(replace(config, host=replace(config.host, routing=candidate)))
+        _screen(
+            output,
+            pairs(port_summary(postgres_ports, kv_ports)),
+            heading="Save native ports",
+        )
+        if set(postgres_ports) != set(routing.postgres_ports) or set(kv_ports) != set(
+            routing.kv_ports
+        ):
+            output("Changing bindings will briefly drop native connections.")
+        if not confirm(input_fn, "Save?") or candidate == routing:
+            return config
+        if session is not None:
+            session.invalidate(config)
+        with loading(output, "Applying native ports"):
+            host_module.initialize(
+                config.paths.source,
+                {"postgres_ports": list(postgres_ports), "kv_ports": list(kv_ports)},
+                paths=config.paths,
+                output=output,
+            )
+            updated = load(config.paths.source, paths=config.paths)
+        if session is not None:
+            session.invalidate(updated)
+        _screen(output, "Native ports saved", heading="Native ports")
+        return updated
     if choice != "1":
-        return
+        return config
     _screen(
         output,
         "Active database connections may briefly drop.",
         heading="Restart traffic",
     )
     if not _yes(input_fn, "Restart Traefik traffic? [y/N] "):
-        return
+        return config
     from . import host as host_module
 
     if session is not None:
@@ -1214,6 +1255,34 @@ def _host(
         "Traefik traffic restart complete",
         heading="Restart traffic",
         states=(("complete", "green"),),
+    )
+    return config
+
+
+def port_summary(postgres_ports, kv_ports) -> dict[str, str]:
+    return {
+        label: f"{', '.join(map(str, ports))} (preferred: {ports[0]})"
+        for label, ports in (("Postgres ports", postgres_ports), ("KV ports", kv_ports))
+    }
+
+
+def ask_ports(input_fn, output, label: str, default: tuple[int, ...]) -> tuple[int, ...] | None:
+    from .config import validate_ports
+
+    def validate(value):
+        try:
+            ports = [int(port.strip()) for port in value.split(",")]
+        except ValueError as exc:
+            raise Error(f"{label} must be comma-separated integers") from exc
+        return validate_ports(ports, label)
+
+    return ask_text(
+        input_fn,
+        output,
+        label,
+        default=", ".join(map(str, default)),
+        help_text="Comma-separated native host ports; the first is preferred for connections.",
+        validate=validate,
     )
 
 

@@ -234,6 +234,8 @@ def as_dict(config: Config) -> dict[str, Any]:
                 "acme_email": host.routing.acme_email,
                 "dns_provider": host.routing.dns_provider,
                 "traefik_image": host.routing.traefik_image,
+                "postgres_ports": list(host.routing.postgres_ports),
+                "kv_ports": list(host.routing.kv_ports),
             },
         },
         "projects": projects,
@@ -422,6 +424,20 @@ def validate_postgres_name(value: str, name: str) -> str:
     return value
 
 
+def validate_ports(value: Any, name: str) -> tuple[int, ...]:
+    if (
+        not isinstance(value, (list, tuple))
+        or not value
+        or any(type(port) is not int or not 1 <= port <= 65535 for port in value)
+    ):
+        raise ConfigError(f"{name} must be a nonempty list of integer ports in 1–65535")
+    if len(set(value)) != len(value):
+        raise ConfigError(f"{name} must not contain duplicate ports")
+    if set(value) & {80, 443}:
+        raise ConfigError(f"{name} must not use ports 80 or 443")
+    return tuple(value)
+
+
 def require_valid(config: Config) -> None:
     errors = []
     host = config.host
@@ -464,6 +480,13 @@ def require_valid(config: Config) -> None:
     except ConfigError as exc:
         errors.append(str(exc))
     seen = set()
+    try:
+        postgres_ports = validate_ports(host.routing.postgres_ports, "host.routing.postgres_ports")
+        kv_ports = validate_ports(host.routing.kv_ports, "host.routing.kv_ports")
+        if set(postgres_ports) & set(kv_ports):
+            errors.append("host.routing.postgres_ports and kv_ports must not overlap")
+    except ConfigError as exc:
+        errors.append(str(exc))
     http_domains = {}
     http_ports = {}
     for project in config.projects:
@@ -637,7 +660,11 @@ def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
         "host.backup",
     )
     routing_data = _object(_required(host_data, "routing", "host"), "host.routing")
-    _only(routing_data, {"acme_email", "dns_provider", "traefik_image"}, "host.routing")
+    _only(
+        routing_data,
+        {"acme_email", "dns_provider", "traefik_image", "postgres_ports", "kv_ports"},
+        "host.routing",
+    )
     rclone_value = backup_data.get("rclone_config")
     if rclone_value is not None and (not isinstance(rclone_value, str) or not rclone_value):
         raise ConfigError("host.backup.rclone_config must be a non-empty string or omitted")
@@ -655,6 +682,10 @@ def _config(data: dict[str, Any], secrets: Secrets, paths: Paths) -> Config:
             _string(routing_data, "acme_email", "host.routing"),
             _string(routing_data, "dns_provider", "host.routing"),
             _string(routing_data, "traefik_image", "host.routing"),
+            validate_ports(
+                routing_data.get("postgres_ports", [5432]), "host.routing.postgres_ports"
+            ),
+            validate_ports(routing_data.get("kv_ports", [6379]), "host.routing.kv_ports"),
         ),
     )
     projects = []

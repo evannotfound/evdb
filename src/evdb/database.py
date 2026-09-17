@@ -633,7 +633,10 @@ def connection(database: Database) -> dict[str, Any]:
     if database.role == "postgres":
         username = quote(database.settings.username, safe="")
         name = quote(database.settings.database, safe="")
-        url = f"postgresql://{username}:{password}@{database.domain}:5432/{name}?sslmode=require"
+        url = (
+            f"postgresql://{username}:{password}@{database.domain}:{database.port}/{name}"
+            "?sslmode=require"
+        )
         return {
             "url": url,
             "username": database.settings.username,
@@ -641,7 +644,7 @@ def connection(database: Database) -> dict[str, Any]:
             "database": database.settings.database,
         }
     value = {
-        "url": f"rediss://default:{password}@{database.domain}:6379/0",
+        "url": f"rediss://default:{password}@{database.domain}:{database.port}/0",
         "username": "default",
         "password": database.credentials.password,
     }

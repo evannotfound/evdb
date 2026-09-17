@@ -6,6 +6,7 @@ import secrets as random
 import shutil
 import socket
 import stat
+from dataclasses import replace
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,9 @@ from .config import (
     protected,
     reject_unsupported,
     repository_parts,
+    require_valid,
     validate_data_roots,
+    validate_ports,
     write,
 )
 from .errors import CommandError, ConfigError, Error, HostError
@@ -67,15 +70,37 @@ def initialize(
     if missing:
         raise HostError("missing prerequisites: " + ", ".join(sorted(set(missing))))
     _writable(config, Path(unit_dir))
-    _require_ports(config)
     if not existing:
         backup.preflight(config)
     with operation(config, write=True, timeout=config.host.timeouts["backup"]):
+        if existing:
+            config = load(source_path, paths=managed)
+        previous = config.host.routing
+        ports = {
+            name: validate_ports(value, f"host.routing.{name}")
+            for name in ("postgres_ports", "kv_ports")
+            if (value := (values or {}).get(name)) is not None
+        }
+        routing = replace(previous, **ports)
+        config = replace(config, host=replace(config.host, routing=routing))
+        require_valid(config)
+        _require_ports(config)
+        if (
+            existing
+            and output
+            and (
+                set(previous.postgres_ports) != set(routing.postgres_ports)
+                or set(previous.kv_ports) != set(routing.kv_ports)
+            )
+        ):
+            output("Changing native port bindings will briefly drop active database connections.")
         _directories(config)
         if not existing:
             write(config)
         else:
             _assert_private(config.paths.secrets)
+            if routing != previous:
+                write(config, secrets=False)
         _source_ownership(config)
         _dns(config)
         docker.ensure_network(timeout=config.host.timeouts["command"])
@@ -177,14 +202,18 @@ def _initial(values: dict[str, Any], paths: Paths) -> Config:
             values["domain"],
             tuple(Path(value) for value in values.get("data_roots", (paths.databases,))),
             BackupSettings(values["repository"], Path(rclone) if rclone else None, 5, 26),
-            Routing(values["acme_email"], provider, DEFAULT_IMAGES["traefik"]),
+            Routing(
+                values["acme_email"],
+                provider,
+                DEFAULT_IMAGES["traefik"],
+                validate_ports(values.get("postgres_ports", [5432]), "host.routing.postgres_ports"),
+                validate_ports(values.get("kv_ports", [6379]), "host.routing.kv_ports"),
+            ),
         ),
         (),
         Secrets(_restic_password(values), tuple(sorted(dns_data.items()))),
         paths,
     )
-    from .config import require_valid
-
     require_valid(config)
     return config
 
@@ -264,7 +293,10 @@ def _traefik(config: Config) -> None:
                 "env_file": [str(config.paths.traefik / "dns.env")],
                 # Disable cname so we can verify through dns even though wildcard is present
                 "environment": {"LEGO_DISABLE_CNAME_SUPPORT": "true"},
-                "ports": ["5432:5432/tcp", "6379:6379/tcp"],
+                "ports": [
+                    *[f"{port}:5432/tcp" for port in sorted(config.host.routing.postgres_ports)],
+                    *[f"{port}:6379/tcp" for port in sorted(config.host.routing.kv_ports)],
+                ],
                 "healthcheck": docker.healthcheck(["CMD", "traefik", "healthcheck", "--ping"]),
                 "volumes": [
                     "/var/run/docker.sock:/var/run/docker.sock:ro",
@@ -488,6 +520,7 @@ def _units() -> tuple[Path, ...]:
 
 def _require_ports(config: Config) -> None:
     credentials = protected(config)
+    owned = {}
     try:
         result = run(
             ["docker", "inspect", docker.TRAEFIK_CONTAINER],
@@ -519,8 +552,8 @@ def _require_ports(config: Config) -> None:
                     f"existing {docker.TRAEFIK_CONTAINER} is not an evdb Traefik container"
                 )
             if running:
-                return
-        except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
+                owned = docker.published_ports(item)
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError, ValueError) as exc:
             raise HostError(f"malformed Docker inspection: {detail}") from exc
     else:
         lowered = detail.lower()
@@ -528,7 +561,9 @@ def _require_ports(config: Config) -> None:
             raise HostError(detail)
     sockets = []
     try:
-        for port in (5432, 6379):
+        for port in (*config.host.routing.postgres_ports, *config.host.routing.kv_ports):
+            if port in owned:
+                continue
             current = socket.socket()
             sockets.append(current)
             current.bind(("0.0.0.0", port))

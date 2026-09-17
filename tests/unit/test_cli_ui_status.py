@@ -1135,10 +1135,10 @@ def test_postgres_settings_display_nested_pool_values(config):
     assert "Reserve Size: 5" in text
 
 
-def test_host_screen_explicitly_shows_network_traefik_acme_and_runtime_fields():
+def test_host_screen_explicitly_shows_network_traefik_acme_and_runtime_fields(config):
     output = []
 
-    ui._host(None, _value(), lambda prompt: "0", output.append)
+    ui._host(config, _value(), lambda prompt: "0", output.append)
     text = "\n".join(output)
 
     for expected in (
@@ -1193,6 +1193,8 @@ def test_guided_init_uses_masked_restic_prompt_and_blank_generates(tmp_path):
             "ops@example.com",
             "",
             "n",
+            "",
+            "",
             "cloudflare",
             "",
             "1",
@@ -1232,7 +1234,9 @@ def test_guided_init_does_not_prompt_over_supplied_restic_password_file(tmp_path
             "restic_password_file": str(path),
         },
         lambda prompt: (
-            "" if prompt.startswith("Next") else pytest.fail(f"unexpected text prompt: {prompt}")
+            ""
+            if prompt.startswith(("Next", "Postgres ports", "KV ports"))
+            else pytest.fail(f"unexpected text prompt: {prompt}")
         ),
         lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
     )
@@ -1490,3 +1494,63 @@ def test_cli_does_not_claim_healthy_for_existing_unhealthy_role(config, monkeypa
     assert code == 1
     assert output == []
     assert errors == ["evdb: database is unhealthy"]
+
+
+@pytest.mark.parametrize("bindings", ["matching", "missing", "wrong_protocol", "unowned"])
+def test_status_requires_owned_configured_port_bindings(config, monkeypatch, bindings):
+    routing = replace(config.host.routing, postgres_ports=(15432, 5432), kv_ports=(16379,))
+    config = replace(config, host=replace(config.host, routing=routing))
+    ports = {
+        "5432/tcp": [
+            {"HostIp": "0.0.0.0", "HostPort": "15432"},
+            {"HostIp": "0.0.0.0", "HostPort": "5432"},
+        ],
+        "6379/tcp": [{"HostIp": "0.0.0.0", "HostPort": "16379"}],
+    }
+    if bindings == "missing":
+        ports["5432/tcp"].pop()
+    elif bindings == "wrong_protocol":
+        ports["6379/tcp"].append(ports["5432/tcp"].pop())
+    inspected = [
+        {
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": "other"
+                    if bindings == "unowned"
+                    else "evdb-traefik"
+                },
+                "Image": config.host.routing.traefik_image,
+            },
+            "State": {"Running": True, "Health": {"Status": "healthy"}},
+            "NetworkSettings": {"Ports": ports},
+        }
+    ]
+    monkeypatch.setattr(
+        docker, "run", lambda args, **kw: Result(tuple(args), 0, json.dumps(inspected), "")
+    )
+
+    def run(args, **kwargs):
+        if args[0] == "ss":
+            return Result(tuple(args), 0, "0.0.0.0:15432 \n0.0.0.0:5432 \n0.0.0.0:16379 \n", "")
+        return Result(tuple(args), 0, json.dumps([{"Labels": {docker.NETWORK_LABEL: "true"}}]), "")
+
+    monkeypatch.setattr(status, "run", run)
+    monkeypatch.setattr(host, "certificate_ready", lambda current: True)
+    errors = []
+    value = status._infrastructure(config, errors)
+    assert value["listeners"] == {"15432": True, "5432": True, "16379": True}
+    assert value["healthy"] is (bindings == "matching")
+    assert bool(errors) is (bindings != "matching")
+
+
+def test_listener_failure_uses_configured_keys(config, monkeypatch):
+    routing = replace(config.host.routing, postgres_ports=(15432,), kv_ports=(16379,))
+    config = replace(config, host=replace(config.host, routing=routing))
+    monkeypatch.setattr(status, "run", lambda args, **kw: Result(tuple(args), 1, "", "denied"))
+    monkeypatch.setattr(
+        docker, "state", lambda *a, **kw: {"running": False, "healthy": False, "image": None}
+    )
+    monkeypatch.setattr(host, "certificate_ready", lambda current: True)
+    value = status._infrastructure(config, [])
+    assert value["listeners"] == {"15432": None, "16379": None}
+    assert value["healthy"] is False

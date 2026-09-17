@@ -83,6 +83,8 @@ class Routing:
     acme_email: str
     dns_provider: str
     traefik_image: str
+    postgres_ports: tuple[int, ...] = (5432,)
+    kv_ports: tuple[int, ...] = (6379,)
 
 
 @dataclass(frozen=True)
@@ -239,7 +241,8 @@ class Database:
 
     @property
     def port(self) -> int:
-        return 5432 if self.role == "postgres" else 6379
+        routing = self.host.routing
+        return (routing.postgres_ports if self.role == "postgres" else routing.kv_ports)[0]
 
     @property
     def http_port(self) -> int:

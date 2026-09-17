@@ -23,6 +23,26 @@ def _runtime(monkeypatch):
     return calls
 
 
+def test_native_port_changes_only_external_connections(config):
+    from evdb.engines import dragonfly, kv, redis
+
+    routing = replace(config.host.routing, postgres_ports=(15432, 5432), kv_ports=(16379, 6379))
+    updated = replace(config, host=replace(config.host, routing=routing))
+    pg = config.select("app-test-01/postgres")
+    cache = config.select("app-test-01/kv")
+    new_pg = updated.select(pg.identity)
+    new_cache = updated.select(cache.identity)
+    assert ":15432/" in database.connection(new_pg)["url"]
+    assert ":16379/" in database.connection(new_cache)["url"]
+    for key in ("http_url", "http_loopback", "http_token"):
+        assert database.connection(new_cache)[key] == database.connection(cache)[key]
+    assert postgres.services(new_pg) == postgres.services(pg)
+    assert postgres.files(new_pg) == postgres.files(pg)
+    assert redis.services(new_cache) == redis.services(cache)
+    assert dragonfly.services(new_cache) == dragonfly.services(cache)
+    assert kv.http_env(new_cache) == kv.http_env(cache)
+
+
 def _place(config, identity, root):
     target = config.select(identity)
     projects = tuple(
