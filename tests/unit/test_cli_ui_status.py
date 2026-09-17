@@ -8,6 +8,9 @@ from threading import Event
 from urllib.parse import quote
 
 import pytest
+from prompt_toolkit import PromptSession
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from evdb import backup, cli, database, docker, host, status, ui
@@ -318,21 +321,8 @@ def test_guided_choice_starts_before_live_backup_update(config, monkeypatch):
 
 def test_live_numeric_choice_preserves_typed_buffer(config, monkeypatch):
     output, stream = _terminal()
-    chunks = iter((b"1", b"\n"))
-
-    class Input:
-        def fileno(self):
-            return 0
-
-        def isatty(self):
-            return True
-
-    monkeypatch.setattr(ui.sys, "stdin", Input())
-    monkeypatch.setattr(ui.termios, "tcgetattr", lambda descriptor: [])
-    monkeypatch.setattr(ui.termios, "tcsetattr", lambda *args: None)
-    monkeypatch.setattr(ui.tty, "setcbreak", lambda descriptor: None)
-    monkeypatch.setattr(ui.select, "select", lambda *args: ([0], [], []))
-    monkeypatch.setattr(ui.os, "read", lambda *args: next(chunks))
+    rendered = []
+    buffers = []
 
     class Session:
         value = status.pending(config)
@@ -340,15 +330,34 @@ def test_live_numeric_choice_preserves_typed_buffer(config, monkeypatch):
         def start(self):
             pass
 
-        def snapshot(self):
-            return 0, self.value
-
     session = Session()
 
-    value = ui._live_choice(output, session, [("0", "Exit")], {"1"})
+    with create_pipe_input() as pipe:
+
+        def prompt(message, **kwargs):
+            kwargs["output"] = DummyOutput()
+            result = PromptSession(message, input=pipe, **kwargs)
+
+            def updated(buffer):
+                if buffer.text == "1":
+                    rendered.append(message().value)
+                    session.value = _value()
+                    rendered.append(message().value)
+                    buffers.append(buffer.text)
+
+            result.default_buffer.on_text_changed += updated
+            return result
+
+        monkeypatch.setattr(ui, "PromptSession", prompt)
+        pipe.send_text("1\n")
+        value = ui._live_choice(output, session, [("0", "Exit")], {"1"})
 
     assert value == "1"
-    assert "Select: 1" in clean(stream.getvalue())
+    assert buffers == ["1"]
+    assert "checking" in clean(rendered[0])
+    assert "stopped" in clean(rendered[1])
+    assert "Select:" in clean(rendered[1])
+    assert stream.getvalue() == ""
 
 
 def test_guided_status_session_does_not_overlap_and_reuses_ttl(config):

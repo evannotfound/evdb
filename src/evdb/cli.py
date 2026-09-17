@@ -482,36 +482,37 @@ def _data_root_candidate(roots: list[str], value: str) -> str:
 
 def _init_dns(result: dict, input_fn, output, password_fn) -> None:
     if not result.get("dns_provider"):
-        while True:
-            term = ui.ask_text(
-                input_fn,
-                output,
-                "Search DNS providers",
-                help_text="Enter part of a provider name or code; example: cloudflare",
-            )
-            if term is None:
-                raise KeyboardInterrupt
+
+        def search(term):
             matches = dns.search(term)
             if not matches:
-                output("No supported DNS providers match that search")
-                continue
+                raise Error("No supported DNS providers match that search")
             if len(matches) > 20:
-                output(f"{len(matches)} providers match; enter a more specific search")
-                continue
-            key = ui.choose(
-                input_fn,
-                output,
-                "Provider",
-                [
-                    (str(index), f"{item['name']} ({item['code']})")
-                    for index, item in enumerate(matches, 1)
-                ],
-                default="1" if len(matches) == 1 else None,
-            )
-            if key is None:
-                raise KeyboardInterrupt
-            result["dns_provider"] = matches[int(key) - 1]["code"]
-            break
+                raise Error(f"{len(matches)} providers match; enter a more specific search")
+            return matches
+
+        matches = ui.ask_text(
+            input_fn,
+            output,
+            "Search DNS providers",
+            help_text="Enter part of a provider name or code; example: cloudflare",
+            validate=search,
+        )
+        if matches is None:
+            raise KeyboardInterrupt
+        key = ui.choose(
+            input_fn,
+            output,
+            "Provider",
+            [
+                (str(index), f"{item['name']} ({item['code']})")
+                for index, item in enumerate(matches, 1)
+            ],
+            default="1" if len(matches) == 1 else None,
+        )
+        if key is None:
+            raise KeyboardInterrupt
+        result["dns_provider"] = matches[int(key) - 1]["code"]
     else:
         result["dns_provider"] = dns.normalize(result["dns_provider"])
     if result.get("dns_file") or "dns" in result:

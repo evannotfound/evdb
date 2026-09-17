@@ -12,8 +12,8 @@ text from it.
 Before writing:
 
 - Work autonomously. Use `gh`, Git commands, repository search, and any other available tools as needed.
-- Use GitHub release metadata to find the latest non-draft release before the target tag. The target
-  release may not exist yet.
+- Use GitHub release metadata to find the latest non-draft, non-prerelease release before the target
+  tag. Ignore the rolling `preview` release. The target release may not exist yet.
 - Inspect the commits and real diffs from the previous release to the target. Read relevant source,
   configuration, and documentation when needed to understand the user-visible effect.
 - Use pull request descriptions and commit messages as context, but treat the implementation as

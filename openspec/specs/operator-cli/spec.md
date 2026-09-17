@@ -3,9 +3,7 @@
 ## Purpose
 
 Define the guided and explicit host-local operator command interface.
-
 ## Requirements
-
 ### Requirement: Guided root menu
 Running `evdb` in an interactive terminal SHALL show a compact host summary and one numbered database
 overview. Database rows SHALL be directly selectable, followed by Add database, Host, and Exit. The
@@ -38,9 +36,9 @@ Interactive output SHALL use an SSH-safe terminal presenter with readable semant
 layout. In a color-capable terminal, headings and questions SHALL be emphasized, effective prompt defaults
 SHALL be visually distinct from alternatives, and healthy, warning, pending, and failure states SHALL use
 distinct styles. Color SHALL supplement explicit wording rather than replace any state label. The
-presenter SHALL separate screens, results, errors, and prompts with blank lines, preserve numbered input,
-and avoid cursor-addressed navigation except for updating the active guided overview while background
-status loads. Plain or injected output SHALL contain no terminal control sequences or Rich markup.
+presenter SHALL separate screens, results, errors, and prompts with blank lines and preserve numbered input.
+It SHALL redraw the active question and guided overview as needed while retaining completed steps in
+terminal scrollback. Plain or injected output SHALL contain no terminal control sequences or Rich markup.
 
 #### Scenario: Guided flow advances between screens
 - **WHEN** the operator selects a database and then a backup action
@@ -230,3 +228,31 @@ subprocess stderr SHALL remain visible.
 #### Scenario: Subprocess prints an exact credential
 - **WHEN** command output includes a value loaded from `secrets.yml` or credential fields in `rclone.conf`
 - **THEN** evdb replaces that exact value before display or journald capture
+
+### Requirement: Editable guided input
+Interactive terminal questions SHALL use prompt_toolkit for visible text, numbered choices, confirmations,
+and masked secrets. Validation SHALL occur on Enter, show errors at the active question, and retain invalid
+input for editing. Existing defaults, optional values, domain validators, cancellation, and deletion
+identity/phrase checks SHALL remain effective. Completed answers SHALL remain in scrollback; secret values
+SHALL never appear as plaintext in that transcript or persist in input history. Dumb terminals and injected
+input SHALL retain line-oriented behavior.
+
+#### Scenario: Operator corrects a text field
+- **WHEN** a guided field rejects an answer
+- **THEN** the answer remains editable with its error at the same prompt until corrected or cancelled
+
+#### Scenario: Operator corrects a menu selection
+- **WHEN** a root or submenu selection is invalid
+- **THEN** the prompt shows the allowed choices and lets the operator edit the submitted value without appending another question
+
+#### Scenario: Operator corrects a confirmation
+- **WHEN** a terminal yes/no answer is neither a recognized yes nor no nor blank
+- **THEN** the question remains active with an error; Enter on blank still uses the stated default
+
+#### Scenario: Operator confirms a secret
+- **WHEN** a secret confirmation differs from the first secret
+- **THEN** the masked confirmation stays editable with a mismatch error and neither secret is printed
+
+#### Scenario: Operator cancels input
+- **WHEN** the operator presses Ctrl-C or submits EOF at an empty prompt
+- **THEN** the existing caller cancellation path runs without applying an unconfirmed operation

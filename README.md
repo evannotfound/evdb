@@ -76,6 +76,25 @@ curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install
 
 The installer verifies the downloaded executable and installs it at `/usr/local/bin/evdb`.
 
+To try the latest successful build from `main`, opt into the rolling preview prerelease:
+
+```sh
+curl -fsSL https://github.com/evannotfound/evdb/releases/download/preview/install.sh | sudo sh -s -- --preview
+```
+
+Preview reports its source-derived version, such as `1.2.4.dev17+gabc1234`. Rerun that command to
+update preview. To return to stable, rerun the default installation command above. You can also
+select an exact stable version as a positional argument:
+
+```sh
+curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install.sh | sudo sh -s -- 1.2.3
+```
+
+Preview keeps only recent builds; historical preview installation is not supported. If publication
+briefly interrupts a download, rerun the command. Failed download or verification leaves the installed
+executable intact. On a configured host, either channel also runs `evdb init --yes` after installation
+to refresh the managed router and backup timer.
+
 ## Initialize the host
 
 Start guided initialization:
@@ -84,10 +103,14 @@ Start guided initialization:
 sudo evdb init
 ```
 
-The append-only setup flow validates each answer, searches supported DNS providers, collects documented
+The guided setup flow validates each answer, searches supported DNS providers, collects documented
 credentials, selects rclone or local storage, and shows a redacted review before Apply. Leave the initial
 Restic password blank to generate one. Setup waits for the wildcard certificate and verifies or creates
 the Restic repository before enabling automatic backups.
+
+Interactive prompts support cursor editing and pasting. Invalid answers stay editable with an error at
+the same question; passwords stay masked. Completed steps remain in terminal scrollback. Numbered menus
+work the same way throughout setup and database operations; press Ctrl-C to cancel.
 
 Initialization stores configuration under `/etc/evdb`, managed data under `/var/lib/evdb`, starts the
 TLS router, initializes the Restic repository, and enables automatic daily backups.

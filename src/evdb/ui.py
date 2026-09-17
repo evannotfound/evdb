@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import os
 import re
-import select
 import shutil
 import sys
-import termios
 import time
-import tty
 from contextlib import contextmanager
 from getpass import getpass
 from threading import Condition, Event, Thread
 from typing import IO, Any
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.history import DummyHistory
+from prompt_toolkit.output import ColorDepth, create_output
+from prompt_toolkit.validation import ValidationError, Validator
 from rich.console import Console, Group
 from rich.live import Live
 from rich.spinner import Spinner
@@ -188,6 +190,20 @@ class _StatusSession:
             raise self._error
 
 
+class _Validator(Validator):
+    def __init__(self, parse):
+        self.parse = parse
+        self.value = None
+
+    def validate(self, document):
+        try:
+            self.value = self.parse(document.text)
+        except (Error, ValueError) as exc:
+            raise ValidationError(
+                message=clean(str(exc)), cursor_position=document.cursor_position
+            ) from exc
+
+
 class Terminal:
     def __init__(self, console: Console):
         self.console = console
@@ -212,11 +228,35 @@ class Terminal:
         self.text(value, style="bold red" if error else "bold")
 
     def input(self, prompt: str) -> str:
+        if _input_terminal(self.input):
+            return self.ask(prompt)
         return self.console.input(_prompt(prompt))
 
     def read_secret(self, prompt: str) -> str:
+        if _input_terminal(self.read_secret):
+            return self.ask(prompt, password=True)
         self.console.print(_prompt(prompt), end="")
         return getpass("", echo_char="*")
+
+    def ask(self, prompt: str, *, validate=None, password=False, view=None):
+        def message():
+            with self.console.capture() as capture:
+                self.console.print(view() if view else _prompt(prompt), end="")
+            return ANSI(capture.get())
+
+        validator = _Validator(validate or (lambda value: value))
+        session = PromptSession(
+            message,
+            validator=validator,
+            validate_while_typing=False,
+            is_password=password,
+            history=DummyHistory(),
+            output=create_output(stdout=self.console.file),
+            color_depth=ColorDepth.DEPTH_1_BIT if self.console.no_color or _no_color() else None,
+            refresh_interval=0.125 if view else 0,
+        )
+        session.prompt()
+        return validator.value
 
     @contextmanager
     def loading(self, message: str):
@@ -493,11 +533,8 @@ def _root_view(
     options: list[tuple[str, str]],
     *,
     width: int,
-    answer: str = "",
-    error: str | None = None,
 ):
     prompt = _prompt("Select: ")
-    prompt.append(answer)
     prompt.end = ""
     values = [
         _status_table(value, guided=True, width=width),
@@ -505,8 +542,6 @@ def _root_view(
         Text("\n".join(f"{key}. {label}" for key, label in options)),
         Text(""),
     ]
-    if error:
-        values.extend((Text(error, style="red"), Text("")))
     values.append(prompt)
     return Group(*values)
 
@@ -519,51 +554,32 @@ def _live_input(input_fn, output) -> bool:
     )
 
 
+def _input_terminal(input_fn) -> Terminal | None:
+    output = getattr(input_fn, "__self__", None)
+    return output if _live_enabled(output) and sys.stdin.isatty() else None
+
+
 def _live_choice(
     output: Terminal,
     session: _StatusSession,
     options: list[tuple[str, str]],
     allowed: set[str],
 ) -> str | None:
-    descriptor = sys.stdin.fileno()
-    previous = termios.tcgetattr(descriptor)
-    answer = ""
-    error = None
-    revision = -1
-    width = output.console.width
+    def validate(value):
+        value = value.strip()
+        if value not in allowed:
+            raise Error(_invalid_choice(allowed))
+        return value
+
+    session.start()
     try:
-        tty.setcbreak(descriptor)
-        with output.live(_root_view(session.value, options, width=width)) as update:
-            session.start()
-            output.console.show_cursor(True)
-            while True:
-                current_revision, value = session.snapshot()
-                if current_revision != revision:
-                    revision = current_revision
-                    update(_root_view(value, options, width=width, answer=answer, error=error))
-                ready, _write, _error = select.select([descriptor], [], [], 0.05)
-                if not ready:
-                    continue
-                text = os.read(descriptor, 64).decode(errors="ignore")
-                for character in text:
-                    if character == "\x03":
-                        raise KeyboardInterrupt
-                    if character == "\x04" and not answer:
-                        return None
-                    if character in "\r\n":
-                        if answer in allowed:
-                            return answer
-                        error = _invalid_choice(allowed)
-                        answer = ""
-                    elif character in {"\x08", "\x7f"}:
-                        answer = answer[:-1]
-                        error = None
-                    elif character.isdigit():
-                        answer += character
-                        error = None
-                update(_root_view(value, options, width=width, answer=answer, error=error))
-    finally:
-        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+        return output.ask(
+            "Select: ",
+            validate=validate,
+            view=lambda: _root_view(session.value, options, width=output.console.width),
+        )
+    except EOFError:
+        return None
 
 
 def run(
@@ -1049,18 +1065,29 @@ def _settings(target: Database, input_fn, output) -> dict[str, Any] | None:
     values = {}
     _screen(output, pairs(current), heading="Settings")
     for name, old in current.items():
-        while True:
-            entered = _text(input_fn, f"{name} [{old}]", blank=True)
-            if not entered:
+
+        def validate(entered, name=name, old=old, values=values):
+            candidate = {**values, name: _parse(entered, old)}
+            database._settings(target, candidate, ())
+            return candidate
+
+        if _input_terminal(input_fn):
+            candidate = ask_text(
+                input_fn, output, f"{name} [{old}]", required=False, validate=validate
+            )
+            if candidate is not None:
+                values = candidate
+        else:
+            while True:
+                entered = _text(input_fn, f"{name} [{old}]", blank=True)
+                if not entered:
+                    break
+                try:
+                    values = validate(entered)
+                except Error as exc:
+                    _screen(output, str(exc), heading=f"Invalid {name}", error=True)
+                    continue
                 break
-            try:
-                candidate = {**values, name: _parse(entered, old)}
-                database._settings(target, candidate, ())
-            except Error as exc:
-                _screen(output, str(exc), heading=f"Invalid {name}", error=True)
-                continue
-            values = candidate
-            break
     if not values:
         return None
     _screen(
@@ -1343,6 +1370,19 @@ def _options(output, options: list[tuple[str, str]]) -> None:
 
 
 def _choice(input_fn, output, prompt: str | None, allowed: set[str]) -> str | None:
+    terminal = _input_terminal(input_fn)
+    if terminal:
+
+        def validate(value):
+            value = value.strip()
+            if value not in allowed:
+                raise Error(_invalid_choice(allowed))
+            return value
+
+        try:
+            return terminal.ask(f"{prompt}: " if prompt else "", validate=validate)
+        except EOFError:
+            return None
     while True:
         try:
             value = input_fn(f"{prompt}: " if prompt else "").strip()
@@ -1373,6 +1413,8 @@ def _text(input_fn, prompt: str, *, blank: bool = False) -> str | None:
 
 def _yes(input_fn, prompt: str) -> bool:
     try:
+        if terminal := _input_terminal(input_fn):
+            return terminal.ask(prompt, validate=lambda value: _confirmation(value, False))
         return input_fn(prompt).strip().lower() in {"y", "yes"}
     except EOFError:
         return False
@@ -1390,8 +1432,22 @@ def ask_text(
 ) -> str | None:
     if help_text:
         output(help_text)
+    suffix = f" [{default}]" if default is not None else ""
+    if terminal := _input_terminal(input_fn):
+
+        def parse(value):
+            value = value.strip() or default
+            if not value:
+                if not required:
+                    return None
+                raise Error(f"{prompt} is required")
+            return validate(value) if validate else value
+
+        try:
+            return terminal.ask(f"{prompt}{suffix}: ", validate=parse)
+        except EOFError:
+            return None
     while True:
-        suffix = f" [{default}]" if default is not None else ""
         try:
             value = input_fn(f"{prompt}{suffix}: ").strip()
         except EOFError:
@@ -1419,6 +1475,20 @@ def choose(
     default: str | None = None,
 ) -> str | None:
     _options(output, choices)
+    if terminal := _input_terminal(input_fn):
+
+        def validate(value):
+            value = value.strip() or default
+            allowed = {key for key, _label in choices}
+            if value not in allowed:
+                raise Error(_invalid_choice(allowed))
+            return value
+
+        suffix = f" [{default}]" if default is not None else ""
+        try:
+            return terminal.ask(f"{prompt}{suffix}: ", validate=validate)
+        except EOFError:
+            return None
     while True:
         suffix = f" [{default}]" if default is not None else ""
         try:
@@ -1439,6 +1509,27 @@ def ask_secret(
     required: bool = False,
     confirm: bool = False,
 ) -> str | None:
+    if terminal := _input_terminal(password_fn):
+
+        def validate(value):
+            if not value:
+                if required:
+                    raise Error(f"{prompt} is required")
+                return None
+            if any(char in value for char in "\0\r\n"):
+                raise Error(f"{prompt} must be one non-empty line")
+            return value
+
+        value = terminal.ask(f"{prompt}: ", validate=validate, password=True)
+        if value and confirm:
+
+            def matches(answer):
+                if answer != value:
+                    raise Error("Passwords do not match")
+                return answer
+
+            terminal.ask(f"Confirm {prompt.lower()}: ", validate=matches, password=True)
+        return value
     while True:
         value = password_fn(f"{prompt}: ")
         if not value:
@@ -1458,11 +1549,24 @@ def ask_secret(
 def confirm(input_fn, prompt: str, *, default: bool = False) -> bool:
     suffix = " [Y/n] " if default else " [y/N] "
     try:
+        if terminal := _input_terminal(input_fn):
+            return terminal.ask(
+                prompt + suffix, validate=lambda value: _confirmation(value, default)
+            )
         value = input_fn(prompt + suffix).strip().lower()
     except EOFError:
         return False
     if not value:
         return default
+    return value in {"y", "yes"}
+
+
+def _confirmation(value: str, default: bool) -> bool:
+    value = value.strip().lower()
+    if not value:
+        return default
+    if value not in {"y", "yes", "n", "no"}:
+        raise Error("Enter yes or no")
     return value in {"y", "yes"}
 
 

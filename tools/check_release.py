@@ -9,6 +9,11 @@ from pathlib import Path
 
 MAX_SIZE = 268_435_456
 ASSET = re.compile(r"evdb_linux_(?:amd64|arm64)")
+PREVIEW_ASSET = re.compile(r"evdb_linux_(?:amd64|arm64)_[0-9a-f]{40}_[1-9][0-9]*_[1-9][0-9]*")
+DEVELOPMENT = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:(?:a|b|rc)(?:0|[1-9][0-9]*))?\.dev(0|[1-9][0-9]*)\+g[0-9a-f]{7,40}"
+)
 VERSION = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -69,14 +74,19 @@ def executable_version(executable: Path, selected: str) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: check_release.py EXECUTABLE TAG")
+    preview = len(sys.argv) == 4 and sys.argv[3] == "--preview"
+    if len(sys.argv) != 3 and not preview:
+        raise SystemExit("usage: check_release.py EXECUTABLE TAG | EXECUTABLE VERSION --preview")
     executable = Path(sys.argv[1])
     tag = sys.argv[2]
-    selected = tag.removeprefix("v")
-    if tag != f"v{selected}" or not semantic(selected):
+    selected = tag if preview else tag.removeprefix("v")
+    if preview:
+        if not semantic(selected) and not DEVELOPMENT.fullmatch(selected):
+            fail(f"invalid preview version: {selected}")
+    elif tag != f"v{selected}" or not semantic(selected):
         fail(f"invalid release tag: {tag}")
-    if not ASSET.fullmatch(executable.name):
+    asset_pattern = PREVIEW_ASSET if preview else ASSET
+    if not asset_pattern.fullmatch(executable.name):
         fail(f"invalid release asset name: {executable.name}")
     if executable.is_symlink() or not executable.is_file():
         fail("release executable is missing or unsafe")

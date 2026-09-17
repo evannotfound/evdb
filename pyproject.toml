@@ -10,6 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.14"
 dependencies = [
+    "prompt-toolkit>=3.0.52,<4",
     "PyYAML>=6.0",
     "rich>=15.0.0",
 ]
@@ -32,6 +33,7 @@ evdb = ["dns_providers.json", "units/*.service", "units/*.timer"]
 
 [tool.setuptools_scm]
 version_file = "src/evdb/_version.py"
+scm.git.describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --import-mode=importlib"

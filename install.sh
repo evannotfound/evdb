@@ -7,7 +7,8 @@ RELEASES=${EVDB_RELEASES:-https://github.com/evannotfound/evdb/releases}
 DESTDIR=${DESTDIR:-}
 COMMAND="${DESTDIR}/usr/local/bin/evdb"
 CONFIG="${DESTDIR}/etc/evdb/config.yml"
-VERSION=${1:-}
+VERSION=
+PREVIEW=0
 MAX_RELEASE_SIZE=${EVDB_MAX_RELEASE_SIZE:-268435456}
 STAGE=
 TEMP=
@@ -57,6 +58,11 @@ valid_version() {
     esac
 }
 
+valid_preview_version() {
+    valid_version "$1" || printf '%s\n' "$1" | grep -Eq \
+        '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)((a|b|rc)(0|[1-9][0-9]*))?\.dev(0|[1-9][0-9]*)\+g[0-9a-f]{7,40}$'
+}
+
 download() {
     URL=$1
     DESTINATION=$2
@@ -72,6 +78,13 @@ download() {
 
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+
+[ "$#" -le 1 ] || fail "usage: install.sh [VERSION | --preview]"
+case "${1:-}" in
+    --preview) PREVIEW=1 ;;
+    -*) fail "usage: install.sh [VERSION | --preview]" ;;
+    *) VERSION=${1:-} ;;
+esac
 
 if [ -z "${DESTDIR}" ] && [ "$(id -u)" -ne 0 ]; then
     fail "installation requires root; rerun with sudo"
@@ -116,13 +129,28 @@ fi
 LOCK_CREATED=1
 
 ASSET="evdb_linux_${ARCH}"
-if [ -n "${VERSION}" ]; then
+STAGE=$(mktemp -d)
+if [ "${PREVIEW}" -eq 1 ]; then
+    BASE="${RELEASES}/download/preview"
+    download "${BASE}/preview.txt" "${STAGE}/preview.txt" 1024
+    {
+        read -r COMMIT VERSION RUN ATTEMPT EXTRA || fail "preview manifest is malformed"
+        [ -z "${EXTRA}" ] || fail "preview manifest is malformed"
+        if IFS= read -r EXTRA || [ -n "${EXTRA}" ]; then
+            fail "preview manifest is malformed"
+        fi
+    } < "${STAGE}/preview.txt"
+    printf '%s\n' "${COMMIT}" | grep -Eq '^[0-9a-f]{40}$' || fail "preview commit is invalid"
+    printf '%s\n' "${RUN}" | grep -Eq '^[1-9][0-9]*$' || fail "preview run is invalid"
+    printf '%s\n' "${ATTEMPT}" | grep -Eq '^[1-9][0-9]*$' || fail "preview attempt is invalid"
+    valid_preview_version "${VERSION}" || fail "preview version is invalid"
+    ASSET="${ASSET}_${COMMIT}_${RUN}_${ATTEMPT}"
+elif [ -n "${VERSION}" ]; then
     BASE="${RELEASES}/download/v${VERSION}"
 else
     BASE="${RELEASES}/latest/download"
 fi
 
-STAGE=$(mktemp -d)
 CANDIDATE="${STAGE}/${ASSET}"
 CHECKSUM="${CANDIDATE}.sha256"
 download "${BASE}/${ASSET}" "${CANDIDATE}" "${MAX_RELEASE_SIZE}"
@@ -150,7 +178,11 @@ case "${REPORTED}" in
     "evdb "*) RESOLVED=${REPORTED#evdb } ;;
     *) fail "release executable returned an invalid version" ;;
 esac
-valid_version "${RESOLVED}" || fail "release executable returned an invalid version"
+if [ "${PREVIEW}" -eq 1 ]; then
+    valid_preview_version "${RESOLVED}" || fail "release executable returned an invalid version"
+else
+    valid_version "${RESOLVED}" || fail "release executable returned an invalid version"
+fi
 [ -z "${VERSION}" ] || [ "${RESOLVED}" = "${VERSION}" ] || \
     fail "release executable version does not match ${VERSION}"
 

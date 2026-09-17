@@ -1,0 +1,151 @@
+name: preview
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.14"
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Record source version
+        id: version
+        run: |
+          VERSION="$(uv run evdb --version)"
+          echo "version=${VERSION#evdb }" >> "${GITHUB_OUTPUT}"
+      - run: make check
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.14"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: make binary
+      - name: Smoke test standalone executable
+        run: |
+          uv run pyi-archive_viewer -r -b dist/evdb > binary-members.txt
+          grep -F "evdb/units/evdb-backup.service" binary-members.txt
+          grep -F "evdb/units/evdb-backup.timer" binary-members.txt
+          grep -Fx " rich.console" binary-members.txt
+          grep -Fx " prompt_toolkit.shortcuts.prompt" binary-members.txt
+      - name: Assemble preview executable
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          ASSET="evdb_linux_${ARCH}_${GITHUB_SHA}_${GITHUB_RUN_NUMBER}_${GITHUB_RUN_ATTEMPT}"
+          install -d -m 0755 artifacts
+          install -m 0755 dist/evdb "artifacts/${ASSET}"
+          (cd artifacts && sha256sum "${ASSET}" > "${ASSET}.sha256")
+          uv run python tools/check_release.py "artifacts/${ASSET}" "${VERSION}" --preview
+      - uses: actions/upload-artifact@v7
+        with:
+          name: preview-${{ matrix.arch }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: preview-publication
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: preview-*
+          path: release
+          merge-multiple: true
+      - name: Attest preview executables
+        uses: actions/attest@v4
+        with:
+          subject-path: release/evdb_linux_*
+      - name: Publish rolling preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # The title is a publication high-water mark, including interrupted attempts.
+          if TITLE="$(gh release view preview --json name --jq .name)"; then
+            PREVIOUS_RUN="${TITLE#Preview run }"
+            [[ "${PREVIOUS_RUN}" =~ ^[0-9]+$ ]]
+            if (( PREVIOUS_RUN > GITHUB_RUN_NUMBER )); then
+              echo "A newer run already owns preview; skipping."
+              exit 0
+            fi
+          else
+            gh release create preview --draft --prerelease --latest=false \
+              --target "${GITHUB_SHA}" --title "Preview run 0" --notes "Preparing preview."
+          fi
+          gh release view preview --json assets --jq '.assets[].name' > previous-assets.txt
+          BUILD="${GITHUB_SHA}_${GITHUB_RUN_NUMBER}_${GITHUB_RUN_ATTEMPT}"
+          PREVIOUS_BUILD=
+          if grep -Fxq preview.txt previous-assets.txt; then
+            gh release download preview --pattern preview.txt --dir previous
+            read -r PREVIOUS_COMMIT PREVIOUS_VERSION PUBLISHED_RUN PUBLISHED_ATTEMPT < previous/preview.txt
+            [[ "${PREVIOUS_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+            [[ "${PUBLISHED_RUN}" =~ ^[1-9][0-9]*$ ]]
+            [[ "${PUBLISHED_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+            PREVIOUS_BUILD="${PREVIOUS_COMMIT}_${PUBLISHED_RUN}_${PUBLISHED_ATTEMPT}"
+          fi
+          gh release edit preview --title "Preview run ${GITHUB_RUN_NUMBER}" --prerelease --latest=false
+          if test "${PREVIOUS_BUILD}" != "${BUILD}"; then
+            # Run/attempt suffixes also keep rebuilds of the same commit immutable.
+            gh release upload preview release/evdb_linux_*
+            install -m 0755 install.sh release/install.sh
+            gh release upload preview release/install.sh --clobber
+            printf '%s %s %s %s\n' "${GITHUB_SHA}" "${VERSION}" \
+              "${GITHUB_RUN_NUMBER}" "${GITHUB_RUN_ATTEMPT}" > release/preview.txt
+            gh release upload preview release/preview.txt --clobber
+          fi
+          gh release edit preview --draft=false --prerelease --latest=false --target "${GITHUB_SHA}" \
+            --notes "Latest successful main build: ${VERSION} (${GITHUB_SHA}). Install with --preview."
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/preview" \
+            -f sha="${GITHUB_SHA}" -F force=true
+          # Keep the previous generation for installers that already fetched its manifest.
+          if test -n "${PREVIOUS_BUILD}" && test "${PREVIOUS_BUILD}" != "${BUILD}"; then
+            while read -r ASSET; do
+              case "${ASSET}" in
+                evdb_linux_*_"${BUILD}"|evdb_linux_*_"${BUILD}".sha256) ;;
+                evdb_linux_*_"${PREVIOUS_BUILD}"|evdb_linux_*_"${PREVIOUS_BUILD}".sha256) ;;
+                evdb_linux_*) gh release delete-asset preview "${ASSET}" --yes ;;
+              esac
+            done < previous-assets.txt
+          fi
