@@ -15,7 +15,7 @@ VERSION = "1.2.4.dev17+gabc1234"
 
 # Execute the real publication shell against a disposable release, with no GitHub writes.
 FAKE_GH = """\
-import json, os, pathlib, sys
+import json, os, pathlib, re, sys
 path = pathlib.Path(os.environ['RELEASE_STATE'])
 state = json.loads(path.read_text())
 args = sys.argv[1:]
@@ -26,15 +26,18 @@ def option(name):
 if args[:2] == ['release', 'view']:
     if not state['exists']:
         code = 1
-    elif option('--json') == 'name':
-        print(state['title'])
+    elif option('--json') == 'name,body':
+        marker = re.search(r'<!-- preview-run: ([0-9]+) -->', state['body'])
+        print(marker.group(1) if marker else state['title'].removeprefix('Preview run '))
     else:
         print('\\n'.join(state['assets']))
 elif args[:2] == ['release', 'create']:
-    state.update(exists=True, title=option('--title'), draft=True)
+    state.update(exists=True, title=option('--title'), body=option('--notes'), draft=True)
 elif args[:2] == ['release', 'edit']:
     if '--title' in args:
         state['title'] = option('--title')
+    if '--notes-file' in args:
+        state['body'] = pathlib.Path(option('--notes-file')).read_text()
     if '--draft=false' in args:
         state['draft'] = False
 elif args[:2] == ['release', 'download']:
@@ -68,7 +71,7 @@ sys.exit(code)
 """
 
 
-def _state(tmp_path, *, exists=True, title="Preview run 16"):
+def _state(tmp_path, *, exists=True, title="Preview run 16", body=""):
     old = f"evdb_linux_amd64_{PREVIOUS}_16_1"
     ancient = f"evdb_linux_amd64_{'c' * 40}_15_1"
     assets = {
@@ -85,6 +88,7 @@ def _state(tmp_path, *, exists=True, title="Preview run 16"):
             {
                 "exists": exists,
                 "title": title,
+                "body": body,
                 "draft": False,
                 "assets": assets if exists else {},
                 "calls": [],
@@ -155,7 +159,9 @@ def test_publication_switches_manifest_after_assets_and_keeps_previous_build(tmp
     result, published = _publish(tmp_path, state)
 
     assert result.returncode == 0, result.stderr
-    assert published["title"] == "Preview run 17"
+    assert published["title"] == "v1.2.4.dev17"
+    assert f"Latest successful main build: {VERSION}" in published["body"]
+    assert "<!-- preview-run: 17 -->" in published["body"]
     assert published["tag"] == COMMIT
     assert published["assets"]["preview.txt"] == f"{COMMIT} {VERSION} 17 1\n"
     assert f"evdb_linux_amd64_{PREVIOUS}_16_1" in published["assets"]
@@ -173,11 +179,12 @@ def test_first_publication_uses_one_draft_prerelease(tmp_path):
     creates = [call for call in published["calls"] if call[:2] == ["release", "create"]]
     assert len(creates) == 1
     assert "--prerelease" in creates[0] and "--latest=false" in creates[0]
+    assert published["title"] == "v1.2.4.dev17"
     assert not published["draft"]
 
 
 def test_older_workflow_cannot_modify_newer_preview(tmp_path):
-    state = _state(tmp_path, title="Preview run 18")
+    state = _state(tmp_path, title="v1.2.4.dev18", body="<!-- preview-run: 18 -->")
     before = json.loads(state.read_text())
 
     result, after = _publish(tmp_path, state)
@@ -192,7 +199,8 @@ def test_interrupted_manifest_switch_blocks_older_run_and_allows_retry(tmp_path)
     state = _state(tmp_path)
     failed, partial = _publish(tmp_path, state, fail_upload="preview.txt")
     assert failed.returncode != 0
-    assert partial["title"] == "Preview run 17"
+    assert partial["title"] == "v1.2.4.dev17"
+    assert "<!-- preview-run: 17 -->" in partial["body"]
     assert "preview.txt" not in partial["assets"]
 
     skipped, older = _publish(tmp_path, state, run=16)

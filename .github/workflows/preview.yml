@@ -102,9 +102,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
-          # The title is a publication high-water mark, including interrupted attempts.
-          if TITLE="$(gh release view preview --json name --jq .name)"; then
-            PREVIOUS_RUN="${TITLE#Preview run }"
+          TITLE="v${VERSION%%+*}"
+          # Track publication in a hidden note, independently of the display title.
+          if PREVIOUS_RUN="$(gh release view preview --json name,body --jq \
+            '(.body | capture("<!-- preview-run: (?<run>[0-9]+) -->").run) // (.name | ltrimstr("Preview run "))')"; then
             [[ "${PREVIOUS_RUN}" =~ ^[0-9]+$ ]]
             if (( PREVIOUS_RUN > GITHUB_RUN_NUMBER )); then
               echo "A newer run already owns preview; skipping."
@@ -112,7 +113,7 @@ jobs:
             fi
           else
             gh release create preview --draft --prerelease --latest=false \
-              --target "${GITHUB_SHA}" --title "Preview run 0" --notes "Preparing preview."
+              --target "${GITHUB_SHA}" --title "${TITLE}" --notes "<!-- preview-run: 0 -->"
           fi
           gh release view preview --json assets --jq '.assets[].name' > previous-assets.txt
           BUILD="${GITHUB_SHA}_${GITHUB_RUN_NUMBER}_${GITHUB_RUN_ATTEMPT}"
@@ -125,7 +126,9 @@ jobs:
             [[ "${PUBLISHED_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
             PREVIOUS_BUILD="${PREVIOUS_COMMIT}_${PUBLISHED_RUN}_${PUBLISHED_ATTEMPT}"
           fi
-          gh release edit preview --title "Preview run ${GITHUB_RUN_NUMBER}" --prerelease --latest=false
+          printf '%s\n\n%s\n' 'Preparing preview.' \
+            "<!-- preview-run: ${GITHUB_RUN_NUMBER} -->" > release/notes.md
+          gh release edit preview --title "${TITLE}" --notes-file release/notes.md --prerelease --latest=false
           if test "${PREVIOUS_BUILD}" != "${BUILD}"; then
             # Run/attempt suffixes also keep rebuilds of the same commit immutable.
             gh release upload preview release/evdb_linux_*
@@ -135,8 +138,11 @@ jobs:
               "${GITHUB_RUN_NUMBER}" "${GITHUB_RUN_ATTEMPT}" > release/preview.txt
             gh release upload preview release/preview.txt --clobber
           fi
+          printf '%s\n\n%s\n' \
+            "Latest successful main build: ${VERSION} (${GITHUB_SHA}). Install with --preview." \
+            "<!-- preview-run: ${GITHUB_RUN_NUMBER} -->" > release/notes.md
           gh release edit preview --draft=false --prerelease --latest=false --target "${GITHUB_SHA}" \
-            --notes "Latest successful main build: ${VERSION} (${GITHUB_SHA}). Install with --preview."
+            --notes-file release/notes.md
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/preview" \
             -f sha="${GITHUB_SHA}" -F force=true
           # Keep the previous generation for installers that already fetched its manifest.
