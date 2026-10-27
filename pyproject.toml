@@ -33,7 +33,7 @@ evdb = ["dns_providers.json", "units/*.service", "units/*.timer"]
 
 [tool.setuptools_scm]
 version_file = "src/evdb/_version.py"
-scm.git.describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
+scm.git.describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*", "--exclude", "*.dev*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --import-mode=importlib"

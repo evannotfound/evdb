@@ -24,7 +24,8 @@ def _release(tmp_path, version, *, init_code=0, valid_checksum=True, preview=Fal
         f"exit {init_code}; fi\n"
         "exit 2\n"
     )
-    folder = releases / ("download/preview-17-1" if preview else f"download/v{version}")
+    tag = f"v{version.split('+')[0]}" if preview else f"v{version}"
+    folder = releases / f"download/{tag}"
     folder.mkdir(parents=True, exist_ok=True)
     executable = folder / asset
     executable.write_text(binary)
@@ -35,7 +36,7 @@ def _release(tmp_path, version, *, init_code=0, valid_checksum=True, preview=Fal
     (folder / f"{asset}.sha256").write_text(f"{digest}  {asset}\n")
     if preview:
         (folder / "preview.txt").write_text(f"{commit} {version} 17 1\n")
-        (releases / "releases.json").write_text(json.dumps([{"tag_name": "preview-17-1"}]))
+        (releases / "releases.json").write_text(json.dumps([{"tag_name": tag}]))
     return releases
 
 
@@ -151,7 +152,7 @@ def test_default_installer_selects_stable_even_when_preview_exists(tmp_path):
     assert (destination / "usr/local/bin/evdb").is_file()
 
 
-@pytest.mark.parametrize("version", ["1.2.4.dev17+gabc1234", "1.2.4rc1.dev2+gabc1234", "1.2.3"])
+@pytest.mark.parametrize("version", ["1.2.4.dev17+gabc1234", "1.2.4rc1.dev2+gabc1234"])
 @pytest.mark.parametrize("machine,arch", [("x86_64", "amd64"), ("aarch64", "arm64")])
 def test_preview_installs_exact_scm_version(tmp_path, version, machine, arch):
     releases = _release(tmp_path, version, preview=True, arch=arch)
@@ -202,17 +203,17 @@ def test_preview_failure_preserves_configured_installation(tmp_path, invalid):
     config.parent.mkdir(parents=True)
     config.write_text("configured: true\n")
     _release(tmp_path, "1.2.4.dev17+gabc1234", preview=True, valid_checksum=invalid != "checksum")
-    folder = releases / "download/preview-17-1"
+    folder = releases / "download/v1.2.4.dev17"
     manifest = folder / "preview.txt"
     replacements = {
-        "version": manifest.read_text().replace("dev17", "dev18"),
+        "version": manifest.read_text().replace("gabc1234", "gdef1234"),
         "manifest": "bad\n",
         "extra-line": manifest.read_text() + "unexpected\n",
         "trailing-data": manifest.read_text() + "unexpected",
         "dirty": manifest.read_text().replace("gabc1234", "gabc1234.d20260917"),
         "path": manifest.read_text().replace("a" * 40, "../../outside"),
         "attempt": manifest.read_text().replace("17 1", "17 0"),
-        "release": manifest.read_text().replace("17 1", "18 1"),
+        "release": manifest.read_text().replace("dev17", "dev18"),
     }
     if invalid in replacements:
         manifest.write_text(replacements[invalid])
@@ -251,7 +252,7 @@ def test_preview_upgrade_refreshes_host_and_can_return_to_stable(tmp_path):
 
 def test_preview_uses_one_manifest_snapshot_during_publication(tmp_path):
     releases = _release(tmp_path, "1.2.4.dev17+gabc1234", preview=True)
-    manifest = releases / "download/preview-17-1/preview.txt"
+    manifest = releases / "download/v1.2.4.dev17/preview.txt"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     curl = fake_bin / "curl"
@@ -278,17 +279,18 @@ def test_preview_uses_one_manifest_snapshot_during_publication(tmp_path):
 
 
 @pytest.mark.parametrize("indent", [None, 2])
-def test_preview_selects_highest_run_and_attempt_not_release_order(tmp_path, indent):
+def test_preview_selects_highest_version_not_release_order(tmp_path, indent):
     releases = _release(tmp_path, "1.2.4.dev17+gabc1234", preview=True)
     (releases / "releases.json").write_text(
         json.dumps(
             [
-                {"tag_name": "preview-9-12"},
-                {"tag_name": "v2.0.0", "body": '"tag_name": "preview-999-1"'},
-                {"tag_name": "preview-17-1"},
+                {"tag_name": "v1.2.4.dev9"},
+                {"tag_name": "v2.0.0", "body": '"tag_name": "v9.9.9.dev999"'},
+                {"tag_name": "v1.2.4.dev17"},
                 {"tag_name": "preview"},
-                {"tag_name": "preview-16-20"},
-                {"tag_name": "preview-17-0"},
+                {"tag_name": "preview-999-1"},
+                {"tag_name": "v1.2.3.dev999"},
+                {"tag_name": "v1.2.4.dev16"},
             ],
             indent=indent,
         )

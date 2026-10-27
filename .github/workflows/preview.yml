@@ -102,8 +102,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
-          TAG="preview-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
-          TITLE="v${VERSION%%+*}"
+          TAG="v${VERSION%%+*}"
+          case "${TAG}" in
+            *.dev[0-9]*) ;;
+            *) echo "Source is a stable version; no preview to publish."; exit 0 ;;
+          esac
           if DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft')"; then
             if test "${DRAFT}" = false; then
               echo "${TAG} is already published; skipping."
@@ -111,7 +114,7 @@ jobs:
             fi
           else
             gh release create "${TAG}" --draft --prerelease --latest=false \
-              --target "${GITHUB_SHA}" --title "${TITLE}" \
+              --target "${GITHUB_SHA}" --title "${TAG}" \
               --notes "Main build: ${VERSION} (${GITHUB_SHA}). Install with --preview."
           fi
           install -m 0755 install.sh release/install.sh

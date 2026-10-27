@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
@@ -79,10 +80,10 @@ def _state(tmp_path):
     return path
 
 
-def _assets(run=17, attempt=1):
+def _assets(run=17, attempt=1, version=VERSION):
     assets = {
         "install.sh": "new installer",
-        "preview.txt": f"{COMMIT} {VERSION} {run} {attempt}\n",
+        "preview.txt": f"{COMMIT} {version} {run} {attempt}\n",
     }
     for arch in ["amd64", "arm64"]:
         name = f"evdb_linux_{arch}_{COMMIT}_{run}_{attempt}"
@@ -91,7 +92,7 @@ def _assets(run=17, attempt=1):
     return assets
 
 
-def _publish(tmp_path, state, *, run=17, attempt=1, fail_upload=""):
+def _publish(tmp_path, state, *, run=17, attempt=1, fail_upload="", version=VERSION):
     work = tmp_path / f"run-{run}-{attempt}"
     work.mkdir(exist_ok=True)
     binary_dir = work / "bin"
@@ -101,7 +102,7 @@ def _publish(tmp_path, state, *, run=17, attempt=1, fail_upload=""):
     gh.chmod(0o755)
     release = work / "release"
     release.mkdir(exist_ok=True)
-    for name, content in _assets(run, attempt).items():
+    for name, content in _assets(run, attempt, version).items():
         if name.startswith("evdb_linux_"):
             (release / name).write_text(content)
     (work / "install.sh").write_text("new installer")
@@ -116,7 +117,7 @@ def _publish(tmp_path, state, *, run=17, attempt=1, fail_upload=""):
             "GITHUB_RUN_NUMBER": str(run),
             "GITHUB_RUN_ATTEMPT": str(attempt),
             "GITHUB_REPOSITORY": "example/evdb",
-            "VERSION": VERSION,
+            "VERSION": version,
             "FAIL_UPLOAD": fail_upload,
         },
         text=True,
@@ -149,8 +150,8 @@ def test_first_publication_attaches_all_assets_to_draft_before_publishing(tmp_pa
     result, state = _publish(tmp_path, _state(tmp_path))
 
     assert result.returncode == 0, result.stderr
-    assert list(state["releases"]) == ["preview-17-1"]
-    release = state["releases"]["preview-17-1"]
+    assert list(state["releases"]) == ["v1.2.4.dev17"]
+    release = state["releases"]["v1.2.4.dev17"]
     assert release["title"] == "v1.2.4.dev17"
     assert VERSION in release["body"]
     assert release["target"] == COMMIT
@@ -162,8 +163,25 @@ def test_first_publication_attaches_all_assets_to_draft_before_publishing(tmp_pa
     assert all(flag in create for flag in ["--draft", "--prerelease", "--latest=false"])
 
 
-@pytest.mark.parametrize(("run", "attempt"), [(18, 1), (17, 2), (16, 1)])
-def test_new_publication_leaves_previous_release_unchanged(tmp_path, run, attempt):
+@pytest.mark.parametrize("run", [18, 16])
+def test_new_version_leaves_previous_release_unchanged(tmp_path, run):
+    state = _state(tmp_path)
+    first, before = _publish(tmp_path, state)
+    assert first.returncode == 0, first.stderr
+
+    version = f"1.2.4.dev{run}+gabc1234"
+    result, after = _publish(tmp_path, state, run=run, version=version)
+
+    assert result.returncode == 0, result.stderr
+    assert len(after["releases"]) == 2
+    assert after["releases"]["v1.2.4.dev17"] == before["releases"]["v1.2.4.dev17"]
+    release = after["releases"][f"v1.2.4.dev{run}"]
+    assert not release["draft"]
+    assert release["assets"] == release["published_assets"] == _assets(run, version=version)
+
+
+@pytest.mark.parametrize(("run", "attempt"), [(17, 1), (17, 2), (18, 1)])
+def test_published_version_is_reused_across_runs_and_attempts(tmp_path, run, attempt):
     state = _state(tmp_path)
     first, before = _publish(tmp_path, state)
     assert first.returncode == 0, first.stderr
@@ -171,24 +189,9 @@ def test_new_publication_leaves_previous_release_unchanged(tmp_path, run, attemp
     result, after = _publish(tmp_path, state, run=run, attempt=attempt)
 
     assert result.returncode == 0, result.stderr
-    assert len(after["releases"]) == 2
-    assert after["releases"]["preview-17-1"] == before["releases"]["preview-17-1"]
-    release = after["releases"][f"preview-{run}-{attempt}"]
-    assert not release["draft"]
-    assert release["assets"] == release["published_assets"] == _assets(run, attempt)
-
-
-def test_published_run_attempt_is_idempotent(tmp_path):
-    state = _state(tmp_path)
-    first, before = _publish(tmp_path, state)
-    assert first.returncode == 0, first.stderr
-
-    result, after = _publish(tmp_path, state)
-
-    assert result.returncode == 0, result.stderr
     assert after["releases"] == before["releases"]
     assert after["calls"][len(before["calls"]) :] == [
-        ["release", "view", "preview-17-1", "--json", "isDraft", "--jq", ".isDraft"]
+        ["release", "view", "v1.2.4.dev17", "--json", "isDraft", "--jq", ".isDraft"]
     ]
 
 
@@ -199,7 +202,7 @@ def test_failed_upload_keeps_draft_and_same_attempt_recovers(tmp_path, asset):
     state = _state(tmp_path)
     failed, partial = _publish(tmp_path, state, fail_upload=asset)
     assert failed.returncode != 0
-    draft = partial["releases"]["preview-17-1"]
+    draft = partial["releases"]["v1.2.4.dev17"]
     assert draft["draft"]
     assert draft["assets"] and asset not in draft["assets"]
     assert "published_assets" not in draft
@@ -207,7 +210,7 @@ def test_failed_upload_keeps_draft_and_same_attempt_recovers(tmp_path, asset):
     result, after = _publish(tmp_path, state)
 
     assert result.returncode == 0, result.stderr
-    release = after["releases"]["preview-17-1"]
+    release = after["releases"]["v1.2.4.dev17"]
     assert not release["draft"]
     assert release["assets"] == release["published_assets"] == _assets()
     calls = after["calls"][len(partial["calls"]) :]
@@ -222,7 +225,7 @@ def test_fake_github_rejects_changes_to_published_releases(tmp_path, operation):
     assert first.returncode == 0, first.stderr
 
     result = subprocess.run(
-        [sys.executable, "-c", FAKE_GH, "release", operation, "preview-17-1"],
+        [sys.executable, "-c", FAKE_GH, "release", operation, "v1.2.4.dev17"],
         env={**os.environ, "RELEASE_STATE": str(state)},
         text=True,
         capture_output=True,
@@ -232,3 +235,28 @@ def test_fake_github_rejects_changes_to_published_releases(tmp_path, operation):
     assert result.returncode != 0
     assert "HTTP 422" in result.stderr
     assert json.loads(state.read_text())["releases"] == before["releases"]
+
+
+def test_stable_source_version_does_not_publish_a_preview(tmp_path):
+    result, state = _publish(tmp_path, _state(tmp_path), version="1.2.3")
+
+    assert result.returncode == 0, result.stderr
+    assert not state["releases"]
+    assert not state["calls"]
+
+
+@pytest.mark.parametrize(
+    ("tag", "expected"),
+    [
+        ("v1.2.3", True),
+        ("v1.2.4.dev17", False),
+        ("v1.2.4rc1.dev2", False),
+    ],
+)
+def test_stable_release_trigger_excludes_development_tags(tag, expected):
+    stable = yaml.load((ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader)
+    matches = False
+    for pattern in stable["on"]["push"]["tags"]:
+        if fnmatchcase(tag, pattern.removeprefix("!")):
+            matches = not pattern.startswith("!")
+    assert matches is expected

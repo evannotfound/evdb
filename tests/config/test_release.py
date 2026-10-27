@@ -89,7 +89,7 @@ def test_preview_checker_rejects_non_scm_or_dirty_version(tmp_path, version):
     assert "invalid preview version" in result.stderr
 
 
-def test_scm_describe_ignores_rolling_preview_tag(tmp_path):
+def test_scm_describe_ignores_preview_tags(tmp_path):
     def git(*args):
         return subprocess.run(
             ["git", *args], cwd=tmp_path, text=True, capture_output=True, check=True
@@ -121,8 +121,21 @@ def test_scm_describe_ignores_rolling_preview_tag(tmp_path):
     describe = config["tool"]["setuptools_scm"]["scm"]["git"]["describe_command"]
     before = git(*describe[1:])
     git("tag", "preview")
+    git("tag", "preview-3-1")
+    git("tag", "v1.2.4.dev1")
 
     assert before.startswith("v1.2.3-1-g")
     assert git(*describe[1:]) == before
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "after preview",
+    )
+    assert git(*describe[1:]).startswith("v1.2.3-2-g")
     git("tag", "v1.2.4")
     assert git(*describe[1:]).startswith("v1.2.4-0-g")

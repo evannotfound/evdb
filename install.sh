@@ -139,15 +139,15 @@ if [ "${PREVIEW}" -eq 1 ]; then
         download "${INDEX}" "${STAGE}/releases.json" 16777216 "${STAGE}/headers"
         # The public endpoint excludes drafts; only workflow-owned preview tags qualify.
         tr '\n' ' ' < "${STAGE}/releases.json" | \
-            grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"preview-[1-9][0-9]*-[1-9][0-9]*"' | \
-            sed -E 's/.*"(preview-[0-9]+-[0-9]+)"$/\1/' >> "${STAGE}/tags"
+            grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?\.dev[0-9]+"' | \
+            sed -E 's/.*"(v[^"]+)"$/\1/' >> "${STAGE}/tags"
         if ! grep -qi 'rel="next"' "${STAGE}/headers"; then
             break
         fi
         PAGE=$((PAGE + 1))
         INDEX="${RELEASES_API}&page=${PAGE}"
     done
-    TAG=$(sort -t- -k2,2nr -k3,3nr "${STAGE}/tags" | head -n 1)
+    TAG=$(LC_ALL=C sort -Vr "${STAGE}/tags" | head -n 1)
     [ -n "${TAG}" ] || fail "no published preview is available"
     BASE="${RELEASES}/download/${TAG}"
     download "${BASE}/preview.txt" "${STAGE}/preview.txt" 1024
@@ -161,7 +161,7 @@ if [ "${PREVIEW}" -eq 1 ]; then
     printf '%s\n' "${COMMIT}" | grep -Eq '^[0-9a-f]{40}$' || fail "preview commit is invalid"
     printf '%s\n' "${RUN}" | grep -Eq '^[1-9][0-9]*$' || fail "preview run is invalid"
     printf '%s\n' "${ATTEMPT}" | grep -Eq '^[1-9][0-9]*$' || fail "preview attempt is invalid"
-    [ "${TAG}" = "preview-${RUN}-${ATTEMPT}" ] || fail "preview manifest does not match selected release"
+    [ "${TAG}" = "v${VERSION%%+*}" ] || fail "preview manifest does not match selected release"
     valid_preview_version "${VERSION}" || fail "preview version is invalid"
     ASSET="${ASSET}_${COMMIT}_${RUN}_${ATTEMPT}"
 elif [ -n "${VERSION}" ]; then
