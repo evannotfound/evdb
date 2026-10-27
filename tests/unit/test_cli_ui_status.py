@@ -14,7 +14,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from evdb import backup, cli, database, docker, host, status, ui
-from evdb.errors import BackupError, CommandError, DatabaseError
+from evdb.errors import BackupError, CommandError, DatabaseError, ResticError
 from evdb.run import Result, clean
 
 
@@ -600,10 +600,12 @@ def test_pending_status_uses_configured_order_without_probes(config, monkeypatch
     assert all(item["health"] == "checking" for item in value["databases"].values())
 
 
-def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
+def test_status_collect_reads_one_catalog_without_remote_requests(config, monkeypatch):
     snapshots = [{"id": "shared"}]
+    saved = backup.catalog(config)
+    saved.update(snapshots=snapshots, checked_at=datetime.now(UTC).isoformat())
     calls = []
-    repository_calls = []
+    catalog_calls = []
     progress = []
     previews = []
 
@@ -611,7 +613,7 @@ def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
         calls.append((target.identity, remote_snapshots))
         return []
 
-    def host_snapshots(current):
+    def catalog(current):
         assert previews
         assert previews[0]["pending"]
         assert previews[0]["healthy"] is None
@@ -619,14 +621,14 @@ def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
             item["latest_backup"]["state"] == "loading"
             for item in previews[0]["databases"].values()
         )
-        repository_calls.append(current)
-        return snapshots
+        catalog_calls.append(current)
+        return saved
 
-    monkeypatch.setattr(status.backup, "host_snapshots", host_snapshots)
+    monkeypatch.setattr(status.backup, "catalog", catalog)
     monkeypatch.setattr(
         status.backup,
-        "repository_ready",
-        lambda current: pytest.fail("host snapshot listing already proved repository access"),
+        "_restic",
+        lambda *args, **kwargs: pytest.fail("status must not contact the repository"),
     )
     monkeypatch.setattr(status.backup, "history", history)
     monkeypatch.setattr(
@@ -650,7 +652,7 @@ def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
     value = status.collect(config, progress=progress.append, preview=previews.append)
 
     durable = {target.identity for target in config.databases if target.durable}
-    assert repository_calls == [config]
+    assert catalog_calls == [config]
     assert "pending" not in value
     assert {identity for identity, _snapshots in calls} == durable
     assert all(remote is snapshots for _identity, remote in calls)
@@ -658,7 +660,7 @@ def test_status_collect_reuses_one_host_snapshot_listing(config, monkeypatch):
     assert {message.removeprefix("Checking ") for message in progress[1:-1]} == {
         target.identity for target in config.databases
     }
-    assert progress[-1] == "Reading backup repository"
+    assert progress[-1] == "Reading saved backup catalog"
 
 
 def test_host_status_reports_each_root_assignment_and_low_custom_filesystem(config, monkeypatch):
@@ -773,6 +775,104 @@ def test_backup_all_returns_nonzero_after_reporting_every_failure(config, monkey
     assert code == 1
     assert len(output) == 2
     assert "postgres" in output[0] and "kv" in output[1]
+
+
+def test_cli_backup_refresh_is_explicit_and_reports_failure(config, monkeypatch):
+    monkeypatch.setattr(cli, "load", lambda path: config)
+    monkeypatch.setattr(cli, "_canonical", lambda path: True)
+    monkeypatch.setattr(cli, "_host_access_allowed", lambda: True)
+    calls = []
+    saved = backup.catalog(config)
+    saved["checked_at"] = "2026-10-27T12:00:00+00:00"
+    monkeypatch.setattr(backup, "refresh", lambda current: calls.append(current) or saved)
+    output = []
+    errors = []
+
+    assert cli.main(["backup", "refresh"], output=output.append) == 0
+    assert calls == [config]
+    assert saved["checked_at"] in output[0]
+    assert cli._mutating(cli.parser().parse_args(["backup", "refresh"]))
+    monkeypatch.setattr(
+        backup,
+        "refresh",
+        lambda current: (_ for _ in ()).throw(ResticError("inventory refresh failed: offline")),
+    )
+    assert cli.main(["backup", "refresh"], output=output.append, error=errors.append) == 1
+    assert errors == ["evdb: inventory refresh failed: offline"]
+
+
+def test_backup_history_cli_shows_unknown_inventory_without_remote_work(config, monkeypatch):
+    monkeypatch.setattr(cli, "load", lambda path: config)
+    monkeypatch.setattr(backup, "_restic", lambda *a, **kw: pytest.fail("remote request"))
+    output = []
+
+    assert (
+        cli.main(
+            ["--config", str(config.paths.source), "backup", "list", "app-test-01/postgres"],
+            output=output.append,
+        )
+        == 0
+    )
+    assert "not checked; run evdb backup refresh" in output[0]
+    assert "No known backups" in output[0]
+
+
+def test_backup_history_displays_cached_evidence_and_failed_refresh():
+    rows = [
+        {
+            "time": "2026-10-26T12:00:00Z",
+            "backup": "backup-1",
+            "purpose": "scheduled",
+            "source": "remote",
+            "snapshot": "snapshot-1",
+        }
+    ]
+    saved = {
+        "checked_at": "2026-10-26T13:00:00Z",
+        "refresh_error": {"time": "2026-10-27T13:00:00Z", "error": "OneDrive unavailable"},
+    }
+
+    text = ui.backup_history(rows, catalog_value=saved)
+
+    assert "Remote availability is cached" in text
+    assert "local presence is not an integrity check" in text
+    assert saved["checked_at"] in text
+    assert "OneDrive unavailable" in text
+    assert "scheduled" in text and "snapshot-1" in text
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_guided_refresh_updates_host_inventory_and_invalidates_status(config, monkeypatch, failed):
+    events = []
+
+    class Session:
+        def invalidate(self, current):
+            events.append("invalidate")
+
+        def start(self):
+            events.append("start")
+
+    def refresh(current):
+        assert current is config
+        events.append("refresh")
+        if failed:
+            raise ResticError("OneDrive unavailable")
+        return {"checked_at": "2026-10-27T12:00:00Z"}
+
+    monkeypatch.setattr(backup, "refresh", refresh)
+    answers = iter(["3", "2", "0"])
+    output = []
+    ui._backups(
+        config,
+        config.select("app-test-01/postgres"),
+        lambda prompt: next(answers),
+        output.append,
+        session=Session(),
+    )
+
+    assert events == ["invalidate", "refresh", "start"]
+    assert "all databases" in "\n".join(output)
+    assert ("OneDrive unavailable" if failed else "Backup inventory refreshed") in "\n".join(output)
 
 
 def test_guided_backup_creation_restarts_background_refresh(config, monkeypatch):
@@ -1430,7 +1530,7 @@ def test_status_json_survives_unavailable_host_and_database_probes(config, monke
     monkeypatch.setattr(status, "run", failed)
     monkeypatch.setattr(status.docker, "state", failed)
     monkeypatch.setattr(status.backup, "repository_ready", failed)
-    monkeypatch.setattr(status.backup, "host_snapshots", failed)
+    monkeypatch.setattr(status.backup, "catalog", failed)
     monkeypatch.setattr(status.backup, "history", failed)
     monkeypatch.setattr(database, "observe", failed)
 

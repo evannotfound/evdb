@@ -1,8 +1,11 @@
 import json
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from threading import Event, get_ident
 from urllib.parse import quote
 
 import pytest
@@ -60,6 +63,11 @@ def test_checked_backup_manifest_upload_and_local_cleanup(config, monkeypatch):
     assert folder.parent.stat().st_mode & 0o777 == 0o711
     assert "verification" not in json.dumps(record).lower()
     assert "machine" not in json.dumps(record).lower()
+    saved = backup.catalog(config)
+    assert saved["snapshots"][0]["id"] == "snapshot-1"
+    assert saved["attempts"][target.identity]["ok"]
+    assert saved["checked_at"] is None
+    assert (config.paths.state / "backup-catalog.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_completed_backup_handoff_is_recursive_and_rejects_symlinks(config, tmp_path):
@@ -103,6 +111,7 @@ def test_upload_failure_keeps_complete_local_folder(config, monkeypatch):
     folders = [item for item in target.paths.role_backups(target.project, target.role).iterdir()]
     assert len(folders) == 1
     assert backup.manifest_check(folders[0])["upload"]["ok"] is False
+    assert not backup.catalog(config)["attempts"][target.identity]["ok"]
 
 
 def test_cache_backup_never_calls_engine(config, monkeypatch):
@@ -130,9 +139,10 @@ def test_create_all_continues_and_reports_failures(config, monkeypatch):
         return {"backup": "kv-backup", "snapshot": "kv-snapshot"}
 
     monkeypatch.setattr(backup, "create", create)
+    monkeypatch.setattr(backup, "refresh", lambda current: calls.append("refresh"))
     values = backup.create_all(config)
 
-    assert calls == ["app-test-01/postgres", "app-test-01/kv"]
+    assert calls == ["app-test-01/postgres", "app-test-01/kv", "refresh"]
     assert not values["app-test-01/postgres"]["ok"]
     assert values["app-test-01/kv"]["ok"]
 
@@ -278,6 +288,7 @@ def test_create_all_redacts_exact_and_encoded_credentials(config, monkeypatch):
             BackupError(f"repository visible {secret} {encoded}")
         ),
     )
+    monkeypatch.setattr(backup, "refresh", lambda current: None)
 
     values = backup.create_all(config)
 
@@ -338,17 +349,9 @@ def test_matched_remote_snapshot_time_drives_history_and_freshness(config, monke
         "time": snapshot_time.isoformat(),
     }
     backup.manifest_write(created["folder"], record)
-    monkeypatch.setattr(
-        backup,
-        "snapshots",
-        lambda *args: [
-            {
-                "id": "snapshot-after-long-upload",
-                "time": snapshot_time.isoformat(),
-                "tags": [f"backup:{record['backup']}", "purpose:manual"],
-            }
-        ],
-    )
+    saved = backup.catalog(config)
+    saved["snapshots"][0]["time"] = snapshot_time.isoformat()
+    backup.write_json(config.paths.state / "backup-catalog.json", saved)
     monkeypatch.setattr(
         database,
         "observe",
@@ -363,3 +366,201 @@ def test_matched_remote_snapshot_time_drives_history_and_freshness(config, monke
     assert value["latest_backup"]["time"] == snapshot_time.isoformat()
     assert value["latest_backup"]["state"] == "current"
     assert not any(item["code"] == "backup_stale" for item in errors)
+
+
+def _snapshot(config, target, *, identity="snapshot-1", hours=0):
+    return {
+        "id": identity,
+        "time": (datetime.now(UTC) - timedelta(hours=hours)).isoformat(),
+        "tags": sorted(backup._identity_tags(config, target))
+        + [f"engine:{target.engine}", "backup:backup-1", "purpose:manual"],
+    }
+
+
+def test_history_reads_catalog_without_remote_calls_or_dump_hashing(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    _ready(config, target)
+    monkeypatch.setattr(backup, "get", lambda engine: Engine)
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
+    monkeypatch.setattr(backup, "_upload", lambda *args: "snapshot-1")
+    created = backup.create(config, target)
+    monkeypatch.setattr(backup, "_restic", lambda *a, **kw: pytest.fail("remote request"))
+    monkeypatch.setattr(backup, "file_hash", lambda *a: pytest.fail("dump hashed"))
+
+    rows = backup.history(config, target)
+
+    assert rows[0]["source"] == "local+remote"
+    assert rows[0]["snapshot"] == "snapshot-1"
+    shutil.rmtree(created["folder"])
+    assert backup.history(config, target)[0]["source"] == "remote"
+
+
+def test_history_presence_does_not_replace_integrity_checks(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    _ready(config, target)
+    monkeypatch.setattr(backup, "get", lambda engine: Engine)
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
+    monkeypatch.setattr(backup, "_upload", lambda *args: "snapshot-1")
+    created = backup.create(config, target)
+    folder = backup.Path(created["folder"])
+    (folder / "data.bin").write_bytes(b"changed data")
+
+    assert backup.history(config, target)[0]["local"]
+    with pytest.raises(BackupError, match="backup file changed"):
+        backup.manifest_check(folder)
+
+
+def test_missing_catalog_is_local_unknown_and_other_repository_is_ignored(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    monkeypatch.setattr(backup, "_restic", lambda *a, **kw: pytest.fail("remote request"))
+    assert backup.history(config, target) == []
+    value, errors = status._backup(config, target)
+    assert value["state"] == "unknown"
+    assert {item["code"] for item in errors} == {"backup_unknown"}
+    saved = backup.catalog(config)
+    saved.update(repository="other", snapshots=[_snapshot(config, target)], checked_at="yesterday")
+    backup.write_json(config.paths.state / "backup-catalog.json", saved)
+    assert backup.catalog(config)["checked_at"] is None
+    assert backup.history(config, target) == []
+
+
+def test_refresh_replaces_inventory_once_and_preserves_attempts(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    saved = backup.catalog(config)
+    saved["snapshots"] = [_snapshot(config, target, identity="removed")]
+    backup.write_json(config.paths.state / "backup-catalog.json", saved)
+    calls = []
+    snapshot = _snapshot(config, target)
+
+    def restic(current, args, **kwargs):
+        calls.append(args)
+        backup._record(config, target, error="attempt failed while refreshing")
+        return Result(("restic",), 0, json.dumps([snapshot]), "")
+
+    monkeypatch.setattr(backup, "_restic", restic)
+    refreshed = backup.refresh(config)
+
+    assert calls == [["snapshots", "--json", "--tag", f"host:{config.host.id}"]]
+    assert refreshed["snapshots"] == [snapshot]
+    assert refreshed["checked_at"]
+    assert refreshed["refresh_error"] is None
+    assert refreshed["attempts"][target.identity]["error"] == "attempt failed while refreshing"
+    assert backup.catalog(config) == refreshed
+
+
+def test_failed_refresh_retains_inventory_and_redacts_error(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    saved = backup.catalog(config)
+    saved.update(
+        snapshots=[_snapshot(config, target)],
+        checked_at=datetime.now(UTC).isoformat(),
+        repository_checked_at=datetime.now(UTC).isoformat(),
+    )
+    backup.write_json(config.paths.state / "backup-catalog.json", saved)
+    secret = config.secrets.restic_password
+    monkeypatch.setattr(
+        backup,
+        "_restic",
+        lambda *a, **kw: (_ for _ in ()).throw(ResticError(f"OneDrive failed {secret}")),
+    )
+
+    with pytest.raises(ResticError, match="inventory refresh failed"):
+        backup.refresh(config)
+
+    failed = backup.catalog(config)
+    assert failed["checked_at"] == saved["checked_at"]
+    assert failed["snapshots"] == saved["snapshots"]
+    assert secret not in json.dumps(failed)
+    assert "<redacted>" in failed["refresh_error"]["error"]
+    value, errors = status._backup(config, target)
+    assert value["state"] == "current" and not errors
+    repository_errors = []
+    repository = status._repository(config, repository_errors)
+    assert repository["ready"] is True and repository["refresh_error"]
+    assert repository_errors[0]["code"] == "repository_assessment_failed"
+
+
+def test_catalog_backup_age_is_recomputed_and_failures_keep_success(config):
+    target = config.select("app-test-01/postgres")
+    saved = backup.catalog(config)
+    saved.update(snapshots=[_snapshot(config, target, hours=30)], checked_at=None)
+    backup.write_json(config.paths.state / "backup-catalog.json", saved)
+    backup._record(config, target, error="latest attempt failed")
+
+    value, errors = status._backup(config, target)
+
+    assert value["state"] == "stale"
+    assert value["snapshot"] == "snapshot-1"
+    assert value["last_attempt"]["error"] == "latest attempt failed"
+    assert {item["code"] for item in errors} == {"backup_stale", "backup_failed"}
+
+
+def test_concurrent_catalog_updates_preserve_each_role(config):
+    targets = config.databases
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(backup._record, config, target, error=f"failed {target.identity}")
+            for target in targets
+        ]
+        for future in futures:
+            future.result()
+
+    assert set(backup.catalog(config)["attempts"]) == {target.identity for target in targets}
+
+
+def test_failed_refresh_cannot_overwrite_a_newer_success(config, monkeypatch):
+    original_lock = backup.lock
+    publishing_failure = Event()
+    release_failure = Event()
+    second_listing = Event()
+    failed_thread = []
+
+    @contextmanager
+    def locking(path, **kwargs):
+        if path.name == "backup-catalog.lock" and failed_thread == [get_ident()]:
+            publishing_failure.set()
+            assert release_failure.wait(2)
+        with original_lock(path, **kwargs):
+            yield
+
+    def restic(*args, **kwargs):
+        if not failed_thread:
+            failed_thread.append(get_ident())
+            raise ResticError("older refresh failed")
+        second_listing.set()
+        return Result(("restic",), 0, "[]", "")
+
+    monkeypatch.setattr(backup, "lock", locking)
+    monkeypatch.setattr(backup, "_restic", restic)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(backup.refresh, config)
+        try:
+            assert publishing_failure.wait(1)
+            second = pool.submit(backup.refresh, config)
+            assert not second_listing.wait(0.2)
+        finally:
+            release_failure.set()
+        with pytest.raises(ResticError, match="older refresh failed"):
+            first.result(timeout=2)
+        assert second.result(timeout=2)["refresh_error"] is None
+
+    assert backup.catalog(config)["checked_at"]
+    assert backup.catalog(config)["refresh_error"] is None
+
+
+def test_create_all_reports_refresh_failure_and_empty_host_skips_refresh(config, monkeypatch):
+    monkeypatch.setattr(
+        backup, "create", lambda *a, **kw: {"backup": "backup-1", "snapshot": "snapshot-1"}
+    )
+    calls = []
+
+    def refresh(current):
+        calls.append(current)
+        raise ResticError("inventory unavailable")
+
+    monkeypatch.setattr(backup, "refresh", refresh)
+    values = backup.create_all(config)
+    assert values["host/repository"] == {"ok": False, "error": "inventory unavailable"}
+    assert all(values[target.identity]["ok"] for target in config.databases)
+    assert backup.create_all(replace(config, projects=())) == {}
+    assert calls == [config]

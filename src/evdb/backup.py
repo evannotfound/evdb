@@ -49,6 +49,10 @@ def initialize(config: Config) -> None:
                 f"({result.code}): {detail}"
             )
         _require_format(config, result)
+        with lock(config.paths.locks / "backup-catalog.lock", timeout=30):
+            value = catalog(config)
+            value["repository_checked_at"] = datetime.now(UTC).isoformat()
+            write_json(config.paths.state / "backup-catalog.json", value)
 
 
 def preflight(config: Config) -> str:
@@ -102,6 +106,20 @@ def create(
         raise BackupError(f"backups are disabled for cache database {database.identity}")
     if purpose not in {"manual", "scheduled"}:
         raise BackupError(f"invalid backup purpose: {purpose}")
+    context = (
+        nullcontext()
+        if lock_held
+        else operation(config, database, timeout=config.host.timeouts["backup"])
+    )
+    with context:
+        try:
+            return _create(config, database, purpose=purpose)
+        except (Error, OSError) as exc:
+            _record(config, database, error=_message(config, exc))
+            raise
+
+
+def _create(config: Config, database: Database, *, purpose: str) -> dict[str, Any]:
     if not database.compose.is_file():
         raise BackupError(f"database generated files are missing: {database.identity}")
     operator = repository_owner(config.host.backup)
@@ -109,67 +127,62 @@ def create(
     require_space(root, config.host.backup.min_free_gb)
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     partial = root / f"{run_id}.partial"
-    context = (
-        nullcontext()
-        if lock_held
-        else operation(config, database, timeout=config.host.timeouts["backup"])
-    )
-    with context:
-        private_dir(partial)
-        folder = None
-        started = datetime.now(UTC).isoformat()
-        try:
-            facts = get(database.engine).backup(database, partial, run_id)
-            names = facts.pop("files")
-            record = {
-                "status": "complete",
-                "backup": run_id,
-                "host": config.host.id,
-                "project": database.project,
-                "role": database.role,
-                "engine": database.engine,
-                "image": database.image,
-                "started": started,
-                "finished": datetime.now(UTC).isoformat(),
-                "version": facts.pop("version"),
-                "format": facts.pop("format"),
-                "purpose": purpose,
-                "facts": facts,
-                "files": manifest_files(partial, names),
-                "checks": ["size", "sha256", database.engine],
-                "upload": {"ok": False, "backup": run_id},
-            }
-            manifest_write(partial, record)
-            folder = finish(partial)
-            _handoff(folder, operator)
-        except BaseException:
-            shutil.rmtree(folder or partial, ignore_errors=True)
-            raise
-        try:
-            snapshot = _upload(config, database, folder)
-        except (Error, OSError) as exc:
-            raise ResticError(
-                f"{database.identity}: upload to repository "
-                f"{config.host.backup.repository} failed; "
-                f"local backup retained at {folder}: {exc}"
-            ) from exc
-        record["upload"] = {
-            "ok": True,
+    private_dir(partial)
+    folder = None
+    started = datetime.now(UTC).isoformat()
+    try:
+        facts = get(database.engine).backup(database, partial, run_id)
+        names = facts.pop("files")
+        record = {
+            "status": "complete",
             "backup": run_id,
-            "snapshot": snapshot,
-            "time": datetime.now(UTC).isoformat(),
+            "host": config.host.id,
+            "project": database.project,
+            "role": database.role,
+            "engine": database.engine,
+            "image": database.image,
+            "started": started,
+            "finished": datetime.now(UTC).isoformat(),
+            "version": facts.pop("version"),
+            "format": facts.pop("format"),
+            "purpose": purpose,
+            "facts": facts,
+            "files": manifest_files(partial, names),
+            "checks": ["size", "sha256", database.engine],
+            "upload": {"ok": False, "backup": run_id},
         }
-        try:
-            manifest_write(folder, record, mode=0o400, owner=(operator.uid, operator.gid))
-        finally:
-            _handoff(folder, operator)
-        _clean(config, database, root, keep=2)
-        return {
-            **record,
-            "folder": str(folder),
-            "snapshot": record["upload"].get("snapshot"),
-            "repository": config.host.backup.repository,
-        }
+        manifest_write(partial, record)
+        folder = finish(partial)
+        _handoff(folder, operator)
+    except BaseException:
+        shutil.rmtree(folder or partial, ignore_errors=True)
+        raise
+    try:
+        snapshot = _upload(config, database, folder)
+    except (Error, OSError) as exc:
+        raise ResticError(
+            f"{database.identity}: upload to repository "
+            f"{config.host.backup.repository} failed; "
+            f"local backup retained at {folder}: {exc}"
+        ) from exc
+    record["upload"] = {
+        "ok": True,
+        "backup": run_id,
+        "snapshot": snapshot,
+        "time": datetime.now(UTC).isoformat(),
+    }
+    _record(config, database, record=record)
+    try:
+        manifest_write(folder, record, mode=0o400, owner=(operator.uid, operator.gid))
+    finally:
+        _handoff(folder, operator)
+    _clean(config, database, root, keep=2)
+    return {
+        **record,
+        "folder": str(folder),
+        "snapshot": record["upload"].get("snapshot"),
+        "repository": config.host.backup.repository,
+    }
 
 
 def create_all(config: Config) -> dict[str, dict[str, Any]]:
@@ -186,7 +199,99 @@ def create_all(config: Config) -> dict[str, dict[str, Any]]:
             }
         except (Error, OSError) as exc:
             results[database.identity] = {"ok": False, "error": _message(config, exc)}
+    if results:
+        try:
+            refresh(config)
+        except (Error, OSError) as exc:
+            results["host/repository"] = {"ok": False, "error": _message(config, exc)}
     return results
+
+
+def catalog(config: Config) -> dict[str, Any]:
+    empty = {
+        "host": config.host.id,
+        "repository": config.host.backup.repository,
+        "checked_at": None,
+        "repository_checked_at": None,
+        "refresh_error": None,
+        "snapshots": [],
+        "attempts": {},
+    }
+    try:
+        value = read_json(config.paths.state / "backup-catalog.json")
+    except FileNotFoundError:
+        return empty
+    except ValueError as exc:
+        raise BackupError("invalid backup catalog; expected JSON") from exc
+    if not isinstance(value, dict):
+        raise BackupError("invalid backup catalog")
+    if value.get("host") != empty["host"] or value.get("repository") != empty["repository"]:
+        return empty
+    if (
+        not isinstance(value.get("snapshots"), list)
+        or not all(isinstance(item, dict) for item in value["snapshots"])
+        or not isinstance(value.get("attempts"), dict)
+    ):
+        raise BackupError("invalid backup catalog")
+    return {**empty, **value}
+
+
+def refresh(config: Config) -> dict[str, Any]:
+    with lock(_repository_lock(config), timeout=300):
+        try:
+            snapshots = _snapshot_values(config, {f"host:{config.host.id}"}, lock_held=True)
+            with lock(config.paths.locks / "backup-catalog.lock", timeout=30):
+                value = catalog(config)
+                now = datetime.now(UTC).isoformat()
+                value.update(
+                    snapshots=snapshots,
+                    checked_at=now,
+                    repository_checked_at=now,
+                    refresh_error=None,
+                )
+                write_json(config.paths.state / "backup-catalog.json", value)
+                return value
+        except (Error, OSError) as exc:
+            with lock(config.paths.locks / "backup-catalog.lock", timeout=30):
+                value = catalog(config)
+                value["refresh_error"] = {
+                    "time": datetime.now(UTC).isoformat(),
+                    "error": _message(config, exc),
+                }
+                write_json(config.paths.state / "backup-catalog.json", value)
+            raise ResticError(f"backup inventory refresh failed: {_message(config, exc)}") from exc
+
+
+def _record(
+    config: Config,
+    database: Database,
+    *,
+    record: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    with lock(config.paths.locks / "backup-catalog.lock", timeout=30):
+        value = catalog(config)
+        attempt = {"time": datetime.now(UTC).isoformat(), "ok": error is None}
+        if record is not None:
+            upload = record["upload"]
+            snapshot = {
+                "id": upload["snapshot"],
+                "time": upload["time"],
+                "tags": sorted(_identity_tags(config, database))
+                + [
+                    f"engine:{database.engine}",
+                    f"backup:{record['backup']}",
+                    f"purpose:{record['purpose']}",
+                ],
+            }
+            if not any(item.get("id") == snapshot["id"] for item in value["snapshots"]):
+                value["snapshots"].append(snapshot)
+            value["repository_checked_at"] = upload["time"]
+            attempt.update(backup=record["backup"], snapshot=upload["snapshot"])
+        else:
+            attempt["error"] = error
+        value["attempts"][database.identity] = attempt
+        write_json(config.paths.state / "backup-catalog.json", value)
 
 
 def history(
@@ -204,7 +309,7 @@ def history(
             if not folder.is_dir() or folder.name.endswith(".partial"):
                 continue
             try:
-                record = manifest_check(folder)
+                record = manifest_check(folder, verify=False)
             except BackupError, OSError, ValueError:
                 continue
             if not _matches(config, database, record) or record["backup"] != folder.name:
@@ -222,10 +327,10 @@ def history(
             )
     by_snapshot = {row["snapshot"]: row for row in rows if row["snapshot"]}
     by_backup = {row["backup"]: row for row in rows}
-    remote = (
-        snapshots(config, database)
-        if remote_snapshots is None
-        else _matching_snapshots(config, database, remote_snapshots)
+    remote = _matching_snapshots(
+        config,
+        database,
+        catalog(config)["snapshots"] if remote_snapshots is None else remote_snapshots,
     )
     for snapshot in remote:
         snapshot_id = snapshot.get("id")
@@ -267,9 +372,11 @@ def host_snapshots(config: Config) -> list[dict[str, Any]]:
     return _snapshot_values(config, {f"host:{config.host.id}"})
 
 
-def _snapshot_values(config: Config, tags: set[str]) -> list[dict[str, Any]]:
+def _snapshot_values(
+    config: Config, tags: set[str], *, lock_held: bool = False
+) -> list[dict[str, Any]]:
     args = ["snapshots", "--json", "--tag", ",".join(sorted(tags))]
-    with lock(_repository_lock(config), timeout=300):
+    with nullcontext() if lock_held else lock(_repository_lock(config), timeout=300):
         result = _restic(config, args, timeout=300)
     try:
         values = json.loads(result.out)
@@ -334,7 +441,7 @@ def manifest_files(folder: str | Path, names: list[str]) -> list[dict[str, Any]]
     return result
 
 
-def manifest_check(folder: str | Path) -> dict[str, Any]:
+def manifest_check(folder: str | Path, *, verify: bool = True) -> dict[str, Any]:
     root = Path(folder)
     data = manifest_read(root)
     required = {
@@ -416,7 +523,7 @@ def manifest_check(folder: str | Path) -> dict[str, Any]:
             raise BackupError(f"unsafe backup file record: {name}")
         recorded.add(name)
         target = require_file(root / name, mode=None)
-        if target.stat().st_size != size or file_hash(target) != checksum:
+        if target.stat().st_size != size or (verify and file_hash(target) != checksum):
             raise BackupError(f"backup file changed: {name}")
     actual = {
         str(path.relative_to(root))

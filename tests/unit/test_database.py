@@ -463,17 +463,17 @@ def test_kv_info_reports_public_and_loopback_http_endpoints(config, monkeypatch)
         "observe",
         lambda *args: {"running": False, "healthy": False, "health": "stopped"},
     )
-    monkeypatch.setattr(backup, "history", lambda *args: [])
+    monkeypatch.setattr(backup, "history", lambda *args, **kwargs: [])
 
     value = database.info(config, target)
     connection = value["connection"]
 
     assert connection["http_url"] == f"https://{target.domain}"
     assert connection["http_loopback"] == f"http://127.0.0.1:{target.http_port}"
-    assert value["backup"]["state"] == "missing"
+    assert value["backup"]["state"] == "unknown"
 
 
-def test_info_reuses_observed_runtime_and_queries_fresh_backup_history(config, monkeypatch):
+def test_info_reuses_observed_runtime_and_reads_cached_backup_history(config, monkeypatch):
     target = config.select("app-test-01/kv")
     observed = {"running": False, "healthy": False, "health": "stopped"}
     calls = []
@@ -482,7 +482,7 @@ def test_info_reuses_observed_runtime_and_queries_fresh_backup_history(config, m
         "observe",
         lambda *args: pytest.fail("current guided observation should be reused"),
     )
-    monkeypatch.setattr(backup, "history", lambda *args: calls.append(args) or [])
+    monkeypatch.setattr(backup, "history", lambda *args, **kwargs: calls.append(args) or [])
 
     value = database.info(config, target, observed=observed)
 
@@ -530,7 +530,7 @@ def test_info_separates_role_storage_from_live_data(config, monkeypatch):
             },
         ),
     )
-    monkeypatch.setattr(backup, "history", lambda *args: [])
+    monkeypatch.setattr(backup, "history", lambda *args, **kwargs: [])
 
     value = database.info(config, target, observed=observed)
 
@@ -759,7 +759,7 @@ def test_render_rejects_changed_data_root_before_mutation(config, tmp_path, monk
     assert target.compose.read_text() == before
 
 
-def test_info_reports_latest_validated_backup_without_credentials(config, monkeypatch):
+def test_info_reports_latest_known_backup_without_credentials(config, monkeypatch):
     target = config.select("app-test-01/kv")
     monkeypatch.setattr(
         database,
@@ -769,7 +769,7 @@ def test_info_reports_latest_validated_backup_without_credentials(config, monkey
     monkeypatch.setattr(
         backup,
         "history",
-        lambda *args: [
+        lambda *args, **kwargs: [
             {
                 "backup": "latest-backup",
                 "time": "2026-07-28T12:00:00+00:00",
@@ -793,6 +793,10 @@ def test_info_reports_latest_validated_backup_without_credentials(config, monkey
         "time": "2026-07-28T12:00:00+00:00",
         "backup": "latest-backup",
         "snapshot": "latest-snapshot",
+        "cached": True,
+        "checked_at": "not checked; run evdb backup refresh",
+        "refresh_error": None,
+        "last_attempt": None,
     }
     assert target.credentials.password not in str(summary)
     assert target.credentials.http_token not in str(summary)
@@ -812,7 +816,7 @@ def test_info_reports_disabled_and_redacted_backup_errors(config, monkeypatch):
     monkeypatch.setattr(
         backup,
         "history",
-        lambda *args: (_ for _ in ()).throw(DatabaseError(f"history failed {secret}")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(DatabaseError(f"history failed {secret}")),
     )
 
     summary = database.info(config, target)["backup"]

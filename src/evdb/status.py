@@ -59,24 +59,16 @@ def collect(
         if preview is not None:
             preview(_result(host, databases, local_errors, pending=True))
 
-    remote_snapshots = None
+    catalog_value = None
     backup_failure = None
     repository_errors = []
-    _progress(progress, "Reading backup repository")
-    if any(target.durable for target in selected):
-        try:
-            remote_snapshots = backup.host_snapshots(config)
-            repository = {
-                "url": config.host.backup.repository,
-                "ready": True,
-                "available": True,
-            }
-        except (Error, OSError) as exc:
-            backup_failure = exc
-            remote_snapshots = []
-            repository = _repository_error(config, repository_errors, exc)
-    else:
-        repository = _repository(config, repository_errors)
+    _progress(progress, "Reading saved backup catalog")
+    try:
+        catalog_value = backup.catalog(config)
+        repository = _repository(config, repository_errors, catalog_value=catalog_value)
+    except (Error, OSError) as exc:
+        backup_failure = exc
+        repository = _repository_error(config, repository_errors, exc)
 
     final_host = {**host, "repository": repository}
     final_host["healthy"] = _host_healthy(final_host)
@@ -86,7 +78,7 @@ def collect(
         backup_state, backup_errors = _backup(
             config,
             target,
-            remote_snapshots=remote_snapshots,
+            catalog_value=catalog_value,
             backup_failure=backup_failure,
         )
         current_errors = _database_errors(
@@ -179,6 +171,9 @@ def render(value: dict[str, Any], *, width: int | None = None) -> str:
         )
     if not value["databases"]:
         lines.append("No databases configured")
+    lines.extend(
+        fit(line, width) for line in inventory_text(host.get("repository", {})).splitlines()
+    )
     return "\n".join(lines)
 
 
@@ -232,19 +227,40 @@ def _host_healthy(value: dict[str, Any]) -> bool:
         and value["infrastructure"]["healthy"]
         and value["timer"]["ok"]
         and value["repository"]["ready"] is True
+        and not value["repository"].get("refresh_error")
     )
 
 
-def _repository(config: Config, errors: list[dict[str, str]]) -> dict[str, Any]:
-    value = {"url": config.host.backup.repository, "ready": None, "available": False}
+def _repository(
+    config: Config,
+    errors: list[dict[str, str]],
+    *,
+    catalog_value: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
-        value["ready"] = backup.repository_ready(config)
-        value["available"] = True
+        saved = catalog_value if catalog_value is not None else backup.catalog(config)
     except (Error, OSError) as exc:
         return _repository_error(config, errors, exc)
-    if value["available"] and not value["ready"]:
+    value = {
+        "url": config.host.backup.repository,
+        "ready": True if saved["repository_checked_at"] else None,
+        "available": bool(saved["repository_checked_at"]),
+        "cached": True,
+        "checked_at": saved["checked_at"],
+        "repository_checked_at": saved["repository_checked_at"],
+        "refresh_error": saved["refresh_error"],
+    }
+    if saved["refresh_error"]:
         errors.append(
-            _error("repository_unavailable", "host/repository", config.host.backup.repository)
+            _error(
+                "repository_assessment_failed",
+                "host/repository",
+                saved["refresh_error"]["error"],
+            )
+        )
+    elif not value["available"]:
+        errors.append(
+            _error("repository_unknown", "host/repository", "repository has not been checked")
         )
     return value
 
@@ -261,17 +277,9 @@ def _repository_error(
 def _database(
     config: Config,
     target: Database,
-    *,
-    remote_snapshots: list[dict[str, Any]] | None = None,
-    backup_failure: BaseException | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     observed, assessment_errors = _observe(config, target)
-    backup_state, backup_errors = _backup(
-        config,
-        target,
-        remote_snapshots=remote_snapshots,
-        backup_failure=backup_failure,
-    )
+    backup_state, backup_errors = _backup(config, target)
     errors = _database_errors(target, observed, [*assessment_errors, *backup_errors])
     return _database_value(target, observed, backup_state, errors), errors
 
@@ -292,12 +300,18 @@ def _backup(
     config: Config,
     target: Database,
     *,
-    remote_snapshots: list[dict[str, Any]] | None = None,
+    catalog_value: dict[str, Any] | None = None,
     backup_failure: BaseException | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     errors = []
     latest = None
     if target.durable:
+        saved = catalog_value
+        if saved is None and backup_failure is None:
+            try:
+                saved = backup.catalog(config)
+            except (Error, OSError) as exc:
+                backup_failure = exc
         if backup_failure is not None:
             errors.append(
                 _error(
@@ -308,7 +322,7 @@ def _backup(
             )
         else:
             try:
-                rows = backup.history(config, target, remote_snapshots=remote_snapshots)
+                rows = backup.history(config, target, remote_snapshots=saved["snapshots"])
                 remote = [
                     row
                     for row in rows
@@ -322,26 +336,38 @@ def _backup(
                     default=None,
                 )
             except (Error, OSError) as exc:
+                backup_failure = exc
                 errors.append(
                     _error("backup_assessment_failed", target.identity, _message(config, exc))
                 )
         date = _date(latest.get("time")) if latest and latest.get("remote") else None
+        unknown = backup_failure is not None or (date is None and not saved["checked_at"])
         stale = (
             date is None
             or (datetime.now(UTC) - date).total_seconds() > config.host.backup.max_age_hours * 3600
         )
-        if stale:
+        if unknown:
+            errors.append(
+                _error("backup_unknown", target.identity, "remote backup inventory is unknown")
+            )
+        elif stale:
             errors.append(
                 _error("backup_stale", target.identity, "remote backup is stale or missing")
             )
         backup_state = {
-            "state": "stale" if stale else "current",
+            "state": "unknown" if unknown else "stale" if stale else "current",
             "time": latest.get("time") if latest else None,
             "backup": latest.get("backup") if latest else None,
             "snapshot": latest.get("snapshot") if latest else None,
             "local": latest.get("local", False) if latest else False,
             "remote": latest.get("remote", False) if latest else False,
+            "cached": True,
+            "checked_at": saved["checked_at"] if saved else None,
+            "last_attempt": saved["attempts"].get(target.identity) if saved else None,
         }
+        attempt = backup_state["last_attempt"]
+        if attempt and not attempt["ok"]:
+            errors.append(_error("backup_failed", target.identity, attempt["error"]))
     else:
         backup_state = _disabled_backup()
     return backup_state, errors
@@ -584,8 +610,23 @@ def backup_text(value: dict[str, Any]) -> str:
         return "disabled"
     if value["state"] == "stale":
         return "stale/missing"
+    if value["state"] == "unknown":
+        return "unknown"
     date = _date(value.get("time"))
     return date.strftime("%m-%d %H:%M") if date else "current"
+
+
+def inventory_text(value: dict[str, Any]) -> str:
+    checked = value.get("checked_at")
+    text = (
+        f"Remote inventory (cached): checked {checked}"
+        if checked
+        else "Remote inventory: not checked; run evdb backup refresh"
+    )
+    failure = value.get("refresh_error")
+    if failure:
+        text += f"\nRefresh failed at {failure['time']}: {failure['error']}"
+    return text
 
 
 def host_text(value: dict[str, Any]) -> str:

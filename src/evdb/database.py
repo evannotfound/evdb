@@ -593,7 +593,15 @@ def info(
         if progress is not None:
             progress("Reading backup history")
         try:
-            rows = backup.history(config, database)
+            saved = backup.catalog(config)
+            backup_summary.update(
+                state="missing" if saved["checked_at"] else "unknown",
+                cached=True,
+                checked_at=saved["checked_at"] or "not checked; run evdb backup refresh",
+                refresh_error=saved["refresh_error"],
+                last_attempt=saved["attempts"].get(database.identity),
+            )
+            rows = backup.history(config, database, remote_snapshots=saved["snapshots"])
             if rows:
                 latest = rows[0]
                 backup_summary.update(

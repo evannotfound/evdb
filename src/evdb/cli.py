@@ -120,13 +120,16 @@ def parser() -> argparse.ArgumentParser:
     logs.add_argument("database")
     logs.add_argument("--lines", type=int, default=200)
 
-    backups = commands.add_parser("backup", help="create and list backups")
+    backups = commands.add_parser(
+        "backup", help="create backups, list history, and refresh inventory"
+    )
     backup_commands = backups.add_subparsers(dest="backup_command", required=True)
     create = backup_commands.add_parser("create")
     create.add_argument("database", nargs="?")
     create.add_argument("--all", action="store_true")
     listing = backup_commands.add_parser("list")
     listing.add_argument("database")
+    backup_commands.add_parser("refresh", help="refresh saved remote inventory for this host")
     return result
 
 
@@ -279,10 +282,16 @@ def _database(config, args, output, *, terminal: bool) -> int:
 
 
 def _backup(config, args, output) -> int:
+    if args.backup_command == "refresh":
+        with ui.loading(output, "Refreshing remote backup inventory"):
+            saved = backup.refresh(config)
+        output(status.inventory_text(saved))
+        return 0
     if args.backup_command == "list":
         target = config.select(args.database)
-        rows = backup.history(config, target)
-        output(ui.backup_history(rows))
+        saved = backup.catalog(config)
+        rows = backup.history(config, target, remote_snapshots=saved["snapshots"])
+        output(ui.backup_history(rows, catalog_value=saved))
         return 0
     if args.all:
         if args.database:
@@ -328,7 +337,7 @@ def _mutating(args) -> bool:
     if args.command == "database":
         return args.database_command not in {"list", "info", "logs"}
     if args.command == "backup":
-        return args.backup_command == "create"
+        return args.backup_command in {"create", "refresh"}
     return False
 
 

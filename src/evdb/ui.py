@@ -427,6 +427,10 @@ def overview(value: dict[str, Any], *, width: int | None = None) -> str:
         )
     if not value["databases"]:
         lines.append("    No databases configured")
+    lines.extend(
+        status.fit(line, width)
+        for line in status.inventory_text(value["host"].get("repository", {})).splitlines()
+    )
     return "\n".join(lines)
 
 
@@ -522,7 +526,12 @@ def _status_table(value: dict[str, Any], *, guided: bool, width: int):
         if guided:
             row.insert(0, "")
         table.add_row(*row)
-    renderables = [summary, Text(""), table]
+    renderables = [
+        summary,
+        Text(""),
+        table,
+        Text(status.inventory_text(host.get("repository", {}))),
+    ]
     if guided:
         renderables.insert(0, Text("Databases", style="bold"))
     return Group(*renderables)
@@ -1112,8 +1121,12 @@ def _backups(
         _screen(output, "Backups are disabled for this cache database", heading="Backups")
         return config
     while True:
-        _screen(output, "1. Create\n2. History\n0. Back", heading="Backups")
-        choice = _choice(input_fn, output, "Select", {"0", "1", "2"})
+        _screen(
+            output,
+            "1. Create\n2. History\n3. Refresh remote inventory (all databases)\n0. Back",
+            heading="Backups",
+        )
+        choice = _choice(input_fn, output, "Select", {"0", "1", "2", "3"})
         if choice in {None, "0"}:
             return config
         try:
@@ -1132,12 +1145,22 @@ def _backups(
                     heading="Backup complete",
                     states=(("completed", "green"),),
                 )
+            elif choice == "2":
+                saved = backup.catalog(config)
+                rows = backup.history(config, target, remote_snapshots=saved["snapshots"])
+                _screen(output, backup_history(rows, catalog_value=saved), heading="Backup history")
             else:
+                from . import status
+
                 if session is not None:
-                    session.cancel()
-                with loading(output, f"Loading {target.identity} backup history"):
-                    rows = backup.history(config, target)
-                _screen(output, backup_history(rows), heading="Backup history")
+                    session.invalidate(config)
+                try:
+                    with loading(output, "Refreshing remote backup inventory for all databases"):
+                        saved = backup.refresh(config)
+                finally:
+                    if session is not None:
+                        session.start()
+                _screen(output, status.inventory_text(saved), heading="Backup inventory refreshed")
         except Error as exc:
             _screen(
                 output,
@@ -1206,7 +1229,9 @@ def _host(
                 "ACME": _state(infrastructure["acme"], "ready", "missing or unsafe"),
                 "Repository": {
                     "url": host["repository"]["url"],
-                    "ready": _state(host["repository"]["ready"], "yes", "no"),
+                    "last known ready": _state(host["repository"]["ready"], "yes", "no"),
+                    "inventory checked": host["repository"].get("checked_at") or "not checked",
+                    "last successful access": host["repository"].get("repository_checked_at"),
                 },
                 "Timer": {
                     "unit": host["timer"]["unit"],
@@ -1702,12 +1727,20 @@ def connection_details(value: dict[str, Any]) -> str:
     return clean("\n".join(lines))
 
 
-def backup_history(rows: list[dict[str, Any]]) -> str:
-    if not rows:
-        return "No backups available"
-    values = ["Time  Backup  Source  Snapshot"]
-    values.extend(
-        f"{row['time']}  {row['backup']}  {row['source']}  {row.get('snapshot') or '-'}"
-        for row in rows
-    )
+def backup_history(
+    rows: list[dict[str, Any]], *, catalog_value: dict[str, Any] | None = None
+) -> str:
+    from . import status
+
+    values = [status.inventory_text(catalog_value or {})]
+    values.append("Remote availability is cached; local presence is not an integrity check.")
+    if rows:
+        values.append("Time  Backup  Purpose  Source  Snapshot")
+        values.extend(
+            f"{row['time']}  {row['backup']}  {row['purpose']}  "
+            f"{row['source']}  {row.get('snapshot') or '-'}"
+            for row in rows
+        )
+    else:
+        values.append("No known backups available")
     return "\n".join(values)

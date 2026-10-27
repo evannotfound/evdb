@@ -84,9 +84,9 @@ relevant submenu.
 - **WHEN** the operator selects a Postgres role and opens Details
 - **THEN** the view shows its full configured images and PgBouncer settings without widening the root table
 
-#### Scenario: Details refreshes backup information
+#### Scenario: Details reads backup information
 - **WHEN** the operator opens Details before or after background status completes
-- **THEN** evdb obtains the selected runtime state, performs one fresh matching backup-history query, and does not repeat the complete host assessment
+- **THEN** evdb obtains the selected runtime state and reads dated local backup history without querying the remote repository or repeating the complete host assessment
 
 #### Scenario: Operator selects a pending role
 - **WHEN** the operator enters a database number before its runtime assessment completes
@@ -101,7 +101,7 @@ relevant submenu.
 - **THEN** evdb removes local runtime, source, credentials, generated files, and live data while retaining local and remote backups
 
 #### Scenario: Remote backup is not current before deletion
-- **WHEN** the selected role has no current confirmed remote backup
+- **WHEN** the selected role has no current known remote backup
 - **THEN** deletion requires the exact phrase `DELETE WITHOUT BACKUP` rather than `DELETE`
 
 #### Scenario: Narrow terminal displays the root
@@ -129,6 +129,17 @@ deployment transactions, or service contract hashes.
 #### Scenario: Advanced Postgres creation disables PgBouncer
 - **WHEN** the operator enters Advanced configuration and disables PgBouncer
 - **THEN** creation omits the PgBouncer service and does not ask for its image or sizing values
+
+### Requirement: Cached backup views and explicit refresh
+Status, database Details, and backup history SHALL use dated local backup evidence without querying the remote repository. Human history SHALL identify remote availability as cached and show the last successful inventory check or not-checked state, plus any latest refresh failure. The CLI SHALL offer `evdb backup refresh`, and the guided Backups submenu SHALL offer a clearly host-wide refresh action. Refresh SHALL report completion or an actionable failure and invalidate guided cached status.
+
+#### Scenario: Operator requests fresh inventory
+- **WHEN** the operator runs `evdb backup refresh` or selects the guided host-wide backup refresh action
+- **THEN** evdb refreshes the saved inventory once and reports its result
+
+#### Scenario: Operator opens old history
+- **WHEN** saved remote inventory is a day old
+- **THEN** history displays it with its check time without waiting for OneDrive
 
 ### Requirement: Grouped command interface
 The non-menu interface SHALL provide top-level `init` and `status`, group retained operations under

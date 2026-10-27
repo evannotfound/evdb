@@ -235,6 +235,7 @@ sudo evdb database logs notes-prod-01/postgres --lines 200
 sudo evdb backup create notes-prod-01/postgres
 sudo evdb backup create --all
 sudo evdb backup list notes-prod-01/postgres
+sudo evdb backup refresh
 ```
 
 Changing `--postgres-version` to a newer official major creates and uploads a fresh backup, logically
@@ -252,6 +253,18 @@ backup timer without restarting healthy databases.
 
 The automatic timer backs up every durable database sequentially. A backup succeeds only after the
 database files are checked and Restic confirms the remote snapshot.
+
+Status, database Details, and backup history read a private local catalog: they do not contact
+OneDrive or hash dump files. Successful uploads appear immediately. The daily all-database job
+refreshes remote inventory once after attempting every backup, even if an individual backup fails.
+History labels remote availability as cached and shows when inventory was last checked. Local
+presence is not a fresh integrity check; upload and recovery validation remain separate.
+
+Run `sudo evdb backup refresh` (or Backups → Refresh remote inventory) to refresh the entire host
+explicitly, including after installing this version for the first time. Until then, an absent catalog
+shows remote inventory as not checked. A failed refresh keeps the previous inventory and reports its
+error separately. Backup age is always calculated against the current time, so stopped jobs cannot
+leave backups permanently marked current.
 
 evdb does not delete remote snapshots, so configure retention separately. Recovery is manual with
 Restic and the matching database tools; evdb does not provide a restore command.
