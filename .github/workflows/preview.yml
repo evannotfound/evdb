@@ -97,61 +97,25 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: release/evdb_linux_*
-      - name: Publish rolling preview
+      - name: Publish versioned preview
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
+          TAG="preview-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           TITLE="v${VERSION%%+*}"
-          # Track publication in a hidden note, independently of the display title.
-          if PREVIOUS_RUN="$(gh release view preview --json name,body --jq \
-            '(.body | capture("<!-- preview-run: (?<run>[0-9]+) -->").run) // (.name | ltrimstr("Preview run "))')"; then
-            [[ "${PREVIOUS_RUN}" =~ ^[0-9]+$ ]]
-            if (( PREVIOUS_RUN > GITHUB_RUN_NUMBER )); then
-              echo "A newer run already owns preview; skipping."
+          if DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft')"; then
+            if test "${DRAFT}" = false; then
+              echo "${TAG} is already published; skipping."
               exit 0
             fi
           else
-            gh release create preview --draft --prerelease --latest=false \
-              --target "${GITHUB_SHA}" --title "${TITLE}" --notes "<!-- preview-run: 0 -->"
+            gh release create "${TAG}" --draft --prerelease --latest=false \
+              --target "${GITHUB_SHA}" --title "${TITLE}" \
+              --notes "Main build: ${VERSION} (${GITHUB_SHA}). Install with --preview."
           fi
-          gh release view preview --json assets --jq '.assets[].name' > previous-assets.txt
-          BUILD="${GITHUB_SHA}_${GITHUB_RUN_NUMBER}_${GITHUB_RUN_ATTEMPT}"
-          PREVIOUS_BUILD=
-          if grep -Fxq preview.txt previous-assets.txt; then
-            gh release download preview --pattern preview.txt --dir previous
-            read -r PREVIOUS_COMMIT PREVIOUS_VERSION PUBLISHED_RUN PUBLISHED_ATTEMPT < previous/preview.txt
-            [[ "${PREVIOUS_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
-            [[ "${PUBLISHED_RUN}" =~ ^[1-9][0-9]*$ ]]
-            [[ "${PUBLISHED_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
-            PREVIOUS_BUILD="${PREVIOUS_COMMIT}_${PUBLISHED_RUN}_${PUBLISHED_ATTEMPT}"
-          fi
-          printf '%s\n\n%s\n' 'Preparing preview.' \
-            "<!-- preview-run: ${GITHUB_RUN_NUMBER} -->" > release/notes.md
-          gh release edit preview --title "${TITLE}" --notes-file release/notes.md --prerelease --latest=false
-          if test "${PREVIOUS_BUILD}" != "${BUILD}"; then
-            # Run/attempt suffixes also keep rebuilds of the same commit immutable.
-            gh release upload preview release/evdb_linux_*
-            install -m 0755 install.sh release/install.sh
-            gh release upload preview release/install.sh --clobber
-            printf '%s %s %s %s\n' "${GITHUB_SHA}" "${VERSION}" \
-              "${GITHUB_RUN_NUMBER}" "${GITHUB_RUN_ATTEMPT}" > release/preview.txt
-            gh release upload preview release/preview.txt --clobber
-          fi
-          printf '%s\n\n%s\n' \
-            "Latest successful main build: ${VERSION} (${GITHUB_SHA}). Install with --preview." \
-            "<!-- preview-run: ${GITHUB_RUN_NUMBER} -->" > release/notes.md
-          gh release edit preview --draft=false --prerelease --latest=false --target "${GITHUB_SHA}" \
-            --notes-file release/notes.md
-          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/preview" \
-            -f sha="${GITHUB_SHA}" -F force=true
-          # Keep the previous generation for installers that already fetched its manifest.
-          if test -n "${PREVIOUS_BUILD}" && test "${PREVIOUS_BUILD}" != "${BUILD}"; then
-            while read -r ASSET; do
-              case "${ASSET}" in
-                evdb_linux_*_"${BUILD}"|evdb_linux_*_"${BUILD}".sha256) ;;
-                evdb_linux_*_"${PREVIOUS_BUILD}"|evdb_linux_*_"${PREVIOUS_BUILD}".sha256) ;;
-                evdb_linux_*) gh release delete-asset preview "${ASSET}" --yes ;;
-              esac
-            done < previous-assets.txt
-          fi
+          install -m 0755 install.sh release/install.sh
+          printf '%s %s %s %s\n' "${GITHUB_SHA}" "${VERSION}" \
+            "${GITHUB_RUN_NUMBER}" "${GITHUB_RUN_ATTEMPT}" > release/preview.txt
+          gh release upload "${TAG}" release/evdb_linux_* release/install.sh release/preview.txt --clobber
+          gh release edit "${TAG}" --draft=false --prerelease --latest=false

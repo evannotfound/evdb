@@ -76,10 +76,10 @@ curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install
 
 The installer verifies the downloaded executable and installs it at `/usr/local/bin/evdb`.
 
-To try the latest successful build from `main`, opt into the rolling preview prerelease:
+To try the latest successful build from `main`, opt into preview releases:
 
 ```sh
-curl -fsSL https://github.com/evannotfound/evdb/releases/download/preview/install.sh | sudo sh -s -- --preview
+curl -fsSL https://raw.githubusercontent.com/evannotfound/evdb/main/install.sh | sudo sh -s -- --preview
 ```
 
 Preview reports its source-derived version, such as `1.2.4.dev17+gabc1234`. Rerun that command to
@@ -90,10 +90,12 @@ select an exact stable version as a positional argument:
 curl -fsSL https://github.com/evannotfound/evdb/releases/latest/download/install.sh | sudo sh -s -- 1.2.3
 ```
 
-Preview keeps only recent builds; historical preview installation is not supported. If publication
-briefly interrupts a download, rerun the command. Failed download or verification leaves the installed
-executable intact. On a configured host, either channel also runs `evdb init --yes` after installation
-to refresh the managed router and backup timer.
+Each preview is a separate immutable prerelease titled with its version (for example `v1.2.4.dev17`).
+The installer queries GitHub's public release API and selects the newest published preview workflow
+run and attempt; stable releases remain the default. The old `/download/preview/install.sh` URL is
+frozen and does not fetch new previews—use the command above instead. Failed download or verification
+leaves the installed executable intact. On a configured host, either channel also runs `evdb init --yes`
+after installation to refresh the managed router and backup timer.
 
 ## Initialize the host
 

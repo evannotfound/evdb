@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -23,7 +24,7 @@ def _release(tmp_path, version, *, init_code=0, valid_checksum=True, preview=Fal
         f"exit {init_code}; fi\n"
         "exit 2\n"
     )
-    folder = releases / ("download/preview" if preview else f"download/v{version}")
+    folder = releases / ("download/preview-17-1" if preview else f"download/v{version}")
     folder.mkdir(parents=True, exist_ok=True)
     executable = folder / asset
     executable.write_text(binary)
@@ -34,6 +35,7 @@ def _release(tmp_path, version, *, init_code=0, valid_checksum=True, preview=Fal
     (folder / f"{asset}.sha256").write_text(f"{digest}  {asset}\n")
     if preview:
         (folder / "preview.txt").write_text(f"{commit} {version} 17 1\n")
+        (releases / "releases.json").write_text(json.dumps([{"tag_name": "preview-17-1"}]))
     return releases
 
 
@@ -43,6 +45,7 @@ def _run(tmp_path, releases, version, *, extra_env=None):
         **os.environ,
         "DESTDIR": str(destination),
         "EVDB_RELEASES": releases.as_uri(),
+        "EVDB_RELEASES_API": (releases / "releases.json").as_uri(),
         "EVDB_UNAME_S": "Linux",
         "EVDB_UNAME_M": "x86_64",
         **(extra_env or {}),
@@ -184,6 +187,9 @@ def test_preview_and_exact_selection_are_exclusive(tmp_path, args):
         "dirty",
         "path",
         "attempt",
+        "release",
+        "no-preview",
+        "api-unavailable",
     ],
 )
 def test_preview_failure_preserves_configured_installation(tmp_path, invalid):
@@ -196,7 +202,7 @@ def test_preview_failure_preserves_configured_installation(tmp_path, invalid):
     config.parent.mkdir(parents=True)
     config.write_text("configured: true\n")
     _release(tmp_path, "1.2.4.dev17+gabc1234", preview=True, valid_checksum=invalid != "checksum")
-    folder = releases / "download/preview"
+    folder = releases / "download/preview-17-1"
     manifest = folder / "preview.txt"
     replacements = {
         "version": manifest.read_text().replace("dev17", "dev18"),
@@ -206,11 +212,16 @@ def test_preview_failure_preserves_configured_installation(tmp_path, invalid):
         "dirty": manifest.read_text().replace("gabc1234", "gabc1234.d20260917"),
         "path": manifest.read_text().replace("a" * 40, "../../outside"),
         "attempt": manifest.read_text().replace("17 1", "17 0"),
+        "release": manifest.read_text().replace("17 1", "18 1"),
     }
     if invalid in replacements:
         manifest.write_text(replacements[invalid])
     if invalid == "missing-asset":
         (folder / f"evdb_linux_amd64_{'a' * 40}_17_1").unlink()
+    if invalid == "no-preview":
+        (releases / "releases.json").write_text('[{"tag_name": "v1.2.3"}]')
+    if invalid == "api-unavailable":
+        (releases / "releases.json").unlink()
 
     _destination, result = _run(tmp_path, releases, "--preview")
 
@@ -240,7 +251,7 @@ def test_preview_upgrade_refreshes_host_and_can_return_to_stable(tmp_path):
 
 def test_preview_uses_one_manifest_snapshot_during_publication(tmp_path):
     releases = _release(tmp_path, "1.2.4.dev17+gabc1234", preview=True)
-    manifest = releases / "download/preview/preview.txt"
+    manifest = releases / "download/preview-17-1/preview.txt"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     curl = fake_bin / "curl"
@@ -264,3 +275,81 @@ def test_preview_uses_one_manifest_snapshot_during_publication(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "Installed evdb 1.2.4.dev17+gabc1234." in result.stdout
     assert manifest.read_text().startswith("b" * 40)
+
+
+@pytest.mark.parametrize("indent", [None, 2])
+def test_preview_selects_highest_run_and_attempt_not_release_order(tmp_path, indent):
+    releases = _release(tmp_path, "1.2.4.dev17+gabc1234", preview=True)
+    (releases / "releases.json").write_text(
+        json.dumps(
+            [
+                {"tag_name": "preview-9-12"},
+                {"tag_name": "v2.0.0", "body": '"tag_name": "preview-999-1"'},
+                {"tag_name": "preview-17-1"},
+                {"tag_name": "preview"},
+                {"tag_name": "preview-16-20"},
+                {"tag_name": "preview-17-0"},
+            ],
+            indent=indent,
+        )
+    )
+
+    _destination, result = _run(tmp_path, releases, "--preview")
+
+    assert result.returncode == 0, result.stderr
+    assert "Installed evdb 1.2.4.dev17+gabc1234." in result.stdout
+
+
+def test_preview_follows_release_pagination(tmp_path):
+    releases = _release(tmp_path, "1.2.4.dev17+gabc1234", preview=True)
+    (releases / "releases2.json").write_text((releases / "releases.json").read_text())
+    (releases / "releases.json").write_text('[{"tag_name": "v1.2.3"}]')
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    curl = fake_bin / "curl"
+    curl.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, subprocess, sys\n"
+        "args = sys.argv[1:]\n"
+        "url = args[-3]\n"
+        "if url.endswith('releases.json&page=2'):\n"
+        "    args[-3] = url.replace('releases.json&page=2', 'releases2.json')\n"
+        f"subprocess.run([{shutil.which('curl')!r}, *args], check=True)\n"
+        "if url.endswith('releases.json'):\n"
+        "    pathlib.Path(args[args.index('-D') + 1]).write_text('Link: <next>; rel=\"next\"\\n')\n"
+    )
+    curl.chmod(0o755)
+
+    _destination, result = _run(
+        tmp_path, releases, "--preview", extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Installed evdb 1.2.4.dev17+gabc1234." in result.stdout
+
+
+@pytest.mark.parametrize("preview", [False, True])
+def test_small_downloads_do_not_limit_response_headers(tmp_path, preview):
+    version = "1.2.4.dev17+gabc1234" if preview else "1.2.3"
+    releases = _release(tmp_path, version, preview=preview)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    curl = fake_bin / "curl"
+    curl.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, subprocess, sys\n"
+        "args = sys.argv[1:]\n"
+        f"subprocess.run([{shutil.which('curl')!r}, *args], check=True)\n"
+        "pathlib.Path(args[args.index('-D') + 1]).write_text('X-Redirect: ' + 'a' * 8192 + '\\n')\n"
+    )
+    curl.chmod(0o755)
+
+    _destination, result = _run(
+        tmp_path,
+        releases,
+        "--preview" if preview else version,
+        extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"Installed evdb {version}." in result.stdout
