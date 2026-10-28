@@ -14,12 +14,21 @@ from evdb.models import Paths
 from evdb.run import Result
 
 
-def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_path, monkeypatch):
+@pytest.mark.parametrize("custom_root", [False, True])
+def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(
+    config, tmp_path, monkeypatch, custom_root
+):
+    if custom_root:
+        config = replace(
+            config,
+            host=replace(config.host, data_roots=(*config.host.data_roots, tmp_path / "data")),
+        )
+        host.write(config)
     calls = []
     order = []
     before = b"[remote]\ntype = local\ntoken = refreshed oauth state\n"
     config.host.backup.rclone_config.write_bytes(before)
-    host._install_units(tmp_path / "systemd")
+    host._install_units(tmp_path / "systemd", config.host.data_roots)
     monkeypatch.setattr(host, "prerequisites", lambda current=None: [])
     monkeypatch.setattr(host, "_require_ports", lambda current: None)
     monkeypatch.setattr(host, "_source_ownership", lambda current: order.append("source ownership"))
@@ -43,6 +52,11 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
 
     def run(args, **kwargs):
         calls.append(args)
+        if args == ["systemctl", "daemon-reload"]:
+            dropin = tmp_path / "systemd/docker.service.d/evdb-data.conf"
+            roots = " ".join(json.dumps(str(path)) for path in config.host.data_roots)
+            assert dropin.read_text() == f"[Unit]\nRequiresMountsFor={roots}\n"
+            order.append("mount dependencies")
         if args[:3] == ["systemctl", "enable", "--now"]:
             order.append("timer")
         return Result(tuple(args), 0, "", "")
@@ -62,6 +76,7 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
     assert config.host.backup.rclone_config.read_bytes() == before
     assert order == [
         "source ownership",
+        "mount dependencies",
         "network",
         "traefik",
         "repository",
@@ -71,6 +86,7 @@ def test_init_rerun_preserves_rclone_and_enables_only_backup_timer(config, tmp_p
     assert ["systemctl", "daemon-reload"] in calls
     assert ["systemctl", "enable", "--now", "evdb-backup.timer"] in calls
     assert not any("evdb-status" in " ".join(call) for call in calls)
+    assert not any("restart" in call for call in calls)
 
 
 def test_prerequisites_require_restic_017_without_python_or_uv(tmp_path, monkeypatch):
@@ -175,7 +191,6 @@ def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_pa
     monkeypatch.setattr(host.docker, "ensure_network", lambda **kwargs: None)
     monkeypatch.setattr(host.backup, "initialize", lambda current: None)
     monkeypatch.setattr(host.backup, "preflight", lambda current: "missing")
-    monkeypatch.setattr(host, "_install_units", lambda target: None)
     monkeypatch.setattr(host, "run", lambda args, **kwargs: Result(tuple(args), 0, "", ""))
     monkeypatch.setattr(
         __import__("evdb.status", fromlist=["collect"]),
@@ -197,6 +212,8 @@ def test_first_explicit_init_does_not_require_generic_confirmation(paths, tmp_pa
     assert host.load(paths.source, paths=paths).host.routing.postgres_ports == (15432,)
     assert host.load(paths.source, paths=paths).host.routing.kv_ports == (16379,)
     assert paths.secrets.stat().st_mode & 0o777 == 0o600
+    dropin = tmp_path / "systemd/docker.service.d/evdb-data.conf"
+    assert dropin.read_text() == f"[Unit]\nRequiresMountsFor={json.dumps(str(paths.databases))}\n"
     assert output == [
         "Waiting for wildcard certificate *.new-test-01.storage.example.com",
         "Wildcard certificate ready: *.new-test-01.storage.example.com",
@@ -298,7 +315,7 @@ def test_mid_init_failure_preserves_source_and_rerun_converges(paths, tmp_path, 
     monkeypatch.setattr(host, "_wait_certificate", lambda current: order.append("certificate"))
     monkeypatch.setattr(host.backup, "initialize", lambda current: order.append("repository"))
     monkeypatch.setattr(host.backup, "preflight", lambda current: "missing")
-    monkeypatch.setattr(host, "_install_units", lambda target: None)
+    monkeypatch.setattr(host, "_install_units", lambda target, data_roots: None)
     monkeypatch.setattr(host, "run", lambda args, **kwargs: Result(tuple(args), 0, "", ""))
     monkeypatch.setattr(
         __import__("evdb.status", fromlist=["collect"]),
@@ -338,28 +355,34 @@ def test_unit_convergence_rejects_symlink_and_nonregular_destinations(tmp_path):
     destination.symlink_to(tmp_path / "elsewhere")
 
     with pytest.raises(host.HostError, match="unsafe"):
-        host._install_units(target)
+        host._install_units(target, (tmp_path / "data",))
 
     destination.unlink()
     destination.mkdir()
     with pytest.raises(host.HostError, match="unsafe"):
-        host._install_units(target)
+        host._install_units(target, (tmp_path / "data",))
 
     destination.rmdir()
     target.rmdir()
     target.symlink_to(tmp_path)
     with pytest.raises(host.HostError, match="directory is unsafe"):
-        host._install_units(target)
+        host._install_units(target, (tmp_path / "data",))
 
 
 def test_unit_convergence_enforces_mode_owner_and_reports_metadata_change(tmp_path, monkeypatch):
     target = tmp_path / "systemd"
-    host._install_units(target)
+    host._install_units(target, (tmp_path / "data",))
     service = target / host.BACKUP_SERVICE
     service.chmod(0o600)
     ownership = []
     monkeypatch.setattr(host, "UNIT_DIR", target)
     monkeypatch.setattr(host.os, "chown", lambda path, uid, gid: ownership.append((path, uid, gid)))
+    real_fchown = files_module.os.fchown
+    monkeypatch.setattr(
+        files_module.os,
+        "fchown",
+        lambda descriptor, uid, gid: real_fchown(descriptor, os.getuid(), os.getgid()),
+    )
     real_stat = host.Path.stat
 
     def stat_with_foreign_owner(path, *args, **kwargs):
@@ -372,12 +395,50 @@ def test_unit_convergence_enforces_mode_owner_and_reports_metadata_change(tmp_pa
 
     monkeypatch.setattr(host.Path, "stat", stat_with_foreign_owner)
 
-    host._install_units(target)
+    host._install_units(target, (tmp_path / "data",))
     assert service.stat().st_mode & 0o777 == 0o644
     assert {Path(path).name for path, uid, gid in ownership if (uid, gid) == (0, 0)} == {
         host.BACKUP_SERVICE,
         host.BACKUP_TIMER,
     }
+
+
+def test_unit_convergence_refreshes_data_roots_and_preserves_other_dropins(tmp_path):
+    target = tmp_path / "systemd"
+    roots = (Path("/var/lib/evdb/databases"), Path('/mnt/database disk/100%/"data"'))
+
+    host._install_units(target, roots)
+
+    folder = target / "docker.service.d"
+    dropin = folder / "evdb-data.conf"
+    assert dropin.read_text() == (
+        '[Unit]\nRequiresMountsFor="/var/lib/evdb/databases" '
+        '"/mnt/database disk/100%%/\\"data\\""\n'
+    )
+    assert folder.stat().st_mode & 0o777 == 0o755
+    assert dropin.stat().st_mode & 0o777 == 0o644
+    other = folder / "custom.conf"
+    other.write_text("[Service]\nTimeoutStartSec=60\n")
+
+    for _ in range(2):
+        host._install_units(target, (Path("/data/databases"),))
+        assert dropin.read_text() == '[Unit]\nRequiresMountsFor="/data/databases"\n'
+        assert other.read_text() == "[Service]\nTimeoutStartSec=60\n"
+
+
+@pytest.mark.parametrize("directory", [False, True])
+def test_docker_dropin_rejects_symlinks(tmp_path, directory):
+    target = tmp_path / "systemd"
+    folder = target / "docker.service.d"
+    folder.mkdir(parents=True)
+    if directory:
+        folder.rmdir()
+        folder.symlink_to(tmp_path)
+    else:
+        (folder / "evdb-data.conf").symlink_to(tmp_path / "elsewhere")
+
+    with pytest.raises(OSError, match="unsafe|symlink"):
+        host._install_units(target, (Path("/data/databases"),))
 
 
 def test_initial_restic_password_file_is_private_and_existing_config_ignores_replacement(
@@ -854,7 +915,7 @@ def test_port_refresh_preserves_projects_secrets_and_omitted_lists(config, tmp_p
     monkeypatch.setattr(host.docker, "ensure_network", lambda **kw: None)
     monkeypatch.setattr(host.docker, "up", lambda *a, **kw: pytest.fail("database must not start"))
     monkeypatch.setattr(host.backup, "initialize", lambda current: None)
-    monkeypatch.setattr(host, "_install_units", lambda target: None)
+    monkeypatch.setattr(host, "_install_units", lambda target, data_roots: None)
     monkeypatch.setattr(host, "run", lambda args, **kw: Result(tuple(args), 0, "", ""))
     monkeypatch.setattr(host, "_wait_status", lambda current: {"healthy": True})
     output = []

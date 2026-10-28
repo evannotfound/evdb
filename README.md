@@ -118,6 +118,11 @@ work the same way throughout setup and database operations; press Ctrl-C to canc
 Initialization stores configuration under `/etc/evdb`, managed data under `/var/lib/evdb`, starts the
 TLS router, initializes the Restic repository, and enables automatic daily backups.
 
+It also installs a Docker systemd drop-in requiring the mounts for every `host.data_roots` path before
+Docker starts, preventing databases from initializing on the system disk when a data disk mounts late.
+After upgrading or editing `host.data_roots`, run `sudo evdb init --yes` to refresh this dependency.
+This does not restart Docker or reconnect containers that are already using the wrong disk.
+
 ## Run alongside an existing database stack
 
 Start guided setup on free alternate ports while the existing router keeps `5432` and `6379`:

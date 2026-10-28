@@ -102,6 +102,8 @@ def initialize(
             if routing != previous:
                 write(config, secrets=False)
         _source_ownership(config)
+        _install_units(Path(unit_dir), config.host.data_roots)
+        run(["systemctl", "daemon-reload"], timeout=60)
         _dns(config)
         docker.ensure_network(timeout=config.host.timeouts["command"])
         _traefik(config)
@@ -115,8 +117,6 @@ def initialize(
             if output:
                 output(f"Wildcard certificate ready: {wildcard(config)}")
         backup.initialize(config)
-        _install_units(Path(unit_dir))
-        run(["systemctl", "daemon-reload"], timeout=60)
         run(["systemctl", "enable", "--now", BACKUP_TIMER], timeout=120)
     return _wait_status(config)
 
@@ -482,7 +482,7 @@ def _source_ownership(config: Config) -> None:
     run(["chmod", "0600", str(config.paths.source), str(config.paths.secrets)], timeout=60)
 
 
-def _install_units(target: Path) -> None:
+def _install_units(target: Path, data_roots: tuple[Path, ...]) -> None:
     if target.exists() or target.is_symlink():
         if target.is_symlink() or not target.is_dir():
             raise HostError(f"systemd unit directory is unsafe: {target}")
@@ -511,6 +511,18 @@ def _install_units(target: Path) -> None:
             details = destination.stat()
             if details.st_uid != 0 or details.st_gid != 0:
                 os.chown(destination, 0, 0)
+
+    owner = (0, 0) if target == UNIT_DIR else None
+    folder = managed_dir(target / "docker.service.d", 0o755, owner=owner)
+    roots = " ".join(
+        json.dumps(str(path).replace("%", "%%"), ensure_ascii=False) for path in data_roots
+    )
+    write_text(
+        folder / "evdb-data.conf",
+        f"[Unit]\nRequiresMountsFor={roots}\n",
+        mode=0o644,
+        owner=owner,
+    )
 
 
 def _units() -> tuple[Path, ...]:
