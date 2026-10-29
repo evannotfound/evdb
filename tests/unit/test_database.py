@@ -1,6 +1,7 @@
 import os
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
@@ -33,6 +34,7 @@ def test_native_port_changes_only_external_connections(config):
     new_pg = updated.select(pg.identity)
     new_cache = updated.select(cache.identity)
     assert ":15432/" in database.connection(new_pg)["url"]
+    assert ":15432/" in database.connection(new_pg)["pooled_url"]
     assert ":16379/" in database.connection(new_cache)["url"]
     for key in ("http_url", "http_loopback", "http_token"):
         assert database.connection(new_cache)[key] == database.connection(cache)[key]
@@ -90,6 +92,38 @@ def test_add_persists_custom_postgres_identity_and_encodes_connection(config, mo
     assert connection["database"] == "app/data"
     assert "app%20user" in connection["url"]
     assert "/app%2Fdata?" in connection["url"]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_postgres_connection_urls_share_encoded_identity_and_port(config, enabled):
+    target = config.select("app-test-01/postgres")
+    target = replace(
+        target,
+        settings=replace(
+            target.settings,
+            username="app user",
+            database="app/data",
+            pgbouncer=replace(target.settings.pgbouncer, enabled=enabled),
+        ),
+        credentials=replace(target.credentials, password="pass @:/?#%"),
+        host=replace(
+            target.host, routing=replace(target.host.routing, postgres_ports=(15432, 5432))
+        ),
+    )
+    connection = database.connection(target)
+    assert ("pooled_url" in connection) is enabled
+    endpoints = {"url": target.domain}
+    if enabled:
+        endpoints["pooled_url"] = target.pooled_domain
+    for key, hostname in endpoints.items():
+        url = urlsplit(connection[key])
+        assert url.scheme == "postgresql"
+        assert url.hostname == hostname
+        assert url.port == 15432
+        assert unquote(url.username) == target.settings.username
+        assert unquote(url.password) == target.credentials.password
+        assert unquote(url.path[1:]) == target.settings.database
+        assert parse_qs(url.query) == {"sslmode": ["require"]}
 
 
 def test_add_requires_and_persists_selection_when_multiple_roots(config, tmp_path, monkeypatch):

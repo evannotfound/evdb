@@ -227,14 +227,17 @@ def healthcheck(test: list[str]) -> dict[str, Any]:
     }
 
 
-def route(database, service_port: int) -> dict[str, str]:
+def route(database, service_port: int, *, pooled: bool = False) -> dict[str, str]:
     key = f"{database.role}-{database.project}"
+    if pooled:
+        key += "-pooled"
+    domain = database.pooled_domain if pooled else database.domain
     entrypoint = "postgres" if database.role == "postgres" else "kv"
     return {
         "traefik.enable": "true",
         "traefik.docker.network": NETWORK,
         f"traefik.tcp.routers.{key}.entrypoints": entrypoint,
-        f"traefik.tcp.routers.{key}.rule": f"HostSNI(`{database.domain}`)",
+        f"traefik.tcp.routers.{key}.rule": f"HostSNI(`{domain}`)",
         f"traefik.tcp.routers.{key}.tls": "true",
         f"traefik.tcp.services.{key}.loadbalancer.server.port": str(service_port),
     }

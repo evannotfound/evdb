@@ -122,6 +122,40 @@ class _Output(StringIO):
         return self.terminal
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_postgres_connection_views_label_direct_and_pooled_urls(config, enabled):
+    target = config.select("app-test-01/postgres")
+    target = replace(
+        target,
+        settings=replace(
+            target.settings, pgbouncer=replace(target.settings.pgbouncer, enabled=enabled)
+        ),
+    )
+    connection = database.connection(target)
+    for text in (
+        ui.connection_details(connection),
+        ui.database_details({"connection": connection}, include_connection=True),
+    ):
+        assert "Direct URL (migrations / sessions)" in text
+        assert connection["url"] in text
+        assert "HTTP:" not in text
+        if enabled:
+            assert "Pooled URL (transaction / application)" in text
+            assert text.index(connection["pooled_url"]) < text.index(connection["url"])
+        else:
+            assert "Pooled" not in text
+    assert ui.database_details({"connection": connection}) == ""
+
+
+def test_kv_connection_view_keeps_native_and_http_details(config):
+    connection = database.connection(config.select("app-test-01/kv"))
+    text = ui.connection_details(connection)
+    assert connection["url"] in text
+    assert "HTTP:" in text
+    assert connection["http_url"] in text
+    assert "Direct URL" not in text
+
+
 @pytest.mark.parametrize(
     "removed",
     [

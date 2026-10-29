@@ -645,12 +645,18 @@ def connection(database: Database) -> dict[str, Any]:
             f"postgresql://{username}:{password}@{database.domain}:{database.port}/{name}"
             "?sslmode=require"
         )
-        return {
+        value = {
             "url": url,
             "username": database.settings.username,
             "password": database.credentials.password,
             "database": database.settings.database,
         }
+        if database.settings.pgbouncer.enabled:
+            value["pooled_url"] = (
+                f"postgresql://{username}:{password}@{database.pooled_domain}:{database.port}/{name}"
+                "?sslmode=require"
+            )
+        return value
     value = {
         "url": f"rediss://default:{password}@{database.domain}:{database.port}/0",
         "username": "default",

@@ -508,6 +508,10 @@ def require_valid(config: Config) -> None:
             native_domain = f"{project.id}.{host.id}.{host.domain}"
             if not _DOMAIN.fullmatch(native_domain) or len(native_domain) > 253:
                 errors.append(f"{project.id}/{role}: native domain is invalid")
+            if role == "postgres" and settings.pgbouncer.enabled:
+                pooled_domain = f"{project.id}-pooled.{host.id}.{host.domain}"
+                if not _DOMAIN.fullmatch(pooled_domain) or len(pooled_domain) > 253:
+                    errors.append(f"{project.id}/postgres: pooled domain is invalid")
             try:
                 credentials = config.secrets.select(project.id, role)
                 _credential(credentials.password, f"{project.id}/{role} password")

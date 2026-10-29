@@ -190,7 +190,7 @@ Changes to native Postgres/KV port lists do not change HTTP URLs, loopback ports
 
 Project names must end in `-dev-N`, `-test-N`, or `-prod-N`. Guided Postgres creation asks for an official
 major version (default 16) before optional advanced identity and PgBouncer settings. Create Postgres with
-a generated managed login and retrieve its TLS-secured connection URL:
+a generated managed login and retrieve its TLS-secured connection URLs:
 
 ```sh
 sudo evdb database add notes-prod-01 postgres
@@ -198,11 +198,29 @@ sudo evdb database info notes-prod-01/postgres
 ```
 
 ```text
+Application — pooled (transaction):
+postgresql://default:<password>@notes-prod-01-pooled.example-01.storage.example.com:5432/postgres?sslmode=require
+
+Migrations / session-dependent work — direct:
 postgresql://default:<password>@notes-prod-01.example-01.storage.example.com:5432/postgres?sslmode=require
 ```
 
-Use the URL with any standard Postgres client. `database info` prints complete credentials and
-therefore requires a terminal.
+Use the pooled URL for application traffic that does not depend on session state across transactions.
+Use the direct URL for migrations, administration, and session-dependent clients (such as session-level
+advisory locks or `LISTEN`). For example, set your application's `DATABASE_URL` to the pooled URL and
+configure its migration tool to use a `DIRECT_URL` containing the direct URL; environment variable names
+depend on the tool. Both URLs access the same database with the same login and preferred native port.
+`database info` prints complete credentials and therefore requires a terminal.
+
+PgBouncer is enabled by default. Disabling it removes the `-pooled` endpoint and URL; the plain hostname
+always connects directly through the TLS proxy. Both hostnames fit the existing wildcard DNS and
+certificate, without adding a public port.
+
+**Upgrading from the single-endpoint setup:** Previously, enabling PgBouncer routed the plain hostname
+through a session pool. After updating evdb and starting/restarting the database, that hostname bypasses
+PgBouncer, preserving session semantics but no longer applying its connection limits or queuing. Move
+compatible application clients to the new `-pooled` URL to use transaction pooling, and keep migrations
+on the plain hostname. Size direct client connection pools against Postgres's connection limit.
 
 Guided creation has an Advanced option for preserving an existing username, database name, and password
 when you import data yourself. Automation can provide the same creation-only identity without exposing

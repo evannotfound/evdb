@@ -23,6 +23,7 @@ def test_postgres_and_private_pgbouncer_run_in_disposable_compose(config, tmp_pa
     monkeypatch.setattr(backup, "_handoff", lambda *args: None)
     project = _project("postgres")
     password = 'pool password "quoted" \\ slash'
+    settings = defaults("postgres", config.host.data_roots[0])
     selected = _config(
         config,
         tmp_path,
@@ -30,9 +31,10 @@ def test_postgres_and_private_pgbouncer_run_in_disposable_compose(config, tmp_pa
             Project(
                 project,
                 postgres=replace(
-                    defaults("postgres", config.host.data_roots[0]),
+                    settings,
                     username="app_user",
                     database="app_db",
+                    pgbouncer=replace(settings.pgbouncer, pool_size=1, reserve_size=1),
                 ),
             ),
         ),
@@ -76,6 +78,54 @@ def test_postgres_and_private_pgbouncer_run_in_disposable_compose(config, tmp_pa
                 timeout=60,
             )
             assert result.out.strip() == "1"
+            result = docker.exec(
+                target.service("pgbouncer"),
+                [
+                    "psql",
+                    "-XAt",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-c",
+                    "SELECT pg_backend_pid()",
+                    "-c",
+                    "\\! psql -XAt -v ON_ERROR_STOP=1 -c 'SELECT pg_backend_pid()'",
+                    "-c",
+                    "SELECT pg_backend_pid()",
+                ],
+                env={
+                    "PGHOST": "127.0.0.1",
+                    "PGUSER": "app_user",
+                    "PGDATABASE": "app_db",
+                    "PGPASSWORD": password,
+                },
+                secrets=(password,),
+                timeout=30,
+            )
+            pids = result.out.splitlines()
+            assert len(pids) == 3 and len(set(pids)) == 1, result.out
+            result = docker.exec(
+                target.service("primary"),
+                [
+                    "psql",
+                    "-XAt",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-h",
+                    "127.0.0.1",
+                    "-U",
+                    "app_user",
+                    "-d",
+                    "app_db",
+                    "-c",
+                    "BEGIN; CREATE TEMP TABLE session_test AS SELECT 42 AS value; COMMIT;",
+                    "-c",
+                    "SELECT value FROM session_test",
+                ],
+                env={"PGPASSWORD": password},
+                secrets=(password,),
+                timeout=30,
+            )
+            assert result.out.splitlines()[-1] == "42"
             created = backup.create(selected, target)
             manifest = backup.manifest_check(created["folder"])
             assert manifest["format"] == "postgres-custom-v1"

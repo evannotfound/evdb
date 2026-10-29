@@ -90,6 +90,35 @@ def test_native_ports_cannot_overlap_protocols(config):
         require_valid(replace(config, host=replace(config.host, routing=routing)))
 
 
+@pytest.mark.parametrize(
+    "length,enabled,valid", [(56, True, True), (57, True, False), (63, False, True)]
+)
+def test_pooled_hostname_respects_dns_label_limit(config, length, enabled, valid):
+    name = "a" * (length - len("-test-01")) + "-test-01"
+    project = config.projects[0]
+    selected = replace(
+        config,
+        projects=(
+            replace(
+                project,
+                id=name,
+                kv=None,
+                postgres=replace(
+                    project.postgres, pgbouncer=replace(project.postgres.pgbouncer, enabled=enabled)
+                ),
+            ),
+        ),
+        secrets=replace(
+            config.secrets, projects=(replace(config.secrets.projects[0], id=name, kv=None),)
+        ),
+    )
+    if valid:
+        require_valid(selected)
+    else:
+        with pytest.raises(ConfigError, match="pooled domain is invalid"):
+            require_valid(selected)
+
+
 def test_data_roots_are_required_without_compatibility_default(config):
     text = config.paths.source.read_text().replace(
         f"  data_roots:\n  - {config.paths.databases}\n", ""

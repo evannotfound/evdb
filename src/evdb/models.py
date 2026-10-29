@@ -240,6 +240,10 @@ class Database:
         return f"{self.project}.{self.host.id}.{self.host.domain}"
 
     @property
+    def pooled_domain(self) -> str:
+        return f"{self.project}-pooled.{self.host.id}.{self.host.domain}"
+
+    @property
     def port(self) -> int:
         routing = self.host.routing
         return (routing.postgres_ports if self.role == "postgres" else routing.kv_ports)[0]

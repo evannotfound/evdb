@@ -330,6 +330,7 @@ def files(database: Database) -> dict[str, str]:
             "[pgbouncer]\n"
             "listen_addr = 0.0.0.0\n"
             "listen_port = 5432\n"
+            "pool_mode = transaction\n"
             "auth_type = plain\n"
             "auth_file = /run/secrets/pgbouncer-users\n"
             f"max_client_conn = {pool.max_clients}\n"
@@ -357,9 +358,9 @@ def services(database: Database) -> dict[str, Any]:
             f"{generated / 'postgres-password'}:/run/secrets/postgres-password:ro",
         ],
         "networks": {docker.NETWORK: {"aliases": [primary]}},
+        "labels": docker.route(database, 5432),
     }
     values = {primary: service}
-    route = service
     if database.settings.pgbouncer.enabled:
         pool = database.service("pgbouncer")
         group = _group(generated)
@@ -391,9 +392,8 @@ def services(database: Database) -> dict[str, Any]:
             "cap_drop": ["ALL"],
             "security_opt": ["no-new-privileges:true"],
             "networks": {docker.NETWORK: {"aliases": [pool]}},
+            "labels": docker.route(database, 5432, pooled=True),
         }
-        route = values[pool]
-    route["labels"] = docker.route(database, 5432)
     return values
 
 

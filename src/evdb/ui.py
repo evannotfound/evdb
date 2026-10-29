@@ -1674,7 +1674,12 @@ def database_details(value: dict[str, Any], *, include_connection: bool = False)
         if lines:
             lines.append("")
         lines.append("Connection:")
-        lines.extend(_pair_lines(value["connection"], indent=2))
+        if "database" in value["connection"]:
+            lines.extend(
+                f"  {line}" for line in connection_details(value["connection"]).splitlines()
+            )
+        else:
+            lines.extend(_pair_lines(value["connection"], indent=2))
     return clean("\n".join(lines))
 
 
@@ -1716,6 +1721,13 @@ def _bytes(value: int) -> str:
 
 
 def connection_details(value: dict[str, Any]) -> str:
+    if "database" in value:
+        lines = []
+        if "pooled_url" in value:
+            lines.append(f"Pooled URL (transaction / application): {value['pooled_url']}")
+        lines.append(f"Direct URL (migrations / sessions): {value['url']}")
+        lines.extend(_pair_lines({key: value[key] for key in ("username", "password", "database")}))
+        return clean("\n".join(lines))
     native = {
         key: value[key] for key in ("url", "username", "password", "database") if key in value
     }

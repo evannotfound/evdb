@@ -54,6 +54,40 @@ def test_postgres_custom_identity_reaches_primary_and_pgbouncer(config):
     assert "app/data" in pool["healthcheck"]["test"]
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_postgres_direct_and_transaction_pool_routes(config, enabled):
+    target = config.select("app-test-01/postgres")
+    target = replace(
+        target,
+        settings=replace(
+            target.settings, pgbouncer=replace(target.settings.pgbouncer, enabled=enabled)
+        ),
+    )
+    services = postgres.services(target)
+    key = f"postgres-{target.project}"
+    primary = services[target.service("primary")]
+    labels = primary["labels"]
+    assert labels[f"traefik.tcp.routers.{key}.rule"] == f"HostSNI(`{target.domain}`)"
+    assert labels[f"traefik.tcp.routers.{key}.tls"] == "true"
+    assert labels[f"traefik.tcp.routers.{key}.entrypoints"] == "postgres"
+    assert labels[f"traefik.tcp.services.{key}.loadbalancer.server.port"] == "5432"
+    assert all("ports" not in service for service in services.values())
+    files = postgres.files(target)
+    if enabled:
+        assert target.pooled_domain == "app-test-01-pooled.test-01.storage.example.com"
+        labels = services[target.service("pgbouncer")]["labels"]
+        key += "-pooled"
+        assert labels[f"traefik.tcp.routers.{key}.rule"] == f"HostSNI(`{target.pooled_domain}`)"
+        assert labels[f"traefik.tcp.routers.{key}.tls"] == "true"
+        assert labels[f"traefik.tcp.routers.{key}.entrypoints"] == "postgres"
+        assert labels[f"traefik.tcp.services.{key}.loadbalancer.server.port"] == "5432"
+        assert "pool_mode = transaction\n" in files["pgbouncer.ini"]
+    else:
+        assert set(services) == {target.service("primary")}
+        assert set(files) == {"postgres-password"}
+        assert "-pooled" not in yaml.safe_dump(services)
+
+
 @pytest.mark.parametrize("engine", ["redis", "dragonfly"])
 def test_concrete_kv_engine_owns_native_files_http_and_routes(config, engine):
     target = config.select("app-test-01/kv")
