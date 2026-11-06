@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from getpass import getpass
 from threading import Condition, Event, Thread
 from typing import IO, Any
@@ -939,12 +940,68 @@ def _add(
     max_clients = None
     pool_size = None
     reserve_size = None
+    kv_values = {}
     if role == "kv":
-        _screen(output, "1. Dragonfly\n2. Redis\n0. Cancel", heading="KV engine")
-        selected = _choice(input_fn, output, "Engine", {"0", "1", "2"})
+        from .config import defaults
+        from .engines import get
+
+        _screen(output, "1. Valkey\n2. Dragonfly\n3. Redis\n0. Cancel", heading="KV engine")
+        selected = _choice(input_fn, output, "Engine", {"0", "1", "2", "3"})
         if selected in {None, "0"}:
             return config
-        engine = "dragonfly" if selected == "1" else "redis"
+        engine = {"1": "valkey", "2": "dragonfly", "3": "redis"}[selected]
+        settings = defaults("kv", data_root, engine)
+        advanced = ask_text(
+            input_fn,
+            output,
+            "Advanced KV configuration?",
+            default="n",
+            validate=lambda value: _confirmation(value, False),
+        )
+        if advanced is None:
+            return config
+        if advanced:
+
+            def validate_setting(name, value):
+                get(engine).validate(replace(settings, **{name: value}))
+                return value
+
+            mode = ask_text(
+                input_fn,
+                output,
+                "Mode",
+                default=settings.mode,
+                help_text="Choose durable or cache. Valkey mode cannot change after creation.",
+                validate=lambda value: validate_setting("mode", value),
+            )
+            if mode is None:
+                return config
+            settings = replace(settings, mode=mode)
+            if settings.memory is not None:
+                memory = ask_text(
+                    input_fn,
+                    output,
+                    "Memory",
+                    default=settings.memory,
+                    help_text="Database limit, not process RSS; allow headroom for overhead.",
+                    validate=lambda value: validate_setting("memory", value),
+                )
+                if memory is None:
+                    return config
+                settings = replace(settings, memory=memory)
+            http = ask_text(
+                input_fn,
+                output,
+                "Enable HTTP access?",
+                default="y" if settings.http.enabled else "n",
+                validate=lambda value: _confirmation(value, True),
+            )
+            if http is None:
+                return config
+            settings = replace(settings, http=replace(settings.http, enabled=http))
+        kv_values = {"mode": settings.mode, "http": settings.http.enabled}
+        if settings.memory is not None:
+            kv_values["memory"] = settings.memory
     else:
         from .config import postgres_image, validate_postgres_name
 
@@ -1031,6 +1088,20 @@ def _add(
             Password="provided" if password else "generated",
             PgBouncer=True if pgbouncer is None else pgbouncer,
         )
+    else:
+        summary["Mode"] = settings.mode
+        if settings.memory is not None:
+            summary["Memory"] = settings.memory
+        summary["Persistence"] = (
+            "none; backups disabled"
+            if settings.mode == "cache"
+            else {
+                "valkey": "AOF everysec; noeviction; RDB only for backup jobs",
+                "dragonfly": "snapshots for backup jobs",
+                "redis": "periodic RDB snapshots and backup jobs",
+            }[engine]
+        )
+        summary["HTTP"] = settings.http.enabled
     _screen(
         output,
         pairs(summary),
@@ -1055,6 +1126,7 @@ def _add(
         max_clients=max_clients,
         pool_size=pool_size,
         reserve_size=reserve_size,
+        **kv_values,
     )
     if session is not None:
         session.invalidate(updated)

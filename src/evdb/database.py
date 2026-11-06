@@ -129,6 +129,9 @@ def add(
     role: str,
     *,
     engine: str | None = None,
+    mode: str | None = None,
+    memory: str | None = None,
+    http: bool | None = None,
     password: str | None = None,
     username: str | None = None,
     database_name: str | None = None,
@@ -143,6 +146,8 @@ def add(
     identity = f"{project}/{role}"
     if role == "postgres" and engine is not None:
         raise DatabaseError("--engine is only valid for a KV database")
+    if role != "kv" and any(value is not None for value in (mode, memory, http)):
+        raise DatabaseError("mode, memory, and http are only valid for a KV database")
     if role != "postgres" and (username is not None or database_name is not None):
         raise DatabaseError("Postgres identity is only valid for a Postgres database")
     timeout = config.host.timeouts["command"]
@@ -157,6 +162,13 @@ def add(
                 raise DatabaseError(
                     f"{identity} already uses {existing.engine}; engine conversion is outside v1"
                 )
+            for name, value in (("mode", mode), ("memory", memory), ("http", http)):
+                if value is not None and _current(existing.settings, name) != value:
+                    if name == "mode" and existing.engine == "valkey":
+                        raise DatabaseError(
+                            "Valkey mode is chosen at creation and cannot be changed"
+                        )
+                    raise DatabaseError(f"{identity} already has a different {name}; use configure")
             if password is not None and existing.credentials.password != _password(password):
                 raise DatabaseError("password rotation is outside v1")
             if username is not None and existing.settings.username != username:
@@ -183,7 +195,7 @@ def add(
                 health(current, existing)
             return current
         selected_root = _data_root(current, data_root)
-        settings = defaults(role, selected_root, engine or "dragonfly")
+        settings = defaults(role, selected_root, engine)
         if role == "postgres":
             from .config import postgres_image, validate_postgres_name
 
@@ -205,12 +217,20 @@ def add(
                 ),
             )
             get("postgres").validate(settings)
+        else:
+            settings = replace(
+                settings,
+                mode=settings.mode if mode is None else mode,
+                memory=settings.memory if memory is None else memory,
+                http=replace(
+                    settings.http, enabled=settings.http.enabled if http is None else http
+                ),
+            )
+            get(settings.engine).validate(settings)
         credential = (
             _password(password) if password is not None else _password(random.token_urlsafe(32))
         )
-        token = (
-            _password(random.token_urlsafe(32)) if role == "kv" and settings.http.enabled else None
-        )
+        token = _password(random.token_urlsafe(32)) if role == "kv" else None
         updated = add_role(current, project, role, settings, RoleSecrets(credential, token))
         target = updated.select(identity)
         with lock(updated.paths.role_lock(project, role), timeout=timeout):
@@ -618,6 +638,9 @@ def info(
                 error=message,
             )
             errors.append(message)
+    settings = _setting_values(database)
+    if database.engine == "valkey":
+        settings["mode"] = database.settings.mode
     return {
         "database": database.identity,
         "engine": database.engine,
@@ -629,7 +652,7 @@ def info(
         "compose": str(database.compose),
         "storage": storage,
         "data_usage": data_usage,
-        "settings": _setting_values(database),
+        "settings": settings,
         "engine_info": details,
         "backup": backup_summary,
         "connection": connection(database),
@@ -688,8 +711,11 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
     unknown = sorted((set(values) | set(reset)) - allowed)
     if unknown:
         raise DatabaseError(f"setting is not valid for {database.engine}: {unknown[0]}")
-    if database.engine == "redis" and ({"memory", "threads"} & (set(values) | set(reset))):
-        raise DatabaseError("memory and threads are only valid for Dragonfly")
+    requested = set(values) | set(reset)
+    if database.engine == "redis" and "memory" in requested:
+        raise DatabaseError("memory is only valid for Valkey or Dragonfly")
+    if database.role == "kv" and database.engine != "dragonfly" and "threads" in requested:
+        raise DatabaseError("threads are only valid for Dragonfly")
     base = defaults(database.role, database.settings.data_root, database.engine)
     updates = dict(values)
     if "postgres_version" in updates:
@@ -730,6 +756,8 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
         }
         settings = replace(settings, **direct, http=replace(settings.http, **http_values))
     get(database.engine).validate(settings)
+    if database.engine == "valkey" and settings.mode != database.settings.mode:
+        raise DatabaseError("Valkey mode is chosen at creation and cannot be changed")
     return settings
 
 
@@ -749,8 +777,8 @@ def _current(settings: Postgres | KV, name: str):
 
 
 def _setting_values(database: Database) -> dict[str, Any]:
-    names = (
-        (
+    if database.role == "postgres":
+        names = (
             "postgres_version",
             "pgbouncer",
             "pgbouncer_image",
@@ -758,13 +786,12 @@ def _setting_values(database: Database) -> dict[str, Any]:
             "pool_size",
             "reserve_size",
         )
-        if database.role == "postgres"
-        else (
-            ("image", "mode", "http", "http_image", "http_connections", "memory", "threads")
-            if database.engine == "dragonfly"
-            else ("image", "mode", "http", "http_image", "http_connections")
-        )
-    )
+    elif database.engine == "dragonfly":
+        names = ("image", "mode", "http", "http_image", "http_connections", "memory", "threads")
+    elif database.engine == "valkey":
+        names = ("image", "memory", "http", "http_image", "http_connections")
+    else:
+        names = ("image", "mode", "http", "http_image", "http_connections")
     return {name: _current(database.settings, name) for name in names}
 
 

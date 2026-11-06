@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -6,7 +7,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import pytest
 
 from evdb import backup, database
-from evdb.config import load, remove_role, write
+from evdb.config import defaults, load, remove_role, write
 from evdb.engines import postgres
 from evdb.errors import CommandError, ConfigError, DatabaseError
 from evdb.run import Result
@@ -65,11 +66,133 @@ def test_add_persists_source_credentials_and_generated_files_before_start(config
 
     target = updated.select("queue-prod-01/kv")
     loaded = load(updated.paths.source, paths=updated.paths)
-    assert loaded.select(target.identity).engine == "dragonfly"
+    assert loaded.select(target.identity).engine == "valkey"
     assert loaded.select(target.identity).credentials.password == "generated-value"
     assert target.compose.is_file()
-    assert (target.generated / "dragonfly.flags").is_file()
+    assert (target.generated / "valkey.conf").is_file()
     assert calls == [("up", target.compose, target.compose_project)]
+
+
+def test_add_applies_kv_choices_before_first_start(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    updated = database.add(config, "cache-prod-01", "kv", mode="cache", memory="512mb", http=False)
+    target = load(updated.paths.source, paths=updated.paths).select("cache-prod-01/kv")
+
+    assert target.settings.mode == "cache"
+    assert target.settings.memory == "512mb"
+    assert target.settings.http.enabled is False
+    assert target.credentials.http_token
+    assert not target.durable
+    assert calls == [("up", target.compose, target.compose_project)]
+
+
+@pytest.mark.parametrize("engine", ["valkey", "redis", "dragonfly"])
+def test_http_can_be_enabled_after_creation_with_http_disabled(config, monkeypatch, engine):
+    _runtime(monkeypatch)
+    created = database.add(config, "http-prod-01", "kv", engine=engine, http=False)
+    target = created.select("http-prod-01/kv")
+    token = target.credentials.http_token
+    assert not (target.generated / "http.env").exists()
+
+    updated = database.configure(created, target, {"http": True})
+    target = load(updated.paths.source, paths=updated.paths).select(target.identity)
+    assert target.settings.http.enabled
+    assert target.credentials.http_token == token
+    values = dict(
+        line.split("=", 1) for line in (target.generated / "http.env").read_text().splitlines()
+    )
+    assert json.loads(values["SRH_TOKEN"]) == token
+    assert token not in updated.paths.source.read_text()
+    assert token not in target.compose.read_text()
+
+
+@pytest.mark.parametrize("engine", ["redis", "dragonfly"])
+def test_add_retry_preserves_explicit_engine_and_credentials(config, monkeypatch, engine):
+    _runtime(monkeypatch)
+    created = database.add(config, "existing-prod-01", "kv", engine=engine)
+    before = created.select("existing-prod-01/kv")
+
+    retried = database.add(created, before.project, "kv")
+
+    assert retried.select(before.identity).settings == before.settings
+    assert retried.select(before.identity).credentials == before.credentials
+
+
+@pytest.mark.parametrize(
+    "values",
+    [{"memory": "0mb"}, {"mode": "other"}, {"engine": "redis", "memory": "512mb"}],
+)
+def test_invalid_kv_creation_preserves_source(config, monkeypatch, values):
+    calls = _runtime(monkeypatch)
+    before = config.paths.source.read_bytes(), config.paths.secrets.read_bytes()
+
+    with pytest.raises(ConfigError):
+        database.add(config, "invalid-prod-01", "kv", **values)
+
+    assert (config.paths.source.read_bytes(), config.paths.secrets.read_bytes()) == before
+    assert calls == []
+
+
+def test_postgres_rejects_kv_creation_options(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    with pytest.raises(DatabaseError, match="only valid for a KV"):
+        database.add(config, "invalid-prod-01", "postgres", http=False)
+    assert calls == []
+
+
+def test_existing_role_rejects_conflicting_creation_settings(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    before = config.paths.source.read_bytes()
+    with pytest.raises(DatabaseError, match="different mode"):
+        database.add(config, "app-test-01", "kv", mode="cache")
+    assert config.paths.source.read_bytes() == before
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "values", "reset"),
+    [
+        ("durable", {"mode": "cache"}, ()),
+        ("cache", {"mode": "durable"}, ()),
+        ("cache", {}, ("mode",)),
+    ],
+)
+def test_valkey_mode_changes_fail_before_mutation(config, monkeypatch, mode, values, reset):
+    calls = _runtime(monkeypatch)
+    created = database.add(config, "fixed-prod-01", "kv", mode=mode)
+    target = created.select("fixed-prod-01/kv")
+    before = created.paths.source.read_bytes(), target.compose.read_bytes()
+    calls.clear()
+
+    with pytest.raises(DatabaseError, match="chosen at creation"):
+        database.configure(created, target, values, reset=reset)
+
+    assert (created.paths.source.read_bytes(), target.compose.read_bytes()) == before
+    assert calls == []
+
+
+def test_valkey_memory_configure_and_settings_menu(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    created = database.add(config, "memory-prod-01", "kv", mode="cache")
+    target = created.select("memory-prod-01/kv")
+    calls.clear()
+
+    updated = database.configure(created, target, {"memory": "512mb"})
+    target = updated.select(target.identity)
+    assert target.settings.memory == "512mb"
+    assert target.settings.mode == "cache"
+    assert len(calls) == 1
+    choices = database._setting_values(target)
+    assert choices["memory"] == "512mb"
+    assert "mode" not in choices and "threads" not in choices
+    value = database.info(updated, target, observed={"running": False, "health": "stopped"})
+    assert value["settings"]["mode"] == "cache"
+    assert (
+        database._settings(target, {}, ("memory",)).memory
+        == defaults("kv", target.settings.data_root).memory
+    )
+    with pytest.raises(DatabaseError, match="only valid for Dragonfly"):
+        database._settings(target, {"threads": 2}, ())
 
 
 def test_add_persists_custom_postgres_identity_and_encodes_connection(config, monkeypatch):

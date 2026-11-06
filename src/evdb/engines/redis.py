@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Any
 
 from .. import docker
-from ..errors import BackupError, ConfigError
-from ..files import require_file
+from ..errors import ConfigError
 from ..models import KV, Database
-from ..run import run
 from . import kv
 
 
@@ -70,62 +67,25 @@ def services(database: Database) -> dict[str, Any]:
 
 
 def health(database: Database, *, timeout: int = 10) -> bool:
-    return kv.health(database.service("primary"), database.credentials.password, timeout=timeout)
+    return kv.health(
+        database.service("primary"), database.credentials.password, engine="redis", timeout=timeout
+    )
 
 
 def info(database: Database) -> dict[str, Any]:
-    facts = kv.info(database.service("primary"), database.credentials.password, "server")
+    facts = kv.info(
+        database.service("primary"), database.credentials.password, "server", engine="redis"
+    )
     return {
         "version": facts.get("redis_version") or "unknown",
         "mode": database.settings.mode,
         "http": database.settings.http.enabled,
         "http_connections": database.settings.http.connections,
-        "data": kv.usage(database.service("primary"), database.credentials.password),
+        "data": kv.usage(
+            database.service("primary"), database.credentials.password, engine="redis"
+        ),
     }
 
 
 def backup(database: Database, folder: Path, _run_id: str) -> dict[str, Any]:
-    password = database.credentials.password
-    container = database.service("primary")
-    before = int(kv.text(container, password, ["LASTSAVE"]))
-    deadline = time.monotonic() + 5
-    while int(time.time()) <= before:
-        if time.monotonic() >= deadline:
-            raise BackupError("Redis clock did not advance before BGSAVE")
-        time.sleep(0.1)
-    kv.text(container, password, ["BGSAVE"], timeout=60)
-    _wait(container, password, before, database.identity)
-    target = folder / "dump.rdb"
-    docker.copy(f"{container}:/data/dump.rdb", target, timeout=1800)
-    require_file(target)
-    run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "--volume",
-            f"{target.resolve()}:/dump.rdb:ro",
-            database.image,
-            "redis-check-rdb",
-            "/dump.rdb",
-        ],
-        timeout=600,
-    )
-    return {"format": "redis-rdb-v1", **kv.facts(container, password), "files": ["dump.rdb"]}
-
-
-def _wait(container: str, password: str, before: int, identity: str) -> None:
-    deadline = time.monotonic() + 1800
-    while time.monotonic() < deadline:
-        info = kv.info(container, password, "persistence")
-        running = info.get("rdb_bgsave_in_progress") == "1"
-        status = info.get("rdb_last_bgsave_status")
-        saved = int(info.get("rdb_last_save_time", "0"))
-        if not running and status == "ok" and saved > before:
-            return
-        if not running and status == "err":
-            raise BackupError(f"{identity}: Redis background save failed")
-        time.sleep(0.5)
-    raise BackupError(f"{identity}: Redis background save timed out")
+    return kv.backup(database, folder)

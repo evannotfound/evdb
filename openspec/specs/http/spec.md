@@ -7,7 +7,7 @@ Define database access details, authenticated KV HTTP sidecars, routing boundari
 ## Requirements
 
 ### Requirement: Per-database HTTP choice
-KV project roles SHALL have authenticated HTTP access enabled by default and MAY disable it through guided or explicit settings. The role's concrete Redis or Dragonfly engine SHALL not change the public KV identity.
+KV project roles SHALL have authenticated HTTP access enabled by default and SHALL allow disabling it during creation or through guided or explicit settings. The role's concrete Valkey, Redis, or Dragonfly engine SHALL not change the public KV identity.
 
 #### Scenario: Default KV is created
 - **WHEN** the operator adds a KV role with default settings
@@ -16,6 +16,10 @@ KV project roles SHALL have authenticated HTTP access enabled by default and MAY
 #### Scenario: HTTP is disabled
 - **WHEN** the operator confirms `http: false`
 - **THEN** generated Compose removes the sidecar while native KV access and data remain unchanged
+
+#### Scenario: HTTP is enabled after disabled creation
+- **WHEN** a new KV role is created with HTTP disabled and HTTP is enabled later through configure
+- **THEN** its sidecar uses a privately persisted token and becomes available without recreating the database identity
 
 ### Requirement: Serverless HTTP sidecar
 An enabled KV HTTP service SHALL run its role-persisted immutable `serverless-redis-http` image, use `SRH_MODE=env`, enforce its configured connection limit, and receive its token and database connection through a private host-generated environment file.
@@ -57,10 +61,10 @@ The HTTP endpoint SHALL reject missing or incorrect tokens and accept the config
 - **THEN** the sidecar rejects it and does not run the requested database command
 
 ### Requirement: Local HTTP routing test
-Disposable integration tests SHALL run Redis and Dragonfly HTTP sidecars and prove authentication, backend isolation, stable loopback-only bindings, and generated YAML without calling an external proxy or production host.
+Disposable integration tests SHALL run Valkey, Redis, and Dragonfly HTTP sidecars and prove authentication, backend isolation, stable loopback-only bindings, and generated YAML without calling an external proxy or production host.
 
-#### Scenario: Two sidecars use separate ports
-- **WHEN** tests write distinct values through two loopback sidecars
+#### Scenario: Sidecars use separate ports
+- **WHEN** tests write distinct values through separate loopback sidecars
 - **THEN** each value appears only in its matching KV engine
 
 ### Requirement: Detailed database view

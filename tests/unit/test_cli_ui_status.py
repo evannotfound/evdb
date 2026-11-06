@@ -14,7 +14,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from evdb import backup, cli, database, docker, host, status, ui
-from evdb.errors import BackupError, CommandError, DatabaseError, ResticError
+from evdb.errors import BackupError, CommandError, DatabaseError, Error, ResticError
 from evdb.run import Result, clean
 
 
@@ -203,6 +203,42 @@ def test_command_help_contains_actionable_examples_and_creation_identity():
     assert "sudo evdb init" in root
     assert "rclone:REMOTE:PATH or absolute local path" in init.format_help()
     assert "--username" in add.format_help() and "--database-name" in add.format_help()
+
+
+@pytest.mark.parametrize("engine", ["valkey", "dragonfly", "redis"])
+@pytest.mark.parametrize("http", ["--http", "--no-http"])
+def test_cli_kv_creation_forwards_options(config, monkeypatch, engine, http):
+    seen = {}
+    monkeypatch.setattr(database, "add", lambda *args, **values: seen.update(values))
+    flags = ["--engine", engine, "--mode", "cache", http]
+    if engine != "redis":
+        flags.extend(["--memory", "512mb"])
+    args = cli.parser().parse_args(["database", "add", "new-prod-01", "kv", *flags])
+
+    assert cli._database(config, args, lambda value: None, terminal=False) == 0
+    assert seen["engine"] == engine
+    assert seen["mode"] == "cache"
+    assert seen["http"] is (http == "--http")
+    assert seen.get("memory") == (None if engine == "redis" else "512mb")
+
+
+def test_cli_kv_creation_leaves_omitted_options_unset(config, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(database, "add", lambda *args, **values: seen.update(values))
+    args = cli.parser().parse_args(["database", "add", "new-prod-01", "kv"])
+
+    assert cli._database(config, args, lambda value: None, terminal=False) == 0
+    assert seen["engine"] is None
+    assert not {"mode", "memory", "http"} & seen.keys()
+
+
+@pytest.mark.parametrize("flags", [["--mode", "cache"], ["--memory", "512mb"], ["--no-http"]])
+def test_cli_rejects_kv_creation_options_for_postgres(config, monkeypatch, flags):
+    monkeypatch.setattr(database, "add", lambda *a, **kw: pytest.fail("unexpected creation"))
+    args = cli.parser().parse_args(["database", "add", "new-prod-01", "postgres", *flags])
+
+    with pytest.raises(Error, match="only valid for a KV database"):
+        cli._database(config, args, lambda value: None, terminal=False)
 
 
 def test_production_secret_input_uses_asterisk_feedback(monkeypatch):
@@ -1278,6 +1314,26 @@ def test_postgres_settings_display_nested_pool_values(config):
     assert "Reserve Size: 5" in text
 
 
+def test_valkey_settings_offer_memory_image_http_without_mode_or_threads(config):
+    from evdb.config import defaults
+
+    target = config.select("app-test-01/kv")
+    target = replace(target, settings=defaults("kv", target.settings.data_root))
+    prompts = []
+
+    def input_fn(prompt):
+        prompts.append(prompt)
+        if prompt.startswith("memory "):
+            return "512mb"
+        if prompt.startswith("http "):
+            return "false"
+        return "y" if prompt.startswith("Save?") else ""
+
+    assert ui._settings(target, input_fn, lambda value: None) == {"http": False, "memory": "512mb"}
+    assert any(prompt.startswith("image ") for prompt in prompts)
+    assert not any(prompt.startswith(("mode ", "threads ")) for prompt in prompts)
+
+
 def test_host_screen_explicitly_shows_network_traefik_acme_and_runtime_fields(config):
     output = []
 
@@ -1446,6 +1502,112 @@ def test_guided_postgres_creation_selects_version_and_disables_pgbouncer(config,
 
     assert seen["postgres_version"] == 18
     assert seen["pgbouncer"] is False
+
+
+@pytest.mark.parametrize(
+    ("choice", "engine", "persistence"),
+    [
+        ("1", "valkey", "AOF everysec"),
+        ("2", "dragonfly", "snapshots for backup jobs"),
+        ("3", "redis", "periodic RDB snapshots"),
+    ],
+)
+def test_guided_kv_creation_defaults(config, monkeypatch, choice, engine, persistence):
+    answers = iter(["new-prod-01", "2", choice, "", "y"])
+    seen = {}
+    output = []
+
+    def add(current, project, role, **values):
+        seen.update(project=project, role=role, **values)
+        return current
+
+    monkeypatch.setattr(database, "add", add)
+    ui._add(config, lambda prompt: next(answers), output.append, lambda prompt: pytest.fail(prompt))
+
+    assert seen["role"] == "kv"
+    assert seen["engine"] == engine
+    assert seen["mode"] == "durable"
+    assert seen["http"] is True
+    assert seen.get("memory") == (None if engine == "redis" else "256mb")
+    text = "\n".join(output)
+    assert "1. Valkey\n2. Dragonfly\n3. Redis" in text
+    assert f"Engine: {engine}" in text
+    assert "Mode: durable" in text and "Http: True" in text
+    assert persistence in text
+    assert ("Memory:" in text) is (engine != "redis")
+
+
+@pytest.mark.parametrize(
+    ("choice", "engine"), [("1", "valkey"), ("2", "dragonfly"), ("3", "redis")]
+)
+def test_guided_kv_advanced_retries_invalid_values(config, monkeypatch, choice, engine):
+    values = ["new-prod-01", "2", choice, "maybe", "y", "invalid", "cache"]
+    if engine != "redis":
+        values.extend(["0mb", "512mb"])
+    answers = iter([*values, "maybe", "n", "y"])
+    seen = {}
+    output = []
+
+    def add(current, project, role, **values):
+        seen.update(values)
+        return current
+
+    monkeypatch.setattr(database, "add", add)
+    ui._add(config, lambda prompt: next(answers), output.append, lambda prompt: pytest.fail(prompt))
+
+    assert seen["engine"] == engine
+    assert seen["mode"] == "cache"
+    assert seen["http"] is False
+    assert seen.get("memory") == (None if engine == "redis" else "512mb")
+    text = "\n".join(output)
+    assert "mode must be durable or cache" in text
+    assert text.count("Enter yes or no") == 2
+    if engine != "redis":
+        assert "memory must be" in text
+        assert "Memory: 512mb" in text
+    assert "Mode: cache" in text and "Http: False" in text
+    assert "backups disabled" in text
+
+
+@pytest.mark.parametrize("stage", range(2, 8))
+@pytest.mark.parametrize("error", [EOFError, KeyboardInterrupt])
+def test_guided_kv_cancellation_never_creates(config, monkeypatch, stage, error):
+    answers = iter(["new-prod-01", "2", "1", "y", "cache", "512mb", "n", "y"][:stage])
+    cancelled = False
+
+    def input_fn(prompt):
+        nonlocal cancelled
+        assert not cancelled, "cancellation must return without another prompt"
+        try:
+            return next(answers)
+        except StopIteration:
+            cancelled = True
+            raise error from None
+
+    monkeypatch.setattr(database, "add", lambda *a, **kw: pytest.fail("cancelled creation"))
+    if error is KeyboardInterrupt:
+        with pytest.raises(KeyboardInterrupt):
+            ui._add(config, input_fn, lambda value: None, lambda prompt: pytest.fail(prompt))
+    else:
+        assert (
+            ui._add(config, input_fn, lambda value: None, lambda prompt: pytest.fail(prompt))
+            is config
+        )
+
+
+def test_guided_kv_declined_creation_does_not_write(config, monkeypatch):
+    answers = iter(["new-prod-01", "2", "1", "n", "n"])
+    monkeypatch.setattr(database, "add", lambda *a, **kw: pytest.fail("declined creation"))
+
+    assert (
+        ui._add(
+            config,
+            lambda prompt: next(answers),
+            lambda value: None,
+            lambda prompt: pytest.fail(prompt),
+        )
+        is config
+    )
 
 
 def test_guided_delete_requires_identity_and_backup_sensitive_phrase(config, monkeypatch):

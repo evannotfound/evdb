@@ -87,7 +87,10 @@ def parser() -> argparse.ArgumentParser:
     add = database_commands.add_parser("add")
     add.add_argument("project")
     add.add_argument("role", choices=("postgres", "kv"))
-    add.add_argument("--engine", choices=("dragonfly", "redis"))
+    add.add_argument("--engine", choices=("valkey", "dragonfly", "redis"))
+    add.add_argument("--mode", choices=("durable", "cache"), help="KV mode (creation only)")
+    add.add_argument("--memory", help="Valkey or Dragonfly database memory limit; example: 256mb")
+    add.add_argument("--http", action=argparse.BooleanOptionalAction, help="enable KV HTTP access")
     add.add_argument("--username", help="initial Postgres username (creation only)")
     add.add_argument("--database-name", help="initial Postgres database name (creation only)")
     add.add_argument("--postgres-version", type=int, default=16)
@@ -106,7 +109,11 @@ def parser() -> argparse.ArgumentParser:
     configure.add_argument("--max-clients", type=int)
     configure.add_argument("--pool-size", type=int)
     configure.add_argument("--reserve-size", type=int)
-    configure.add_argument("--mode", choices=("durable", "cache"))
+    configure.add_argument(
+        "--mode",
+        choices=("durable", "cache"),
+        help="Redis/Dragonfly only; Valkey mode is creation-only",
+    )
     configure.add_argument("--http", action=argparse.BooleanOptionalAction)
     configure.add_argument("--http-image")
     configure.add_argument("--http-connections", type=int)
@@ -228,6 +235,13 @@ def _database(config, args, output, *, terminal: bool) -> int:
     if command == "add":
         if args.role == "postgres" and args.engine is not None:
             raise Error("--engine is only valid for a KV database")
+        kv_values = {
+            name: getattr(args, name)
+            for name in ("mode", "memory", "http")
+            if getattr(args, name) is not None
+        }
+        if args.role != "kv" and kv_values:
+            raise Error("--mode, --memory, and --http/--no-http are only valid for a KV database")
         if args.role == "kv" and args.password_file:
             raise Error("--password-file is only valid for Postgres")
         if args.role == "kv" and (args.username or args.database_name):
@@ -243,6 +257,7 @@ def _database(config, args, output, *, terminal: bool) -> int:
             database_name=args.database_name,
             data_root=args.data_root,
             postgres_version=args.postgres_version,
+            **kv_values,
         )
         ui.success(output, f"{args.project}/{args.role} is healthy")
         return 0

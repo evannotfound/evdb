@@ -12,6 +12,7 @@ import evdb.files as files_module
 from evdb.config import (
     add_role,
     as_dict,
+    defaults,
     dump,
     dump_secrets,
     load,
@@ -45,6 +46,20 @@ def test_strict_two_file_round_trip_and_project_role_selectors(config):
     assert yaml.safe_load(dump(config)) == as_dict(config)
     assert "local-restic-password" not in dump(config)
     assert "local-restic-password" in dump_secrets(config.secrets)
+
+
+def test_valkey_memory_round_trip_keeps_existing_engine_settings(config):
+    settings = replace(defaults("kv", config.host.data_roots[0]), memory="512mb")
+    updated = add_role(
+        config, "valkey-prod-01", "kv", settings, RoleSecrets("valkey-password", "valkey-token")
+    )
+    write(updated)
+    loaded = load(updated.paths.source, paths=updated.paths)
+
+    assert loaded.select("valkey-prod-01/kv").engine == "valkey"
+    assert loaded.select("valkey-prod-01/kv").settings == settings
+    assert "threads" not in as_dict(loaded)["projects"]["valkey-prod-01"]["kv"]
+    assert loaded.select("app-test-01/kv").settings == config.select("app-test-01/kv").settings
 
 
 def test_postgres_identity_is_required_without_compatibility_defaults(config):

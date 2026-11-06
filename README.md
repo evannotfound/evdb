@@ -170,7 +170,7 @@ An occupied requested port is rejected before the configuration is saved.
 
 ## Redis HTTP with an external reverse proxy
 
-KV creation enables `hiett/serverless-redis-http` by default for both Redis and Dragonfly. Run
+KV creation enables `hiett/serverless-redis-http` by default for Valkey, Dragonfly, and Redis. Run
 `sudo evdb database info PROJECT/kv` to obtain its intended HTTPS URL, localhost gateway address, and
 HTTP token. Configure your external reverse proxy to forward the public hostname to the reported
 `http://127.0.0.1:<port>` address. A containerized proxy must be able to reach the host's loopback
@@ -234,6 +234,27 @@ sudo evdb database add imported-prod-01 postgres \
 evdb does not import the source database or rotate that identity after creation; use standard Postgres
 dump and restore tools for the data transfer.
 
+### Create a KV database
+
+New KV databases default to Valkey (`valkey/valkey:9.1.3`), durable mode, a `256mb` memory limit, and
+HTTP access. Guided creation lists Valkey first and offers optional mode, memory, and HTTP settings
+before a confirmation summary. Redis and Dragonfly remain available; existing databases retain their
+engine and image, with no automatic migration.
+
+```sh
+sudo evdb database add jobs-prod-01 kv
+sudo evdb database add cache-prod-01 kv --mode cache --memory 512mb --no-http
+sudo evdb database add legacy-prod-01 kv --engine dragonfly
+```
+
+Durable Valkey uses `appendonly yes`, `appendfsync everysec`, `save ""`, and `noeviction`.
+AOF supports local crash recovery; recent writes can be lost (roughly a second under normal conditions,
+potentially longer with delayed syncing). This is not a zero-loss guarantee. Cache mode uses no AOF or
+automatic RDB snapshots, `allkeys-lru` eviction, and no evdb backups. Valkey mode is creation-only;
+memory, image, and HTTP remain configurable. Memory is a database limit, not an RSS cap: leave headroom
+for process overhead and background persistence work. Memory overrides also work with Dragonfly, but
+not Redis. BullMQ clients use the native TLS `rediss://` connection from `database info`, not the HTTP API.
+
 ## CLI usage
 
 Run `sudo evdb` for the guided terminal interface. Direct commands execute immediately and are useful
@@ -245,7 +266,7 @@ sudo evdb status
 sudo evdb status --json
 
 sudo evdb database list
-sudo evdb database add cache-prod-01 kv
+sudo evdb database add cache-prod-01 kv --mode cache
 sudo evdb database add cache-prod-02 kv --engine redis
 sudo evdb database info cache-prod-01/kv
 sudo evdb database configure notes-prod-01/postgres --max-clients 200
@@ -277,6 +298,9 @@ backup timer without restarting healthy databases.
 The automatic timer backs up every durable database sequentially. A backup succeeds only after the
 database files are checked and Restic confirms the remote snapshot.
 
+Valkey creates checked RDB snapshots only for explicit backup jobs, including the scheduled daily
+remote backup. It does not schedule periodic server-side RDB saves; AOF handles local recovery.
+
 Status, database Details, and backup history read a private local catalog: they do not contact
 OneDrive or hash dump files. Successful uploads appear immediately. The daily all-database job
 refreshes remote inventory once after attempting every backup, even if an individual backup fails.
@@ -291,6 +315,13 @@ leave backups permanently marked current.
 
 evdb does not delete remote snapshots, so configure retention separately. Recovery is manual with
 Restic and the matching database tools; evdb does not provide a restore command.
+
+To recover a Valkey RDB, load the checked snapshot into a separate empty Valkey instance with AOF
+disabled, then verify the data. For durable recovery, enable AOF on that running instance with
+`CONFIG SET appendonly yes`. Wait until `INFO persistence` reports `aof_rewrite_in_progress:0`,
+`aof_rewrite_scheduled:0`, and `aof_last_bgrewrite_status:ok`; also verify `aof_last_write_status:ok`.
+Then persist the matching AOF configuration before restarting and verify the recovered data again.
+Simply enabling AOF in a startup config can cause the imported RDB to be ignored.
 
 ## Development
 

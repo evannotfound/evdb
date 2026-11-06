@@ -39,6 +39,7 @@ DEFAULT_IMAGES = {
     "postgres": "postgres:16",
     "pgbouncer": "edoburu/pgbouncer:v1.25.1-p0",
     "redis": "redis:7.2.5",
+    "valkey": "valkey/valkey:9.1.3",
     "dragonfly": "docker.dragonflydb.io/dragonflydb/dragonfly:v1.34.1",
     "http": (
         "hiett/serverless-redis-http@"
@@ -220,8 +221,10 @@ def as_dict(config: Config) -> dict[str, Any]:
                     "domain": http.domain,
                 },
             }
+            if project.kv.engine in {"valkey", "dragonfly"}:
+                role["memory"] = project.kv.memory
             if project.kv.engine == "dragonfly":
-                role.update(memory=project.kv.memory, threads=project.kv.threads)
+                role["threads"] = project.kv.threads
             item["kv"] = role
         projects[project.id] = item
     return {
@@ -292,14 +295,15 @@ def _rclone_credentials(path: Path) -> list[str]:
     return values
 
 
-def defaults(role: str, data_root: Path, engine: str = "dragonfly") -> Postgres | KV:
+def defaults(role: str, data_root: Path, engine: str | None = None) -> Postgres | KV:
     if role == "postgres":
         return Postgres(
             DEFAULT_IMAGES["postgres"],
             PgBouncer(True, DEFAULT_IMAGES["pgbouncer"], 100, 20, 5),
             data_root,
         )
-    if role != "kv" or engine not in {"redis", "dragonfly"}:
+    engine = "valkey" if engine is None else engine
+    if role != "kv" or engine not in {"valkey", "redis", "dragonfly"}:
         raise ConfigError("database role must be postgres or kv")
     return KV(
         engine,
@@ -307,7 +311,7 @@ def defaults(role: str, data_root: Path, engine: str = "dragonfly") -> Postgres 
         "durable",
         HTTP(True, DEFAULT_IMAGES["http"], 20),
         data_root,
-        "256mb" if engine == "dragonfly" else None,
+        "256mb" if engine in {"valkey", "dragonfly"} else None,
         1 if engine == "dragonfly" else None,
     )
 

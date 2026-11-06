@@ -3,16 +3,19 @@ from __future__ import annotations
 import json
 import shutil
 import socket
+import time
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from evdb import backup, database, docker
 from evdb.config import defaults, require_valid, write
-from evdb.engines import dragonfly, kv, postgres
+from evdb.engines import dragonfly, kv, postgres, valkey
+from evdb.errors import BackupError
 from evdb.models import Config, Project, ProjectSecrets, RoleSecrets, http_port
 from evdb.run import run
 
@@ -135,7 +138,7 @@ def test_postgres_and_private_pgbouncer_run_in_disposable_compose(config, tmp_pa
             _clean(target, "/var/lib/postgresql/data")
 
 
-def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_path, monkeypatch):
+def test_kv_engines_http_are_authenticated_and_isolated(config, tmp_path, monkeypatch):
     _require_docker()
     monkeypatch.setattr(backup, "_upload", lambda *args: "integration-snapshot")
     monkeypatch.setattr(backup, "_handoff", lambda *args: None)
@@ -143,7 +146,7 @@ def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_pat
     projects = []
     secrets = []
     credentials = {}
-    for engine in ("redis", "dragonfly"):
+    for engine in ("redis", "dragonfly", "valkey"):
         project = _http_project(engine, used)
         password = f"local-{engine}-password"
         token = f"local-{engine}-token"
@@ -166,6 +169,8 @@ def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_pat
             for target in targets:
                 database.health(selected, target, timeout=120)
                 password, token = credentials[target.engine]
+                assert not kv.health(target.service("primary"), "", engine=target.engine)
+                assert not kv.health(target.service("primary"), "wrong", engine=target.engine)
                 status, body = _request(target.http_port, ["PING"], token)
                 assert (status, body) == (200, {"result": "PONG"})
                 assert _request(target.http_port, ["SET", "blocked", "value"])[0] in {
@@ -178,7 +183,10 @@ def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_pat
                     {"result": "OK"},
                 )
                 assert (
-                    kv.text(target.service("primary"), password, ["GET", "scope"]) == target.engine
+                    kv.text(
+                        target.service("primary"), password, ["GET", "scope"], engine=target.engine
+                    )
+                    == target.engine
                 )
                 created = backup.create(selected, target)
                 manifest = backup.manifest_check(created["folder"])
@@ -191,10 +199,141 @@ def test_redis_and_dragonfly_http_are_authenticated_and_isolated(config, tmp_pat
                 inspected = run(["docker", "inspect", target.service("http")], timeout=30)
                 service = json.loads(inspected.out)[0]["NetworkSettings"]["Ports"]["80/tcp"]
                 assert service == [{"HostIp": "127.0.0.1", "HostPort": str(target.http_port)}]
-            assert len({target.http_port for target in targets}) == 2
+            for target in targets:
+                assert (
+                    kv.text(
+                        target.service("primary"),
+                        credentials[target.engine][0],
+                        ["GET", "scope"],
+                        engine=target.engine,
+                    )
+                    == target.engine
+                )
+                assert (
+                    kv.text(
+                        target.service("primary"),
+                        credentials[target.engine][0],
+                        ["GET", "blocked"],
+                        engine=target.engine,
+                    )
+                    == ""
+                )
+            assert len({target.http_port for target in targets}) == 3
         finally:
             for target in targets:
                 _clean(target, "/data")
+
+
+@pytest.mark.parametrize("mode", ["durable", "cache"])
+def test_valkey_persistence_memory_and_checked_rdb_recovery(config, tmp_path, monkeypatch, mode):
+    _require_docker()
+    monkeypatch.setattr(backup, "_upload", lambda *args: "integration-snapshot")
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
+    project = _project("valkey")
+    settings = defaults("kv", config.host.data_roots[0], "valkey")
+    settings = replace(settings, mode=mode, http=replace(settings.http, enabled=False))
+    password = 'local valkey "password" \\ slash'
+    selected = _config(
+        config,
+        tmp_path,
+        (Project(project, kv=settings),),
+        (ProjectSecrets(project, kv=RoleSecrets(password)),),
+    )
+    write(selected)
+    target = selected.select(f"{project}/kv")
+    primary = target.service("primary")
+    restored = f"{primary}-restore"
+
+    def text(*args):
+        return kv.text(primary, password, list(args), engine="valkey")
+
+    with _network(monkeypatch):
+        try:
+            database.render(selected, target)
+            assert (target.generated / "valkey.conf").stat().st_mode & 0o777 == 0o640
+            docker.up(target.compose, target.compose_project, timeout=600, secrets=(password,))
+            database.health(selected, target, timeout=120)
+            aof = "yes" if mode == "durable" else "no"
+            assert text("CONFIG", "GET", "appendonly") == f"appendonly\n{aof}"
+            assert text("CONFIG", "GET", "save") == "save"
+            assert text("CONFIG", "GET", "appendfsync") == "appendfsync\neverysec"
+            policy = "noeviction" if mode == "durable" else "allkeys-lru"
+            assert text("CONFIG", "GET", "maxmemory-policy") == f"maxmemory-policy\n{policy}"
+            assert text("CONFIG", "GET", "maxmemory") == "maxmemory\n268435456"
+            assert valkey.info(target)["version"] == "9.1.3"
+
+            if mode == "cache":
+                with pytest.raises(BackupError, match="disabled"):
+                    backup.create(selected, target)
+                assert not (target.data / "appendonlydir").exists()
+            else:
+                # WAITAOF covers previous writes on this same connection, not a new CLI call.
+                result = run(
+                    [
+                        "docker",
+                        "exec",
+                        "-i",
+                        "--env",
+                        "VALKEYCLI_AUTH",
+                        primary,
+                        "valkey-cli",
+                        "--raw",
+                    ],
+                    input="SET durable survived\nLPUSH queue job-1\nWAITAOF 1 0 10000\n",
+                    env={"VALKEYCLI_AUTH": password},
+                    secrets=(password,),
+                    timeout=30,
+                )
+                assert result.out.splitlines() == ["OK", "1", "1", "0"]
+                assert not (target.data / "dump.rdb").exists()
+                run(["docker", "kill", "--signal", "KILL", primary], timeout=30)
+                stopped = run(["docker", "inspect", "--format", "{{.State.ExitCode}}", primary])
+                assert stopped.out.strip() == "137"
+                run(["docker", "start", primary], timeout=30)
+                database.health(selected, target, timeout=120)
+                assert text("GET", "durable") == "survived"
+                assert text("LRANGE", "queue", "0", "-1") == "job-1"
+                assert not (target.data / "dump.rdb").exists()
+
+            selected = database.configure(selected, target, {"memory": "384mb"})
+            target = selected.select(target.identity)
+            assert text("CONFIG", "GET", "maxmemory") == "maxmemory\n402653184"
+            if mode == "durable":
+                assert text("GET", "durable") == "survived"
+                created = backup.create(selected, target)
+                manifest = backup.manifest_check(created["folder"])
+                assert manifest["format"] == "valkey-rdb-v1"
+                assert manifest["version"] == "9.1.3"
+                folder = tmp_path / "reload"
+                folder.mkdir()
+                shutil.copyfile(Path(created["folder"]) / "dump.rdb", folder / "dump.rdb")
+                assert {path.name for path in folder.iterdir()} == {"dump.rdb"}
+                docker.start(
+                    target.image,
+                    restored,
+                    [
+                        "/usr/local/bin/valkey-server",
+                        "--dir",
+                        "/data",
+                        "--appendonly",
+                        "no",
+                        "--save",
+                        "",
+                    ],
+                    mounts=[(folder, "/data", True)],
+                )
+                deadline = time.monotonic() + 30
+                while not kv.health(restored, "", engine="valkey"):
+                    assert time.monotonic() < deadline, "RDB reload did not become healthy"
+                    time.sleep(0.2)
+                assert kv.text(restored, "", ["GET", "durable"], engine="valkey") == "survived"
+                assert (
+                    kv.text(restored, "", ["LRANGE", "queue", "0", "-1"], engine="valkey")
+                    == "job-1"
+                )
+        finally:
+            docker.remove(restored)
+            _clean(target, "/data")
 
 
 def test_postgres_logical_major_upgrade_from_16_to_18(config, tmp_path, monkeypatch):

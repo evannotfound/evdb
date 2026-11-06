@@ -467,6 +467,7 @@ def manifest_check(folder: str | Path, *, verify: bool = True) -> dict[str, Any]
     formats = {
         "postgres": "postgres-custom-v1",
         "redis": "redis-rdb-v1",
+        "valkey": "valkey-rdb-v1",
         "dragonfly": "dragonfly-dfs-v1",
     }
     if data.get("format") != formats.get(data.get("engine")):

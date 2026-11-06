@@ -6,6 +6,21 @@ Define direct host-local database creation, configuration, lifecycle, routing, a
 
 ## Requirements
 
+### Requirement: Valkey persistence and runtime
+Valkey SHALL use its native server and authenticated CLI, existing KV routing and data mounts, and a configurable memory limit defaulting to 256mb. Durable mode SHALL enable AOF with every-second syncing and noeviction. Cache mode SHALL disable AOF and use allkeys-lru. Both modes SHALL disable automatic RDB snapshots. Graceful stops SHALL allow time to flush persistence. Valkey information SHALL report its actual version rather than the Redis compatibility version.
+
+#### Scenario: Durable Valkey restarts after a crash
+- **WHEN** writes have reached durable AOF storage and the process is abruptly terminated and restarted
+- **THEN** those writes are recovered from AOF without requiring a scheduled RDB snapshot
+
+#### Scenario: Cache Valkey is created
+- **WHEN** Valkey is created in cache mode
+- **THEN** AOF and scheduled RDB saves are disabled, allkeys-lru is active, and evdb does not back it up
+
+#### Scenario: Valkey memory is configured
+- **WHEN** the memory setting is changed through configure
+- **THEN** the running server uses the new limit after the normal Compose and health operation
+
 ### Requirement: Direct settings transaction
 `evdb database configure PROJECT/ROLE` SHALL collect and validate role-specific values, atomically
 update `config.yml`, rerender that role's generated files, run Compose once, and wait for native health.
@@ -97,11 +112,11 @@ not appear in Compose, status, errors, or logs.
 validate identity, persist explicit role settings, generate or securely accept required credentials in
 `secrets.yml`, render role-local files, start Compose, and wait for full native health. Existing matching
 roles SHALL not be duplicated. Creation failure SHALL leave readable source and generated files for
-inspection and retry rather than running candidate rollback.
+inspection and retry rather than running candidate rollback. KV creation SHALL accept mode, supported memory, and HTTP overrides before first startup; conflicting supplied settings on an existing role SHALL be rejected without mutation.
 
 #### Scenario: Default KV is added
 - **WHEN** the operator adds an absent KV role without selecting an engine
-- **THEN** one Dragonfly-backed KV role with HTTP and backups is recorded and started
+- **THEN** one durable Valkey-backed KV role with HTTP and backups is recorded and started
 
 #### Scenario: Postgres receives a supplied initial password
 - **WHEN** an absent Postgres role is added with a valid securely supplied password

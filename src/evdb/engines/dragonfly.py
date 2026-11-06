@@ -73,11 +73,18 @@ def services(database: Database) -> dict[str, Any]:
 
 
 def health(database: Database, *, timeout: int = 10) -> bool:
-    return kv.health(database.service("primary"), database.credentials.password, timeout=timeout)
+    return kv.health(
+        database.service("primary"),
+        database.credentials.password,
+        engine="dragonfly",
+        timeout=timeout,
+    )
 
 
 def info(database: Database) -> dict[str, Any]:
-    facts = kv.info(database.service("primary"), database.credentials.password, "server")
+    facts = kv.info(
+        database.service("primary"), database.credentials.password, "server", engine="dragonfly"
+    )
     return {
         "version": facts.get("dragonfly_version") or "unknown",
         "mode": database.settings.mode,
@@ -85,7 +92,9 @@ def info(database: Database) -> dict[str, Any]:
         "threads": database.settings.threads,
         "http": database.settings.http.enabled,
         "http_connections": database.settings.http.connections,
-        "data": kv.usage(database.service("primary"), database.credentials.password),
+        "data": kv.usage(
+            database.service("primary"), database.credentials.password, engine="dragonfly"
+        ),
     }
 
 
@@ -98,7 +107,7 @@ def backup(database: Database, folder: Path, run_id: str) -> dict[str, Any]:
     files = ()
     error = None
     try:
-        kv.text(container, password, ["SAVE", "DF", base], timeout=1800)
+        kv.text(container, password, ["SAVE", "DF", base], engine="dragonfly", timeout=1800)
         files = _snapshot(base, _sources(container, base))
         for item in files:
             docker.copy(f"{container}:/data/{item}", folder / item, timeout=1800)
@@ -188,8 +197,8 @@ def _check(database: Database, folder: Path, base: str, run_id: str) -> dict[str
 
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
-            if kv.health(name, ""):
-                return kv.facts(name, "")
+            if kv.health(name, "", engine="dragonfly"):
+                return kv.facts(name, "", engine="dragonfly")
             time.sleep(1)
         raise BackupError("Dragonfly backup check did not become healthy")
     finally:

@@ -6,12 +6,15 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from threading import Event, get_ident
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
 
 from evdb import backup, database, status
-from evdb.errors import BackupError, ResticError
+from evdb.config import defaults
+from evdb.engines import kv
+from evdb.errors import BackupError, CommandError, ResticError
 from evdb.run import Result
 
 
@@ -114,12 +117,13 @@ def test_upload_failure_keeps_complete_local_folder(config, monkeypatch):
     assert not backup.catalog(config)["attempts"][target.identity]["ok"]
 
 
-def test_cache_backup_never_calls_engine(config, monkeypatch):
+@pytest.mark.parametrize("engine", ["redis", "dragonfly", "valkey"])
+def test_cache_backup_never_calls_engine(config, monkeypatch, engine):
     target = config.select("app-test-01/kv")
     target = target.__class__(
         target.project,
         target.role,
-        replace(target.settings, mode="cache"),
+        replace(defaults("kv", target.settings.data_root, engine), mode="cache"),
         target.host,
         target.paths,
         target.credentials,
@@ -564,3 +568,144 @@ def test_create_all_reports_refresh_failure_and_empty_host_skips_refresh(config,
     assert all(values[target.identity]["ok"] for target in config.databases)
     assert backup.create_all(replace(config, projects=())) == {}
     assert calls == [config]
+
+
+def _persistence(*, running=0, saved=100, status="ok", saves=1, rewriting=0):
+    return {
+        "rdb_bgsave_in_progress": str(running),
+        "rdb_last_save_time": str(saved),
+        "rdb_last_bgsave_status": status,
+        "rdb_saves": str(saves),
+        "aof_rewrite_in_progress": str(rewriting),
+    }
+
+
+def _rdb(config, monkeypatch, engine, states, *, reply="Background saving started", bad=False):
+    target = config.select("app-test-01/kv")
+    target = replace(target, settings=defaults("kv", target.settings.data_root, engine))
+    _ready(config, target)
+    calls = []
+    pending = iter(states)
+    current = {}
+    clock = [0]
+
+    def sleep(seconds):
+        clock[0] += 60
+
+    monkeypatch.setattr(
+        kv, "time", SimpleNamespace(monotonic=lambda: clock[0], time=lambda: 102, sleep=sleep)
+    )
+
+    def execute(container, args, **kwargs):
+        nonlocal current
+        assert kwargs["env"] == {f"{engine.upper()}CLI_AUTH": target.credentials.password}
+        command = args[2:]
+        calls.append(command)
+        if command == ["INFO", "persistence"]:
+            current = next(pending, current)
+            out = "\n".join(f"{key}:{value}" for key, value in current.items())
+        elif command == ["LASTSAVE"]:
+            out = current["rdb_last_save_time"]
+        elif command[0] == "BGSAVE":
+            out = reply
+        elif command == ["INFO", "server"]:
+            out = "redis_version:7.2.5\n" + ("valkey_version:9.1.3\n" if engine == "valkey" else "")
+        elif command == ["INFO", "keyspace"]:
+            out = "db0:keys=2,expires=0\n"
+        else:
+            pytest.fail(f"unexpected command: {command}")
+        return Result(tuple(args), 0, out, "")
+
+    def copy(source, dest, **kwargs):
+        calls.append("copy")
+        dest.write_bytes(b"RDB snapshot")
+
+    def check(args, **kwargs):
+        calls.append(args)
+        if bad:
+            raise CommandError("invalid RDB checksum")
+        return Result(tuple(args), 0, "OK", "")
+
+    monkeypatch.setattr(kv.docker, "exec", execute)
+    monkeypatch.setattr(kv.docker, "copy", copy)
+    monkeypatch.setattr(kv, "run", check)
+    monkeypatch.setattr(backup, "_handoff", lambda *args: None)
+    monkeypatch.setattr(backup, "_upload", lambda *args: calls.append("upload") or "snapshot")
+    return target, calls
+
+
+@pytest.mark.parametrize("engine", ["redis", "valkey"])
+def test_rdb_backup_waits_for_existing_save_then_checks_fresh_snapshot(config, monkeypatch, engine):
+    target, calls = _rdb(
+        config,
+        monkeypatch,
+        engine,
+        [
+            _persistence(running=1, saved=99),
+            _persistence(saved=100),
+            _persistence(running=1, saves=2),
+            _persistence(saved=101, saves=2),
+        ],
+    )
+    created = backup.create(config, target)
+    record = backup.manifest_check(created["folder"])
+    assert calls[:3] == [["INFO", "persistence"], ["INFO", "persistence"], ["LASTSAVE"]]
+    assert calls[3] == (["BGSAVE", "SCHEDULE"] if engine == "valkey" else ["BGSAVE"])
+    checker = next(call for call in calls if isinstance(call, list) and call[0] == "docker")
+    assert checker[-3:] == [target.image, f"{engine}-check-rdb", "/dump.rdb"]
+    assert calls.index("copy") > 5
+    assert calls[-1] == "upload"
+    assert record["format"] == f"{engine}-rdb-v1"
+    assert record["engine"] == engine
+    assert record["version"] == ("9.1.3" if engine == "valkey" else "7.2.5")
+    record["format"] = "redis-rdb-v1" if engine == "valkey" else "valkey-rdb-v1"
+    backup.manifest_write(created["folder"], record)
+    with pytest.raises(BackupError, match="format does not match"):
+        backup.manifest_check(created["folder"])
+
+
+def test_valkey_scheduled_save_waits_through_aof_rewrite_and_old_failure(config, monkeypatch):
+    target, calls = _rdb(
+        config,
+        monkeypatch,
+        "valkey",
+        [
+            _persistence(status="err", rewriting=1),
+            _persistence(status="err", rewriting=1),
+            _persistence(status="err"),
+            _persistence(running=1, status="err", saves=2),
+            _persistence(saved=101, saves=2),
+        ],
+        reply="Background saving scheduled",
+    )
+    created = backup.create(config, target)
+    assert backup.manifest_check(created["folder"])["format"] == "valkey-rdb-v1"
+    assert calls[:3] == [["INFO", "persistence"], ["LASTSAVE"], ["BGSAVE", "SCHEDULE"]]
+    assert calls[3:7] == [["INFO", "persistence"]] * 4
+    assert calls[7] == "copy"
+
+
+@pytest.mark.parametrize("failure", ["rejected", "failed", "scheduled-failed", "stale", "checker"])
+def test_valkey_backup_failures_never_publish_or_upload(config, monkeypatch, failure):
+    states = [_persistence()]
+    reply = "Background saving started"
+    if failure == "rejected":
+        reply = "ERR Background save already in progress"
+    elif failure in {"failed", "scheduled-failed"}:
+        states.append(_persistence(status="err", saves=2))
+        if failure == "scheduled-failed":
+            states[0] = _persistence(status="err", rewriting=1)
+            reply = "Background saving scheduled"
+    elif failure == "stale":
+        reply = "Background saving scheduled"
+    else:
+        states.append(_persistence(saved=101, saves=2))
+    target, calls = _rdb(
+        config, monkeypatch, "valkey", states, reply=reply, bad=failure == "checker"
+    )
+    with pytest.raises((BackupError, CommandError), match="failed|timed out|invalid RDB"):
+        backup.create(config, target)
+    assert "upload" not in calls
+    if failure != "checker":
+        assert "copy" not in calls
+    assert list(config.paths.role_backups(target.project, target.role).iterdir()) == []
