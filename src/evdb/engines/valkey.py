@@ -26,6 +26,12 @@ def validate(settings: KV) -> None:
         raise ConfigError("Valkey memory must be a positive kb, mb, or gb value")
     if settings.threads is not None:
         raise ConfigError("Valkey does not accept Dragonfly thread settings")
+    if (
+        settings.cluster_mode != "off"
+        or settings.lock_on_hashtags is not False
+        or settings.snapshot_cron != "off"
+    ):
+        raise ConfigError("Valkey does not accept Dragonfly cluster or snapshot settings")
     kv.validate_http(settings)
 
 

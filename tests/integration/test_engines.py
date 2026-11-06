@@ -336,6 +336,84 @@ def test_valkey_persistence_memory_and_checked_rdb_recovery(config, tmp_path, mo
             _clean(target, "/data")
 
 
+def test_dragonfly_configures_cluster_hashtags_and_scheduled_snapshots(
+    config, tmp_path, monkeypatch
+):
+    _require_docker()
+    project = _project("dragonfly")
+    settings = defaults("kv", config.host.data_roots[0], "dragonfly")
+    settings = replace(settings, http=replace(settings.http, enabled=False))
+    password = "local-dragonfly-options-password"
+    selected = _config(
+        config,
+        tmp_path,
+        (Project(project, kv=settings),),
+        (ProjectSecrets(project, kv=RoleSecrets(password)),),
+    )
+    selected = replace(
+        selected,
+        host=replace(selected.host, routing=replace(selected.host.routing, kv_ports=(16379,))),
+    )
+    write(selected)
+    target = selected.select(f"{project}/kv")
+
+    def text(*args):
+        return kv.text(target.service("primary"), password, list(args), engine="dragonfly")
+
+    with _network(monkeypatch):
+        try:
+            database.start(selected, target)
+            selected = database.configure(
+                selected,
+                target,
+                {
+                    "cluster_mode": "emulated",
+                    "lock_on_hashtags": True,
+                    "snapshot_cron": "* * * * *",
+                },
+            )
+            target = selected.select(target.identity)
+            assert "cluster_state:ok" in text("CLUSTER", "INFO")
+            slots = text("CLUSTER", "SLOTS").splitlines()
+            assert slots[:4] == ["0", "16383", target.domain, "16379"]
+            assert (
+                text(
+                    "EVAL",
+                    "redis.call('SET', KEYS[1], 'queued'); "
+                    "return redis.call('LPUSH', KEYS[2], 'job')",
+                    "2",
+                    "{queue}:state",
+                    "{queue}:jobs",
+                )
+                == "1"
+            )
+            before = int(text("LASTSAVE"))
+            deadline = time.monotonic() + 90
+            while int(text("LASTSAVE")) <= before:
+                assert time.monotonic() < deadline, "scheduled Dragonfly snapshot did not complete"
+                time.sleep(0.5)
+            files = dragonfly._sources(target.service("primary"), "dump")
+            assert dragonfly._snapshot("dump", files)
+            folder = tmp_path / "scheduled-backup"
+            folder.mkdir()
+            saved = dragonfly.backup(target, folder, "scheduled")
+            assert saved["keys"] == 2
+            assert dragonfly._sources(target.service("primary"), "dump") == files
+
+            selected = database.configure(
+                selected,
+                target,
+                {},
+                reset=("cluster_mode", "lock_on_hashtags", "snapshot_cron"),
+            )
+            target = selected.select(target.identity)
+            assert "cluster_state:ok" not in text("CLUSTER", "INFO")
+            assert text("GET", "{queue}:state") == "queued"
+            assert target.settings.snapshot_cron == "off"
+        finally:
+            _clean(target, "/data")
+
+
 def test_postgres_logical_major_upgrade_from_16_to_18(config, tmp_path, monkeypatch):
     _require_docker()
     monkeypatch.setattr(backup, "_upload", lambda *args: "integration-snapshot")

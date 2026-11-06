@@ -225,6 +225,9 @@ def as_dict(config: Config) -> dict[str, Any]:
                 role["memory"] = project.kv.memory
             if project.kv.engine == "dragonfly":
                 role["threads"] = project.kv.threads
+                role["cluster_mode"] = project.kv.cluster_mode
+                role["lock_on_hashtags"] = project.kv.lock_on_hashtags
+                role["snapshot_cron"] = project.kv.snapshot_cron
             item["kv"] = role
         projects[project.id] = item
     return {
@@ -741,9 +744,13 @@ def _postgres(value: Any, project: str) -> Postgres:
 
 def _kv(value: Any, project: str) -> KV:
     data = _object(value, f"projects.{project}.kv")
+    engine = _string(data, "engine", f"projects.{project}.kv")
+    allowed = {"engine", "image", "data_root", "mode", "http", "memory", "threads"}
+    if engine == "dragonfly":
+        allowed.update({"cluster_mode", "lock_on_hashtags", "snapshot_cron"})
     _only(
         data,
-        {"engine", "image", "data_root", "mode", "http", "memory", "threads"},
+        allowed,
         f"projects.{project}.kv",
     )
     http = _object(_required(data, "http", f"projects.{project}.kv"), "http")
@@ -758,7 +765,7 @@ def _kv(value: Any, project: str) -> KV:
     if threads is not None and type(threads) is not int:
         raise ConfigError("kv.threads must be an integer or null")
     return KV(
-        _string(data, "engine", f"projects.{project}.kv"),
+        engine,
         _string(data, "image", f"projects.{project}.kv"),
         _string(data, "mode", f"projects.{project}.kv"),
         HTTP(
@@ -770,6 +777,9 @@ def _kv(value: Any, project: str) -> KV:
         Path(_string(data, "data_root", f"projects.{project}.kv")),
         memory,
         threads,
+        data.get("cluster_mode", "off"),
+        data.get("lock_on_hashtags", False),
+        data.get("snapshot_cron", "off"),
     )
 
 

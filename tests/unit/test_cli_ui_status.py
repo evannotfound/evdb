@@ -232,6 +232,64 @@ def test_cli_kv_creation_leaves_omitted_options_unset(config, monkeypatch):
     assert not {"mode", "memory", "http"} & seen.keys()
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_cli_configure_forwards_dragonfly_options(config, monkeypatch, enabled):
+    seen = []
+    monkeypatch.setattr(
+        database,
+        "configure",
+        lambda current, target, values, **kwargs: seen.append((target.identity, values, kwargs)),
+    )
+    mode = "emulated" if enabled else "off"
+    cron = "*/5 * * * *" if enabled else "off"
+    args = cli.parser().parse_args(
+        [
+            "database",
+            "configure",
+            "app-test-01/kv",
+            "--cluster-mode",
+            mode,
+            "--lock-on-hashtags" if enabled else "--no-lock-on-hashtags",
+            "--snapshot-cron",
+            cron,
+        ]
+    )
+
+    assert cli._database(config, args, lambda value: None, terminal=False) == 0
+    assert seen == [
+        (
+            "app-test-01/kv",
+            {"cluster_mode": mode, "lock_on_hashtags": enabled, "snapshot_cron": cron},
+            {"reset": ()},
+        )
+    ]
+
+
+def test_cli_configure_forwards_dragonfly_resets_without_setting_defaults(config, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        database,
+        "configure",
+        lambda current, target, values, **kwargs: seen.append((values, kwargs)),
+    )
+    args = cli.parser().parse_args(
+        [
+            "database",
+            "configure",
+            "app-test-01/kv",
+            "--reset",
+            "cluster_mode",
+            "--reset",
+            "lock_on_hashtags",
+            "--reset",
+            "snapshot_cron",
+        ]
+    )
+
+    assert cli._database(config, args, lambda value: None, terminal=False) == 0
+    assert seen == [({}, {"reset": ("cluster_mode", "lock_on_hashtags", "snapshot_cron")})]
+
+
 @pytest.mark.parametrize("flags", [["--mode", "cache"], ["--memory", "512mb"], ["--no-http"]])
 def test_cli_rejects_kv_creation_options_for_postgres(config, monkeypatch, flags):
     monkeypatch.setattr(database, "add", lambda *a, **kw: pytest.fail("unexpected creation"))
@@ -1332,6 +1390,46 @@ def test_valkey_settings_offer_memory_image_http_without_mode_or_threads(config)
     assert ui._settings(target, input_fn, lambda value: None) == {"http": False, "memory": "512mb"}
     assert any(prompt.startswith("image ") for prompt in prompts)
     assert not any(prompt.startswith(("mode ", "threads ")) for prompt in prompts)
+
+
+@pytest.mark.parametrize("locked", [False, True])
+def test_guided_dragonfly_settings_enable_and_disable_together(config, locked):
+    from evdb.config import defaults
+
+    target = config.select("app-test-01/kv")
+    target = replace(
+        target,
+        settings=replace(
+            defaults("kv", target.settings.data_root, "dragonfly"),
+            cluster_mode="emulated" if locked else "off",
+            lock_on_hashtags=locked,
+            snapshot_cron="*/5 * * * *" if locked else "off",
+        ),
+    )
+    answers = {
+        "cluster_mode": "off" if locked else "emulated",
+        "lock_on_hashtags": "false" if locked else "true",
+        "snapshot_cron": "off" if locked else "*/5 * * * *",
+    }
+    prompts = []
+    output = []
+
+    def input_fn(prompt):
+        name = prompt.split()[0]
+        assert name not in prompts, f"unexpected retry: {prompt}"
+        prompts.append(name)
+        return "y" if name == "Save?" else answers.get(name, "")
+
+    values = ui._settings(target, input_fn, output.append)
+
+    assert values == {
+        "cluster_mode": "off" if locked else "emulated",
+        "lock_on_hashtags": not locked,
+        "snapshot_cron": "off" if locked else "*/5 * * * *",
+    }
+    assert (prompts.index("lock_on_hashtags") < prompts.index("cluster_mode")) is locked
+    assert prompts.count("Save?") == 1
+    assert "Save settings" in output
 
 
 def test_host_screen_explicitly_shows_network_traefik_acme_and_runtime_fields(config):

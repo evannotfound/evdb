@@ -339,6 +339,88 @@ def test_configure_writes_and_invokes_compose_once(config, monkeypatch):
     assert len(calls) == 1
 
 
+def test_dragonfly_configure_info_and_reset(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    created = database.add(config, "dragonfly-prod-01", "kv", engine="dragonfly")
+    target = created.select("dragonfly-prod-01/kv")
+    values = {
+        "cluster_mode": "emulated",
+        "lock_on_hashtags": True,
+        "snapshot_cron": "*/5 * * * *",
+    }
+    calls.clear()
+
+    updated = database.configure(created, target, values)
+    target = load(updated.paths.source, paths=updated.paths).select(target.identity)
+    assert len(calls) == 1
+    details = database.info(updated, target, observed={"running": False, "health": "stopped"})
+    for name, value in values.items():
+        assert getattr(target.settings, name) == value
+        assert details["settings"][name] == value
+
+    reset = database.configure(updated, target, {}, reset=tuple(values))
+    target = load(reset.paths.source, paths=reset.paths).select(target.identity)
+    assert target.settings.cluster_mode == "off"
+    assert target.settings.lock_on_hashtags is False
+    assert target.settings.snapshot_cron == "off"
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "locked,values,reset",
+    [
+        (False, {"cluster_mode": "invalid"}, ()),
+        (False, {"lock_on_hashtags": True}, ()),
+        (False, {"snapshot_cron": ""}, ()),
+        (True, {"cluster_mode": "off"}, ()),
+        (True, {}, ("cluster_mode",)),
+    ],
+)
+def test_invalid_dragonfly_settings_do_not_write(config, monkeypatch, locked, values, reset):
+    calls = _runtime(monkeypatch)
+    created = database.add(config, "dragonfly-prod-01", "kv", engine="dragonfly")
+    target = created.select("dragonfly-prod-01/kv")
+    if locked:
+        created = database.configure(
+            created, target, {"cluster_mode": "emulated", "lock_on_hashtags": True}
+        )
+        target = created.select(target.identity)
+    before = (
+        created.paths.source.read_bytes(),
+        created.paths.secrets.read_bytes(),
+        target.compose.read_bytes(),
+    )
+    calls.clear()
+
+    with pytest.raises(ConfigError):
+        database.configure(created, target, values, reset=reset)
+
+    assert (
+        created.paths.source.read_bytes(),
+        created.paths.secrets.read_bytes(),
+        target.compose.read_bytes(),
+    ) == before
+    assert calls == []
+
+
+@pytest.mark.parametrize("engine", ["postgres", "redis", "valkey"])
+@pytest.mark.parametrize(
+    "name,value", [("cluster_mode", "off"), ("lock_on_hashtags", False), ("snapshot_cron", "off")]
+)
+def test_dragonfly_settings_and_resets_are_not_offered_to_other_engines(
+    config, engine, name, value
+):
+    role = "postgres" if engine == "postgres" else "kv"
+    target = config.select(f"app-test-01/{role}")
+    target = replace(target, settings=defaults(role, target.settings.data_root, engine))
+
+    assert name not in database._setting_values(target)
+    with pytest.raises(DatabaseError, match=name):
+        database._settings(target, {name: value}, ())
+    with pytest.raises(DatabaseError, match=name):
+        database._settings(target, {}, (name,))
+
+
 def test_remove_role_removes_matching_secret_and_empty_project(config):
     updated = remove_role(config, "app-test-01/postgres")
 

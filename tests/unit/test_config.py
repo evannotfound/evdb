@@ -62,6 +62,65 @@ def test_valkey_memory_round_trip_keeps_existing_engine_settings(config):
     assert loaded.select("app-test-01/kv").settings == config.select("app-test-01/kv").settings
 
 
+@pytest.mark.parametrize("engine", ["redis", "valkey", "dragonfly"])
+def test_omitted_dragonfly_settings_keep_legacy_defaults(config, engine):
+    settings = defaults("kv", config.host.data_roots[0], engine)
+    updated = replace(config, projects=(replace(config.projects[0], kv=settings),))
+    data = as_dict(updated)
+    role = data["projects"]["app-test-01"]["kv"]
+    for name in ("cluster_mode", "lock_on_hashtags", "snapshot_cron"):
+        role.pop(name, None)
+    config.paths.source.write_text(yaml.safe_dump(data))
+    before = config.paths.source.read_bytes()
+
+    loaded = load(config.paths.source, paths=config.paths)
+
+    actual = loaded.select("app-test-01/kv").settings
+    assert actual.cluster_mode == "off"
+    assert actual.lock_on_hashtags is False
+    assert actual.snapshot_cron == "off"
+    assert config.paths.source.read_bytes() == before
+    serialized = yaml.safe_load(dump(loaded))["projects"]["app-test-01"]["kv"]
+    for name in ("cluster_mode", "lock_on_hashtags", "snapshot_cron"):
+        assert (name in serialized) is (engine == "dragonfly")
+
+
+def test_dragonfly_settings_round_trip(config):
+    settings = replace(
+        defaults("kv", config.host.data_roots[0], "dragonfly"),
+        cluster_mode="emulated",
+        lock_on_hashtags=True,
+        snapshot_cron="*/5 * * * *",
+    )
+    updated = replace(config, projects=(replace(config.projects[0], kv=settings),))
+
+    write(updated)
+
+    assert (
+        load(config.paths.source, paths=config.paths).select("app-test-01/kv").settings == settings
+    )
+    role = yaml.safe_load(dump(updated))["projects"]["app-test-01"]["kv"]
+    assert role["cluster_mode"] == "emulated"
+    assert role["lock_on_hashtags"] is True
+    assert role["snapshot_cron"] == "*/5 * * * *"
+
+
+@pytest.mark.parametrize("engine", ["postgres", "redis", "valkey"])
+@pytest.mark.parametrize(
+    "name,value", [("cluster_mode", "off"), ("lock_on_hashtags", False), ("snapshot_cron", "off")]
+)
+def test_other_engines_reject_explicit_neutral_dragonfly_keys(config, engine, name, value):
+    role = "postgres" if engine == "postgres" else "kv"
+    settings = defaults(role, config.host.data_roots[0], engine)
+    updated = replace(config, projects=(replace(config.projects[0], **{role: settings}),))
+    data = as_dict(updated)
+    data["projects"]["app-test-01"][role][name] = value
+    config.paths.source.write_text(yaml.safe_dump(data))
+
+    with pytest.raises(ConfigError, match=name):
+        load(config.paths.source, paths=config.paths)
+
+
 def test_postgres_identity_is_required_without_compatibility_defaults(config):
     text = config.paths.source.read_text().replace("      username: default\n", "")
     config.paths.source.write_text(text)

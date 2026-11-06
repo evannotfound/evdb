@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,40 @@ def validate(settings: KV) -> None:
         raise ConfigError("Dragonfly memory must be a positive kb, mb, or gb value")
     if type(settings.threads) is not int or settings.threads < 1:
         raise ConfigError("Dragonfly threads must be positive")
+    if settings.cluster_mode not in ("off", "emulated"):
+        raise ConfigError("Dragonfly cluster_mode must be off or emulated")
+    if type(settings.lock_on_hashtags) is not bool:
+        raise ConfigError("Dragonfly lock_on_hashtags must be a boolean")
+    if settings.lock_on_hashtags and settings.cluster_mode != "emulated":
+        raise ConfigError("Dragonfly lock_on_hashtags requires cluster_mode emulated")
+    if not isinstance(settings.snapshot_cron, str) or (
+        settings.snapshot_cron != "off" and not _cron(settings.snapshot_cron)
+    ):
+        raise ConfigError(
+            "Dragonfly snapshot_cron must be off or a five-field numeric cron schedule"
+        )
     kv.validate_http(settings)
+
+
+def _cron(value: str) -> bool:
+    fields = value.split()
+    if len(fields) != 5 or any(char in value for char in "\0\r\n"):
+        return False
+    for field, (low, high) in zip(
+        fields, ((0, 59), (0, 23), (1, 31), (1, 12), (0, 6)), strict=True
+    ):
+        for part in field.split(","):
+            match = re.fullmatch(r"(\*|[0-9]+(?:-[0-9]+)?)(?:/([0-9]+))?", part)
+            if not match:
+                return False
+            base, step = match.groups()
+            if step is not None and int(step) < 1:
+                return False
+            if base != "*":
+                bounds = [int(item) for item in base.split("-")]
+                if not low <= bounds[0] <= bounds[-1] <= high:
+                    return False
+    return True
 
 
 def files(database: Database) -> dict[str, str]:
@@ -47,15 +81,28 @@ def files(database: Database) -> dict[str, str]:
 
 def services(database: Database) -> dict[str, Any]:
     primary = database.service("primary")
+    command = [
+        "/usr/local/bin/dragonfly",
+        "--logtostderr",
+        "--flagfile=/run/secrets/dragonfly.flags",
+    ]
+    if database.settings.cluster_mode == "emulated":
+        command.extend(
+            [
+                "--cluster_mode=emulated",
+                f"--cluster_announce_ip={database.domain}",
+                f"--announce_port={database.port}",
+            ]
+        )
+    if database.settings.lock_on_hashtags:
+        command.append("--lock_on_hashtags=true")
+    if database.settings.snapshot_cron != "off":
+        command.append(f"--snapshot_cron={' '.join(database.settings.snapshot_cron.split())}")
     service: dict[str, Any] = {
         "image": database.settings.image,
         "container_name": primary,
         "restart": "unless-stopped",
-        "command": [
-            "/usr/local/bin/dragonfly",
-            "--logtostderr",
-            "--flagfile=/run/secrets/dragonfly.flags",
-        ],
+        "command": command,
         "volumes": [
             f"{database.data}:/data",
             f"{database.generated / 'dragonfly.flags'}:/run/secrets/dragonfly.flags:ro",
@@ -90,6 +137,9 @@ def info(database: Database) -> dict[str, Any]:
         "mode": database.settings.mode,
         "memory": database.settings.memory,
         "threads": database.settings.threads,
+        "cluster_mode": database.settings.cluster_mode,
+        "lock_on_hashtags": database.settings.lock_on_hashtags,
+        "snapshot_cron": database.settings.snapshot_cron,
         "http": database.settings.http.enabled,
         "http_connections": database.settings.http.connections,
         "data": kv.usage(
@@ -107,7 +157,18 @@ def backup(database: Database, folder: Path, run_id: str) -> dict[str, Any]:
     files = ()
     error = None
     try:
-        kv.text(container, password, ["SAVE", "DF", base], engine="dragonfly", timeout=1800)
+        deadline = time.monotonic() + 1800
+        while True:
+            reply = kv.text(
+                container, password, ["SAVE", "DF", base], engine="dragonfly", timeout=1800
+            )
+            if reply == "OK":
+                break
+            if reply != "ERR SAVING - can not save database":
+                raise BackupError(f"{database.identity}: Dragonfly SAVE failed: {reply}")
+            if time.monotonic() >= deadline:
+                raise BackupError(f"{database.identity}: Dragonfly snapshot is still in progress")
+            time.sleep(0.5)
         files = _snapshot(base, _sources(container, base))
         for item in files:
             docker.copy(f"{container}:/data/{item}", folder / item, timeout=1800)
@@ -193,8 +254,6 @@ def _check(database: Database, folder: Path, base: str, run_id: str) -> dict[str
     ]
     try:
         docker.start(database.image, name, args, mounts=[(folder, "/data", True)], memory="3g")
-        import time
-
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             if kv.health(name, "", engine="dragonfly"):

@@ -119,6 +119,14 @@ def parser() -> argparse.ArgumentParser:
     configure.add_argument("--http-connections", type=int)
     configure.add_argument("--memory")
     configure.add_argument("--threads", type=int)
+    configure.add_argument("--cluster-mode", choices=("off", "emulated"), help="Dragonfly only")
+    configure.add_argument(
+        "--lock-on-hashtags", action=argparse.BooleanOptionalAction, help="Dragonfly only"
+    )
+    configure.add_argument(
+        "--snapshot-cron",
+        help="Dragonfly only; five-field numeric cron (e.g. '*/5 * * * *') or off",
+    )
     configure.add_argument("--reset", action="append", default=[])
     for name in ("start", "stop", "restart"):
         command = database_commands.add_parser(name)
@@ -283,6 +291,9 @@ def _database(config, args, output, *, terminal: bool) -> int:
                 "http_connections",
                 "memory",
                 "threads",
+                "cluster_mode",
+                "lock_on_hashtags",
+                "snapshot_cron",
             )
             if getattr(args, name) is not None
         }

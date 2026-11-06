@@ -255,6 +255,26 @@ memory, image, and HTTP remain configurable. Memory is a database limit, not an 
 for process overhead and background persistence work. Memory overrides also work with Dragonfly, but
 not Redis. BullMQ clients use the native TLS `rediss://` connection from `database info`, not the HTTP API.
 
+### Dragonfly options
+
+Dragonfly supports optional single-instance cluster emulation, hashtag locking, and scheduled local
+snapshots through Settings or the configure command:
+
+```sh
+sudo evdb database configure legacy-prod-01/kv \
+  --cluster-mode emulated --lock-on-hashtags --snapshot-cron '*/5 * * * *'
+```
+
+All three options are off by default. Hashtag locking requires emulated cluster mode and compatible
+application key naming, such as `{queue}:jobs`. Emulation is not replication or failover. Cluster
+discovery advertises the database's existing public hostname and preferred native TLS port.
+
+`snapshot_cron` accepts five numeric cron fields (minute, hour, day, month, weekday 0–6), with lists,
+ranges, and steps. Snapshots use the existing local `dump` basename, replacing the previous generation;
+they do not replace remote backups or guarantee recovery of writes made after the last completed save.
+Disable these options together with `--cluster-mode off --no-lock-on-hashtags --snapshot-cron off`,
+or use `--reset cluster_mode --reset lock_on_hashtags --reset snapshot_cron`.
+
 ## CLI usage
 
 Run `sudo evdb` for the guided terminal interface. Direct commands execute immediately and are useful

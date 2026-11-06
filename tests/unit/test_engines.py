@@ -119,6 +119,67 @@ def test_redis_rejects_dragonfly_only_settings(config):
         redis.validate(settings)
 
 
+def test_dragonfly_options_are_optional_and_change_the_service_command(config):
+    target = config.select("app-test-01/kv")
+    target = replace(target, settings=defaults("kv", target.settings.data_root, "dragonfly"))
+    original = dragonfly.services(target)[target.service("primary")]["command"]
+    assert not any("cluster_mode" in arg or "snapshot_cron" in arg for arg in original)
+    settings = replace(
+        target.settings,
+        cluster_mode="emulated",
+        lock_on_hashtags=True,
+        snapshot_cron="*/5 * * * *",
+    )
+    dragonfly.validate(settings)
+    target = replace(
+        target,
+        settings=settings,
+        host=replace(target.host, routing=replace(target.host.routing, kv_ports=(16379,))),
+    )
+    command = dragonfly.services(target)[target.service("primary")]["command"]
+    assert "--cluster_mode=emulated" in command
+    assert "--lock_on_hashtags=true" in command
+    assert "--snapshot_cron=*/5 * * * *" in command
+    assert f"--cluster_announce_ip={target.domain}" in command
+    assert "--announce_port=16379" in command
+    assert target.credentials.password not in " ".join(command)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"cluster_mode": "yes"},
+        {"cluster_mode": []},
+        {"lock_on_hashtags": True},
+        {"lock_on_hashtags": "true"},
+        {"snapshot_cron": ""},
+        {"snapshot_cron": "* * *"},
+        {"snapshot_cron": "60 * * * *"},
+        {"snapshot_cron": "*/0 * * * *"},
+        {"snapshot_cron": "0 0 0 * *"},
+        {"snapshot_cron": "0 0 * * 5-1"},
+        {"snapshot_cron": "* * * * *\n"},
+    ],
+)
+def test_dragonfly_rejects_invalid_cluster_and_snapshot_settings(config, values):
+    settings = defaults("kv", config.host.data_roots[0], "dragonfly")
+    with pytest.raises(ConfigError, match="cluster_mode|lock_on_hashtags|snapshot_cron"):
+        dragonfly.validate(replace(settings, **values))
+
+
+@pytest.mark.parametrize("schedule", ["off", "*/5 * * * *", "0,30 6-18/2 * 1,6 1-5"])
+def test_dragonfly_accepts_numeric_snapshot_schedules(config, schedule):
+    settings = defaults("kv", config.host.data_roots[0], "dragonfly")
+    dragonfly.validate(replace(settings, snapshot_cron=schedule))
+
+
+@pytest.mark.parametrize("engine", ["redis", "valkey"])
+def test_other_engines_reject_dragonfly_options(config, engine):
+    settings = defaults("kv", config.host.data_roots[0], engine)
+    with pytest.raises(ConfigError, match="Dragonfly"):
+        get(engine).validate(replace(settings, snapshot_cron="*/5 * * * *"))
+
+
 def test_postgres_info_reports_logical_data_totals(config, monkeypatch):
     target = config.select("app-test-01/postgres")
 

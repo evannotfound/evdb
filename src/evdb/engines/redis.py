@@ -21,6 +21,12 @@ def validate(settings: KV) -> None:
         raise ConfigError("Redis mode must be durable or cache")
     if settings.memory is not None or settings.threads is not None:
         raise ConfigError("Redis does not accept Dragonfly memory or thread settings")
+    if (
+        settings.cluster_mode != "off"
+        or settings.lock_on_hashtags is not False
+        or settings.snapshot_cron != "off"
+    ):
+        raise ConfigError("Redis does not accept Dragonfly cluster or snapshot settings")
     kv.validate_http(settings)
 
 

@@ -135,6 +135,9 @@ class KV:
     data_root: Path
     memory: str | None = None
     threads: int | None = None
+    cluster_mode: str = "off"
+    lock_on_hashtags: bool = False
+    snapshot_cron: str = "off"
 
 
 @dataclass(frozen=True)

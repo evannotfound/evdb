@@ -708,6 +708,8 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
         if database.role == "postgres"
         else {"image", "mode", "http", "http_image", "http_connections", "memory", "threads"}
     )
+    if database.engine == "dragonfly":
+        allowed.update({"cluster_mode", "lock_on_hashtags", "snapshot_cron"})
     unknown = sorted((set(values) | set(reset)) - allowed)
     if unknown:
         raise DatabaseError(f"setting is not valid for {database.engine}: {unknown[0]}")
@@ -751,7 +753,15 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
                 ] = updates[name]
         direct = {
             name: updates[name]
-            for name in ("image", "mode", "memory", "threads")
+            for name in (
+                "image",
+                "mode",
+                "memory",
+                "threads",
+                "cluster_mode",
+                "lock_on_hashtags",
+                "snapshot_cron",
+            )
             if name in updates
         }
         settings = replace(settings, **direct, http=replace(settings.http, **http_values))
@@ -787,7 +797,21 @@ def _setting_values(database: Database) -> dict[str, Any]:
             "reserve_size",
         )
     elif database.engine == "dragonfly":
-        names = ("image", "mode", "http", "http_image", "http_connections", "memory", "threads")
+        names = (
+            "image",
+            "mode",
+            "http",
+            "http_image",
+            "http_connections",
+            "memory",
+            "threads",
+            *(
+                ("lock_on_hashtags", "cluster_mode")
+                if database.settings.lock_on_hashtags
+                else ("cluster_mode", "lock_on_hashtags")
+            ),
+            "snapshot_cron",
+        )
     elif database.engine == "valkey":
         names = ("image", "memory", "http", "http_image", "http_connections")
     else:

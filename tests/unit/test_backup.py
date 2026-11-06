@@ -13,7 +13,7 @@ import pytest
 
 from evdb import backup, database, status
 from evdb.config import defaults
-from evdb.engines import kv
+from evdb.engines import dragonfly, kv
 from evdb.errors import BackupError, CommandError, ResticError
 from evdb.run import Result
 
@@ -131,6 +131,58 @@ def test_cache_backup_never_calls_engine(config, monkeypatch, engine):
     monkeypatch.setattr(backup, "get", lambda engine: pytest.fail("engine called"))
     with pytest.raises(BackupError, match="disabled"):
         backup.create(config, target)
+
+
+def test_dragonfly_backup_waits_for_scheduled_snapshot(config, tmp_path, monkeypatch):
+    target = config.select("app-test-01/kv")
+    target = replace(target, settings=defaults("kv", target.settings.data_root, "dragonfly"))
+    files = ("evdb-test-0000.dfs", "evdb-test-summary.dfs")
+    replies = iter(["ERR SAVING - can not save database", "OK"])
+    sources = iter([(), files, files])
+    saved = []
+    cleaned = []
+
+    def save(container, password, args, **kwargs):
+        saved.append(args)
+        return next(replies)
+
+    monkeypatch.setattr(dragonfly.kv, "text", save)
+    monkeypatch.setattr(dragonfly, "_sources", lambda *args: next(sources))
+    monkeypatch.setattr(dragonfly, "_cleanup", lambda container, names: cleaned.append(names))
+    monkeypatch.setattr(dragonfly, "_check", lambda *args: {"keys": 1})
+    monkeypatch.setattr(
+        dragonfly.docker, "copy", lambda source, dest, **kw: dest.write_bytes(b"dfs")
+    )
+    monkeypatch.setattr(dragonfly.time, "sleep", lambda seconds: None)
+
+    result = dragonfly.backup(target, tmp_path, "test")
+
+    assert saved == [["SAVE", "DF", "evdb-test"], ["SAVE", "DF", "evdb-test"]]
+    assert result["files"] == list(files)
+    assert result["keys"] == 1
+    assert cleaned == [files]
+
+
+@pytest.mark.parametrize(
+    ("reply", "message"),
+    [("ERR disk full", "SAVE failed"), ("ERR SAVING - can not save database", "still in progress")],
+)
+def test_dragonfly_backup_does_not_publish_on_save_error(
+    config, tmp_path, monkeypatch, reply, message
+):
+    target = config.select("app-test-01/kv")
+    target = replace(target, settings=defaults("kv", target.settings.data_root, "dragonfly"))
+    clock = iter([0, 1801])
+    monkeypatch.setattr(dragonfly.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(dragonfly.kv, "text", lambda *a, **kw: reply)
+    monkeypatch.setattr(dragonfly, "_sources", lambda *args: ())
+    monkeypatch.setattr(dragonfly, "_check", lambda *args: pytest.fail("failed snapshot checked"))
+    monkeypatch.setattr(
+        dragonfly.docker, "copy", lambda *a, **kw: pytest.fail("failed snapshot copied")
+    )
+
+    with pytest.raises(BackupError, match=message):
+        dragonfly.backup(target, tmp_path, "test")
 
 
 def test_create_all_continues_and_reports_failures(config, monkeypatch):
