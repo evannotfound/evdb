@@ -110,6 +110,13 @@ def parser() -> argparse.ArgumentParser:
     configure.add_argument("--pool-size", type=int)
     configure.add_argument("--reserve-size", type=int)
     configure.add_argument(
+        "--parameter",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Postgres server parameter; repeat to set several",
+    )
+    configure.add_argument(
         "--mode",
         choices=("durable", "cache"),
         help="Redis/Dragonfly only; Valkey mode is creation-only",
@@ -275,6 +282,12 @@ def _database(config, args, output, *, terminal: bool) -> int:
             raise Error("database info prints credentials and requires a terminal")
         output(ui.database_details(database.info(config, target), include_connection=True))
     elif command == "configure":
+        parameters = {}
+        for item in args.parameter:
+            if "=" not in item or not item.split("=", 1)[0]:
+                raise Error("--parameter must use NAME=VALUE")
+            name, value = item.split("=", 1)
+            parameters[name] = value
         values = {
             name: getattr(args, name)
             for name in (
@@ -297,6 +310,8 @@ def _database(config, args, output, *, terminal: bool) -> int:
             )
             if getattr(args, name) is not None
         }
+        if parameters:
+            values["parameters"] = parameters
         database.configure(config, target, values, reset=tuple(args.reset))
         ui.success(output, f"{target.identity} settings saved and healthy")
     elif command == "logs":

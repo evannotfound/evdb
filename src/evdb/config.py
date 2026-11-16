@@ -207,6 +207,8 @@ def as_dict(config: Config) -> dict[str, Any]:
                     "reserve_size": pool.reserve_size,
                 },
             }
+            if project.postgres.parameters:
+                item["postgres"]["parameters"] = dict(project.postgres.parameters)
         if project.kv:
             http = project.kv.http
             role = {
@@ -429,6 +431,50 @@ def validate_postgres_name(value: str, name: str) -> str:
     ):
         raise ConfigError(f"Postgres {name} must be one non-empty value of at most 63 bytes")
     return value
+
+
+_POSTGRES_PARAMETER = re.compile(r"[a-z_][a-z0-9_.]*")
+_POSTGRES_PARAMETER_RESERVED = {
+    "config_file",
+    "data_directory",
+    "hba_file",
+    "ident_file",
+    "listen_addresses",
+    "port",
+}
+
+
+def validate_postgres_parameters(
+    value: Any, name: str = "parameters"
+) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, dict):
+        items = value.items()
+    elif isinstance(value, tuple):
+        items = value
+    else:
+        raise ConfigError(f"Postgres {name} must be a mapping")
+    result = []
+    seen = set()
+    for key, raw in items:
+        if not isinstance(key, str) or not _POSTGRES_PARAMETER.fullmatch(key):
+            raise ConfigError(f"Postgres parameter name is invalid: {key}")
+        if key in seen:
+            raise ConfigError(f"Postgres parameter is duplicated: {key}")
+        seen.add(key)
+        if key in _POSTGRES_PARAMETER_RESERVED:
+            raise ConfigError(f"Postgres parameter is reserved by evdb: {key}")
+        if isinstance(raw, bool):
+            text = "on" if raw else "off"
+        elif isinstance(raw, (int, float, str)):
+            text = str(raw)
+        else:
+            raise ConfigError(f"Postgres parameter {key} must be a scalar")
+        if any(char in text for char in "\0\r\n"):
+            raise ConfigError(f"Postgres parameter {key} must be one line")
+        result.append((key, text))
+    return tuple(sorted(result))
 
 
 def validate_ports(value: Any, name: str) -> tuple[int, ...]:
@@ -718,7 +764,7 @@ def _postgres(value: Any, project: str) -> Postgres:
     data = _object(value, f"projects.{project}.postgres")
     _only(
         data,
-        {"image", "data_root", "username", "database", "pgbouncer"},
+        {"image", "data_root", "username", "database", "pgbouncer", "parameters"},
         f"projects.{project}.postgres",
     )
     pool = _object(_required(data, "pgbouncer", f"projects.{project}.postgres"), "pgbouncer")
@@ -738,6 +784,9 @@ def _postgres(value: Any, project: str) -> Postgres:
         ),
         validate_postgres_name(
             _string(data, "database", f"projects.{project}.postgres"), "database name"
+        ),
+        validate_postgres_parameters(
+            data.get("parameters"), f"projects.{project}.postgres.parameters"
         ),
     )
 

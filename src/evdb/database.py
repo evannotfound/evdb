@@ -21,6 +21,7 @@ from .config import (
     remove_role,
     replace_role,
     validate_image,
+    validate_postgres_parameters,
     write,
 )
 from .engines import get
@@ -704,6 +705,7 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
             "max_clients",
             "pool_size",
             "reserve_size",
+            "parameters",
         }
         if database.role == "postgres"
         else {"image", "mode", "http", "http_image", "http_connections", "memory", "threads"}
@@ -737,10 +739,12 @@ def _settings(database: Database, values: dict[str, Any], reset: tuple[str, ...]
                 pool_values[
                     {"pgbouncer": "enabled", "pgbouncer_image": "image"}.get(name, name)
                 ] = updates[name]
+        parameters = validate_postgres_parameters(updates.get("parameters", settings.parameters))
         settings = replace(
             settings,
             image=updates.get("image", settings.image),
             pgbouncer=replace(pool, **pool_values),
+            parameters=parameters,
         )
     else:
         http_values = {}
@@ -776,7 +780,13 @@ def _current(settings: Postgres | KV, name: str):
         from .engines import postgres
 
         return postgres.major(settings.image)
-    if name in {"pgbouncer", "pgbouncer_image", "max_clients", "pool_size", "reserve_size"}:
+    if name in {
+        "pgbouncer",
+        "pgbouncer_image",
+        "max_clients",
+        "pool_size",
+        "reserve_size",
+    }:
         attribute = {"pgbouncer": "enabled", "pgbouncer_image": "image"}.get(name, name)
         return getattr(settings.pgbouncer, attribute)
     if name == "http":

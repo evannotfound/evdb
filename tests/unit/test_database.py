@@ -46,6 +46,26 @@ def test_native_port_changes_only_external_connections(config):
     assert kv.http_env(new_cache) == kv.http_env(cache)
 
 
+def test_postgres_parameters_render_and_reset(config, monkeypatch):
+    calls = _runtime(monkeypatch)
+    target = config.select("app-test-01/postgres")
+
+    updated = database.configure(
+        config,
+        target,
+        {"parameters": {"max_locks_per_transaction": "512"}},
+    )
+    current = updated.select(target.identity)
+    service = postgres.services(current)[current.service("primary")]
+
+    assert service["command"] == ["-c", "max_locks_per_transaction=512"]
+    assert calls == [("up", current.compose, current.compose_project)]
+
+    reset = database.configure(updated, current, {}, reset=("parameters",))
+    service = postgres.services(reset.select(target.identity))[current.service("primary")]
+    assert "command" not in service
+
+
 def _place(config, identity, root):
     target = config.select(identity)
     projects = tuple(

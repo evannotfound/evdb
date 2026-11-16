@@ -298,13 +298,14 @@ def _exec(container: str, username: str, database: str, args: list[str]) -> None
 
 
 def validate(settings: Postgres) -> None:
-    from ..config import validate_image, validate_postgres_name
+    from ..config import validate_image, validate_postgres_name, validate_postgres_parameters
 
     if not isinstance(settings, Postgres):
         raise ConfigError("postgres settings are invalid")
     validate_image(settings.image, "postgres image")
     validate_postgres_name(settings.username, "username")
     validate_postgres_name(settings.database, "database name")
+    validate_postgres_parameters(settings.parameters)
     pool = settings.pgbouncer
     validate_image(pool.image, "pgbouncer image")
     if type(pool.enabled) is not bool:
@@ -360,6 +361,12 @@ def services(database: Database) -> dict[str, Any]:
         "networks": {docker.NETWORK: {"aliases": [primary]}},
         "labels": docker.route(database, 5432),
     }
+    if database.settings.parameters:
+        service["command"] = [
+            argument
+            for name, value in database.settings.parameters
+            for argument in ("-c", f"{name}={value}")
+        ]
     values = {primary: service}
     if database.settings.pgbouncer.enabled:
         pool = database.service("pgbouncer")

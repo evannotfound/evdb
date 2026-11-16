@@ -48,6 +48,34 @@ def test_strict_two_file_round_trip_and_project_role_selectors(config):
     assert "local-restic-password" in dump_secrets(config.secrets)
 
 
+def test_postgres_parameters_round_trip_normalizes_scalar_values(config):
+    settings = replace(
+        config.select("app-test-01/postgres").settings,
+        parameters=(("max_locks_per_transaction", "512"),),
+    )
+    updated = replace(config, projects=(replace(config.projects[0], postgres=settings),))
+
+    write(updated)
+    loaded = load(updated.paths.source, paths=updated.paths)
+
+    assert loaded.select("app-test-01/postgres").settings.parameters == (
+        ("max_locks_per_transaction", "512"),
+    )
+    assert as_dict(loaded)["projects"]["app-test-01"]["postgres"]["parameters"] == {
+        "max_locks_per_transaction": "512"
+    }
+
+
+@pytest.mark.parametrize("parameters", [{"bad-name": "1"}, {"port": 5433}, {"work_mem": "1\nmb"}])
+def test_invalid_postgres_parameters_are_rejected(config, parameters):
+    data = as_dict(config)
+    data["projects"]["app-test-01"]["postgres"]["parameters"] = parameters
+    config.paths.source.write_text(yaml.safe_dump(data))
+
+    with pytest.raises(ConfigError, match="Postgres parameter"):
+        load(config.paths.source, paths=config.paths)
+
+
 def test_valkey_memory_round_trip_keeps_existing_engine_settings(config):
     settings = replace(defaults("kv", config.host.data_roots[0]), memory="512mb")
     updated = add_role(

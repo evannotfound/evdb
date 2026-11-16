@@ -216,6 +216,21 @@ PgBouncer is enabled by default. Disabling it removes the `-pooled` endpoint and
 always connects directly through the TLS proxy. Both hostnames fit the existing wildcard DNS and
 certificate, without adding a public port.
 
+### Postgres server parameters
+
+Applications that need PostgreSQL startup settings can add them without editing generated
+Compose. Repeat `--parameter NAME=VALUE` to configure several settings; evdb persists the
+values and applies them during the normal restart and health flow:
+
+```sh
+sudo evdb database configure glitchtip-prod-01/postgres \
+  --parameter max_locks_per_transaction=512
+```
+
+Use `--reset parameters` to clear all custom PostgreSQL parameters. evdb accepts PostgreSQL
+GUC parameters, not a replacement container command; storage, routing, and other evdb-owned
+settings remain managed by evdb.
+
 **Upgrading from the single-endpoint setup:** Previously, enabling PgBouncer routed the plain hostname
 through a session pool. After updating evdb and starting/restarting the database, that hostname bypasses
 PgBouncer, preserving session semantics but no longer applying its connection limits or queuing. Move

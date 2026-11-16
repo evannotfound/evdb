@@ -265,6 +265,49 @@ def test_cli_configure_forwards_dragonfly_options(config, monkeypatch, enabled):
     ]
 
 
+def test_cli_configure_forwards_postgres_parameters(config, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        database,
+        "configure",
+        lambda current, target, values, **kwargs: seen.append((target.identity, values, kwargs)),
+    )
+    args = cli.parser().parse_args(
+        [
+            "database",
+            "configure",
+            "app-test-01/postgres",
+            "--parameter",
+            "max_locks_per_transaction=512",
+            "--parameter",
+            "work_mem=16MB",
+        ]
+    )
+
+    assert cli._database(config, args, lambda value: None, terminal=False) == 0
+    assert seen == [
+        (
+            "app-test-01/postgres",
+            {"parameters": {"max_locks_per_transaction": "512", "work_mem": "16MB"}},
+            {"reset": ()},
+        )
+    ]
+
+
+def test_cli_rejects_malformed_or_non_postgres_parameters(config):
+    malformed = cli.parser().parse_args(
+        ["database", "configure", "app-test-01/postgres", "--parameter", "invalid"]
+    )
+    with pytest.raises(Error, match="NAME=VALUE"):
+        cli._database(config, malformed, lambda value: None, terminal=False)
+
+    kv = cli.parser().parse_args(
+        ["database", "configure", "app-test-01/kv", "--parameter", "max_connections=10"]
+    )
+    with pytest.raises(DatabaseError, match="parameters"):
+        cli._database(config, kv, lambda value: None, terminal=False)
+
+
 def test_cli_configure_forwards_dragonfly_resets_without_setting_defaults(config, monkeypatch):
     seen = []
     monkeypatch.setattr(

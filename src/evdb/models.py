@@ -124,6 +124,7 @@ class Postgres:
     data_root: Path
     username: str = "default"
     database: str = "postgres"
+    parameters: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
