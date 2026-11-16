@@ -1415,6 +1415,62 @@ def test_postgres_settings_display_nested_pool_values(config):
     assert "Reserve Size: 5" in text
 
 
+def test_postgres_parameter_editor_adds_parameter(config):
+    target = config.select("app-test-01/postgres")
+    answers = iter(["1", "max_locks_per_transaction", "512", "0", "y"])
+
+    values = ui._parameter_editor(target, lambda prompt: next(answers), lambda value: None)
+
+    assert values == {"max_locks_per_transaction": "512"}
+
+
+def test_postgres_parameter_editor_discards_unconfirmed_changes(config):
+    target = config.select("app-test-01/postgres")
+    answers = iter(["1", "max_locks_per_transaction", "512", "0", "n"])
+
+    values = ui._parameter_editor(target, lambda prompt: next(answers), lambda value: None)
+
+    assert values is None
+
+
+def test_postgres_parameter_editor_edits_and_removes_parameters(config):
+    target = replace(
+        config.select("app-test-01/postgres"),
+        settings=replace(
+            config.select("app-test-01/postgres").settings,
+            parameters=(("max_locks_per_transaction", "512"),),
+        ),
+    )
+    edit = iter(["1", "1", "768", "0", "y"])
+    remove = iter(["1", "2", "0", "y"])
+
+    assert ui._parameter_editor(target, lambda prompt: next(edit), lambda value: None) == {
+        "max_locks_per_transaction": "768"
+    }
+    assert ui._parameter_editor(target, lambda prompt: next(remove), lambda value: None) == {}
+
+
+def test_guided_postgres_parameters_configure_once(config, monkeypatch):
+    target = config.select("app-test-01/postgres")
+    seen = []
+    monkeypatch.setattr(
+        database,
+        "configure",
+        lambda current, selected, values: seen.append((selected.identity, values)) or current,
+    )
+    answers = iter(["9", "1", "max_locks_per_transaction", "512", "0", "y", "0"])
+
+    ui._database(
+        config,
+        target.identity,
+        lambda prompt: next(answers),
+        lambda value: None,
+        initial={"running": False, "healthy": False, "health": "stopped"},
+    )
+
+    assert seen == [(target.identity, {"parameters": {"max_locks_per_transaction": "512"}})]
+
+
 def test_valkey_settings_offer_memory_image_http_without_mode_or_threads(config):
     from evdb.config import defaults
 

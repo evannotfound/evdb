@@ -744,6 +744,8 @@ def _database(
             ("8", "Delete"),
             ("0", "Back"),
         ]
+        if target.role == "postgres":
+            options.insert(-1, ("9", "Server parameters"))
         _options(output, options)
         choice = _choice(input_fn, output, "Select", {key for key, _label in options})
         if choice in {None, "0"}:
@@ -782,6 +784,21 @@ def _database(
                         output,
                         f"{identity} settings saved and healthy",
                         heading="Settings",
+                        states=(("healthy", "green"),),
+                    )
+            elif choice == "9":
+                parameters = _parameter_editor(target, input_fn, output)
+                if parameters is not None:
+                    if session is not None:
+                        session.invalidate(current)
+                    with loading(output, f"Applying {identity} server parameters"):
+                        current = database.configure(current, target, {"parameters": parameters})
+                    if session is not None:
+                        session.invalidate(current)
+                    _screen(
+                        output,
+                        f"{identity} server parameters saved and healthy",
+                        heading="Server parameters",
                         states=(("healthy", "green"),),
                     )
             elif choice == "4":
@@ -1177,6 +1194,106 @@ def _settings(target: Database, input_fn, output) -> dict[str, Any] | None:
         heading="Save settings",
     )
     return values if _yes(input_fn, "Save? [y/N] ") else None
+
+
+def _parameter_editor(target: Database, input_fn, output) -> dict[str, str] | None:
+    original = dict(target.settings.parameters)
+    draft = dict(original)
+    while True:
+        names = sorted(draft)
+        add = str(len(names) + 1)
+        lines = (
+            ["No custom PostgreSQL parameters configured."]
+            if not names
+            else [f"{index}. {name} = {draft[name]}" for index, name in enumerate(names, 1)]
+        )
+        lines.extend((f"{add}. Add new parameter", "0. Done"))
+        _screen(output, "\n".join(lines), heading="Postgres server parameters")
+        choice = _choice(
+            input_fn, output, "Select", {"0", add, *(str(i) for i in range(1, len(names) + 1))}
+        )
+        if choice in {None, "0"}:
+            if draft == original:
+                return None
+            changes = []
+            for name in sorted(original.keys() | draft.keys()):
+                if name not in draft:
+                    changes.append(f"Removed {name}")
+                elif name not in original:
+                    changes.append(f"Added {name} = {draft[name]}")
+                elif original[name] != draft[name]:
+                    changes.append(f"Changed {name}: {original[name]} -> {draft[name]}")
+            _screen(output, "\n".join(changes), heading="Save parameter changes")
+            return draft if _yes(input_fn, "Save parameter changes? [y/N] ") else None
+        if choice == add:
+            name = ask_text(
+                input_fn,
+                output,
+                "Parameter name",
+                help_text="Example: max_locks_per_transaction",
+                validate=lambda value: _validate_parameter_name(target, draft, value),
+            )
+            if name is None:
+                return None
+            if name in draft:
+                _screen(
+                    output,
+                    f"{name} already exists; select it to edit",
+                    heading="Invalid parameter",
+                    error=True,
+                )
+                continue
+            value = ask_text(
+                input_fn,
+                output,
+                "Parameter value",
+                help_text="Example: 512",
+                validate=lambda entered, name=name: _validate_parameter_value(
+                    target, draft, name, entered
+                ),
+            )
+            if value is not None:
+                draft[name] = value
+            continue
+        name = names[int(choice) - 1]
+        _screen(
+            output,
+            "1. Edit value\n2. Remove parameter\n0. Back",
+            heading=f"{name} = {draft[name]}",
+        )
+        action = _choice(input_fn, output, "Select", {"0", "1", "2"})
+        if action is None:
+            return None
+        if action == "1":
+            value = ask_text(
+                input_fn,
+                output,
+                "Parameter value",
+                default=draft[name],
+                validate=lambda entered, name=name: _validate_parameter_value(
+                    target, draft, name, entered
+                ),
+            )
+            if value is not None:
+                draft[name] = value
+        elif action == "2":
+            del draft[name]
+
+
+def _validate_parameter_name(target: Database, current: dict[str, str], value: str) -> str:
+    from . import database
+
+    database._settings(target, {"parameters": {**current, value: ""}}, ())
+    return value
+
+
+def _validate_parameter_value(
+    target: Database, current: dict[str, str], name: str, value: str
+) -> str:
+    from . import database
+
+    database._settings(target, {"parameters": {**current, name: value}}, ())
+    return value
 
 
 def _backups(

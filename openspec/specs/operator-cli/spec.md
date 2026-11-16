@@ -280,6 +280,33 @@ input SHALL retain line-oriented behavior.
 - **WHEN** the operator presses Ctrl-C or submits EOF at an empty prompt
 - **THEN** the existing caller cancellation path runs without applying an unconfirmed operation
 
+### Requirement: Interactive Postgres parameter editing
+The guided Postgres database menu SHALL provide a numbered server-parameter editor
+separate from general settings. The editor SHALL list configured parameters, offer
+`Add new parameter`, and open an existing parameter to edit its value or remove it.
+Changes SHALL remain a draft until one final save confirmation, and saving SHALL
+apply all parameter changes through one normal database configuration operation.
+
+#### Scenario: Operator adds a Postgres parameter
+- **WHEN** the operator selects Server parameters, chooses Add new parameter, and
+  enters `max_locks_per_transaction` with value `512`
+- **THEN** the parameter appears in the list and is not applied until the operator
+  confirms the final save
+
+#### Scenario: Operator edits an existing parameter
+- **WHEN** the operator selects an existing parameter and chooses Edit value
+- **THEN** only that parameter's value is requested and the updated draft appears in
+  the parameter list
+
+#### Scenario: Operator removes an existing parameter
+- **WHEN** the operator selects an existing parameter and chooses Remove parameter
+- **THEN** it is removed from the draft list and the database remains unchanged unless
+  the final save is confirmed
+
+#### Scenario: Operator cancels parameter changes
+- **WHEN** the operator leaves the parameter editor without confirming Save
+- **THEN** no source, generated Compose, data, or running service changes
+
 ### Requirement: Direct Postgres parameter configuration
 `evdb database configure PROJECT/postgres` SHALL accept repeatable
 `--parameter NAME=VALUE` options. Each option SHALL add or replace one parameter in

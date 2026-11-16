@@ -231,6 +231,10 @@ Use `--reset parameters` to clear all custom PostgreSQL parameters. evdb accepts
 GUC parameters, not a replacement container command; storage, routing, and other evdb-owned
 settings remain managed by evdb.
 
+The guided database menu provides the same editor under **Server parameters**. It lists existing
+parameters, lets you add, edit, or remove them, and applies the draft only after one final save
+confirmation.
+
 **Upgrading from the single-endpoint setup:** Previously, enabling PgBouncer routed the plain hostname
 through a session pool. After updating evdb and starting/restarting the database, that hostname bypasses
 PgBouncer, preserving session semantics but no longer applying its connection limits or queuing. Move
